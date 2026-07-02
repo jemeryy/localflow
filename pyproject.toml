@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "localflow"
-version = "0.2.0"
+version = "0.3.0"
 description = "Personal fully-local push-to-talk dictation for Windows (Whisper on Intel Arc via OpenVINO)"
 requires-python = ">=3.11"
 # Runtime deps only. Export-time tooling (optimum-intel, torch, transformers,
@@ -18,7 +18,12 @@ dependencies = [
     "silero-vad",
     "onnxruntime",
     "sounddevice",
+    "pynput",
+    "pyperclip",
 ]
+
+[project.scripts]
+localflow = "localflow.desktop.app:main"
 
 [project.optional-dependencies]
 dev = ["pytest"]
