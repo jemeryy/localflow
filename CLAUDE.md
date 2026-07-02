@@ -9,6 +9,8 @@ The full v1 spec is `docs/PRD.md` (locked, ready to build). The research behind 
 
 **Start with M1 first:** a throwaway script that proves OpenVINO Whisper runs on the Intel Arc 140V iGPU and prints which device it used, before building any UI or hotkey. That is the one load-bearing risk; everything after it is low-risk plumbing.
 
+**Build status (2 July 2026): M1 and M2 DONE, fully signed off — do not redo either (`docs/m1-results.md`, `docs/m2-results.md`).** The real `localflow/core` + `localflow/desktop` packages exist (installed editable, `pip install -e .[dev]`), all 7 tests pass, GPU+NPU verified, FR-4 silence gate and real-mic dictation verified. The M1 GPU trailing-word issue is CLOSED as a TTS artifact (real trailed-off speech transcribes identically on GPU and NPU) — **GPU is the primary STT device**. The OpenVINO compile cache lives at `models/ov_cache` (NOT `.tmp/` — the old handoff doc predates this move). Next milestone: M3 (push-to-talk hotkey + clipboard injection, AT-1/2/3) — session handoff with the M3 plan: `plans/handoff-2026-07-02-m2-complete.md`.
+
 ## Hard constraints (from the PRD, do not violate)
 - **Fully local.** No network calls for transcription. No cloud speech-to-text. No audio or text leaves the device.
 - **The core seam.** `localflow/core/` is a pure Python package: audio in, text out. It must NOT import the desktop layer, touch the clipboard or keyboard, or make network calls. This is the seam that lets FARA and other projects reuse the exact same transcription code later.

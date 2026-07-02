@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "localflow"
+version = "0.2.0"
+description = "Personal fully-local push-to-talk dictation for Windows (Whisper on Intel Arc via OpenVINO)"
+requires-python = ">=3.11"
+# Runtime deps only. Export-time tooling (optimum-intel, torch, transformers,
+# nncf) is installed separately for the one-time model export (PRD §5).
+dependencies = [
+    "numpy",
+    "openvino",
+    "openvino-genai",
+    "soundfile",
+    "soxr",
+    "silero-vad",
+    "onnxruntime",
+    "sounddevice",
+]
+
+[project.optional-dependencies]
+dev = ["pytest"]
+
+[tool.setuptools.packages.find]
+include = ["localflow*"]
