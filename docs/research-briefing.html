@@ -1,0 +1,382 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Storm Research: Cloning Wispr Flow (Local-First AI Dictation)</title>
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=Montserrat:wght@400;500;600;700;800&family=Roboto+Mono:wght@400;500;600&family=Roboto:wght@300;400;500;700&display=swap" rel="stylesheet" />
+<style>
+  :root {
+    --blue: #2563eb; --blue-dark: #1e3a8a; --ink: #16203a; --muted: #5b6677; --line: #e4e9f2;
+    --bg-soft: #f6f8fc; --green: #15803d; --green-bg: #e9f6ee; --amber: #b45309; --amber-bg: #fdf3e7;
+    --slate: #475569; --slate-bg: #eef1f6; --red: #b91c1c; --red-bg: #fdecec;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: 'Roboto', system-ui, sans-serif; color: var(--ink); background: #eef1f6; line-height: 1.62; font-weight: 400; -webkit-font-smoothing: antialiased; }
+  .page { max-width: 900px; margin: 0 auto; background: #fff; padding: 64px 72px 80px; box-shadow: 0 1px 40px rgba(22,32,58,0.08); }
+  .eyebrow { font-family: 'Roboto Mono', monospace; font-size: 12px; font-weight: 600; letter-spacing: 0.18em; text-transform: uppercase; color: var(--blue); margin-bottom: 14px; }
+  h1 { font-family: 'Montserrat', sans-serif; font-weight: 800; font-size: 40px; line-height: 1.12; letter-spacing: -0.02em; color: var(--ink); margin-bottom: 18px; }
+  .lede { font-size: 17px; color: var(--muted); max-width: 640px; }
+  .meta-row { display: flex; flex-wrap: wrap; gap: 10px 22px; margin-top: 26px; padding-top: 22px; border-top: 2px solid var(--line); font-family: 'Roboto Mono', monospace; font-size: 12px; color: var(--muted); }
+  .meta-row b { color: var(--ink); font-weight: 600; }
+  .verify-banner { margin-top: 22px; background: var(--green-bg); border: 1px solid #bfe3cc; border-radius: 8px; padding: 13px 18px; font-size: 13px; color: #14532d; display: flex; gap: 10px; align-items: baseline; }
+  .verify-banner b { font-weight: 700; }
+  .verify-banner .tag { font-family: 'Roboto Mono', monospace; font-size: 10px; font-weight: 600; letter-spacing: 0.08em; text-transform: uppercase; background: var(--green); color: #fff; padding: 3px 8px; border-radius: 4px; flex-shrink: 0; }
+  .howto { margin-top: 18px; border: 1px solid var(--line); border-radius: 8px; padding: 18px 22px; background: var(--bg-soft); }
+  .howto h4 { font-family: 'Roboto Mono', monospace; font-size: 11px; font-weight: 600; letter-spacing: 0.12em; text-transform: uppercase; color: var(--muted); margin-bottom: 10px; }
+  .howto ul { list-style: none; }
+  .howto li { font-size: 13.5px; color: #2b3950; margin-bottom: 7px; padding-left: 16px; position: relative; }
+  .howto li::before { content: "›"; position: absolute; left: 0; color: var(--blue); font-weight: 700; }
+  .section { margin-top: 56px; }
+  .section-num { font-family: 'Roboto Mono', monospace; font-size: 13px; font-weight: 600; color: var(--blue); letter-spacing: 0.05em; }
+  h2 { font-family: 'Montserrat', sans-serif; font-weight: 700; font-size: 25px; letter-spacing: -0.01em; color: var(--ink); margin: 6px 0 18px; line-height: 1.2; }
+  h2 .bar { display: inline-block; width: 38px; height: 4px; background: var(--blue); border-radius: 2px; vertical-align: middle; margin-right: 14px; }
+  p { margin-bottom: 14px; }
+  p.body-lg { font-size: 16.5px; }
+  .ceo { background: var(--bg-soft); border-left: 5px solid var(--blue); padding: 26px 30px; border-radius: 4px; font-size: 16.5px; }
+  .ceo strong { font-weight: 700; color: var(--blue-dark); }
+  .finding { border: 1px solid var(--line); border-radius: 10px; padding: 24px 26px; margin-bottom: 18px; position: relative; }
+  .finding-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 18px; margin-bottom: 12px; }
+  .finding-title { font-family: 'Montserrat', sans-serif; font-weight: 700; font-size: 18px; line-height: 1.3; color: var(--ink); flex: 1; }
+  .finding-rank { font-family: 'Roboto Mono', monospace; font-weight: 600; font-size: 13px; color: #fff; background: var(--ink); width: 30px; height: 30px; border-radius: 50%; display: flex; align-items: center; justify-content: center; flex-shrink: 0; }
+  .finding p { font-size: 15px; color: #283449; margin-bottom: 14px; }
+  .rel-row { display: flex; align-items: center; gap: 12px; margin-bottom: 14px; flex-wrap: wrap; }
+  .rel { display: inline-flex; align-items: center; gap: 9px; font-family: 'Roboto Mono', monospace; font-size: 11px; font-weight: 600; letter-spacing: 0.08em; text-transform: uppercase; padding: 5px 12px; border-radius: 20px; }
+  .rel.high { background: #e7f0fe; color: var(--blue); }
+  .rel.medhigh { background: var(--green-bg); color: var(--green); }
+  .rel.medium { background: var(--amber-bg); color: var(--amber); }
+  .rel.low { background: var(--red-bg); color: var(--red); }
+  .score { font-family: 'Roboto Mono', monospace; font-size: 13px; font-weight: 600; color: var(--ink); }
+  .score b { font-size: 17px; }
+  .score span { color: var(--muted); font-weight: 400; }
+  .chips { display: flex; flex-direction: column; gap: 8px; margin-top: 6px; }
+  .chip-row { display: flex; align-items: baseline; gap: 9px; flex-wrap: wrap; font-size: 13.5px; }
+  .chip-label { font-family: 'Roboto Mono', monospace; font-size: 10.5px; font-weight: 600; letter-spacing: 0.06em; text-transform: uppercase; padding: 3px 8px; border-radius: 4px; white-space: nowrap; }
+  .chip-label.sup { background: var(--green-bg); color: var(--green); }
+  .chip-label.chal { background: var(--red-bg); color: var(--red); }
+  .chip-label.fix { background: var(--amber-bg); color: var(--amber); }
+  .chip-row span.who { color: #2b3950; }
+  .chip-row span.who b { font-weight: 600; }
+  .contested { border: 1px dashed var(--amber); background: #fffaf2; border-radius: 10px; padding: 22px 26px; margin-bottom: 18px; }
+  .contested .tag { font-family: 'Roboto Mono', monospace; font-size: 10.5px; font-weight: 600; letter-spacing: 0.08em; text-transform: uppercase; color: var(--amber); }
+  .contested h4 { font-family: 'Montserrat', sans-serif; font-weight: 700; font-size: 16px; color: var(--ink); margin: 6px 0 10px; }
+  .contested p { font-size: 14px; color: #4a3a22; margin-bottom: 0; }
+  .connection { background: linear-gradient(135deg, #16203a 0%, #1e3a8a 100%); color: #eaf0fb; border-radius: 12px; padding: 34px 38px; }
+  .connection h2 { color: #fff; }
+  .connection h2 .bar { background: #6ea8ff; }
+  .connection .section-num { color: #9ec1ff; }
+  .connection p { color: #d3def3; font-size: 16px; }
+  .connection .punch { font-family: 'Montserrat', sans-serif; font-weight: 600; font-size: 18px; color: #fff; line-height: 1.4; margin-top: 18px; padding-top: 18px; border-top: 1px solid rgba(255,255,255,0.18); }
+  .assume { border: 1px solid var(--line); border-left: 5px solid var(--amber); border-radius: 6px; padding: 24px 28px; background: #fffdf9; }
+  .assume h3 { font-family: 'Montserrat', sans-serif; font-size: 17px; font-weight: 700; color: var(--ink); margin-bottom: 10px; }
+  .assume p { font-size: 15px; color: #3a3320; }
+  .assume p:last-child { margin-bottom: 0; }
+  .action-item { display: flex; gap: 16px; padding: 16px 0; border-bottom: 1px solid var(--line); }
+  .action-item:last-child { border-bottom: none; }
+  .action-mark { font-family: 'Roboto Mono', monospace; font-weight: 600; font-size: 13px; color: var(--blue); flex-shrink: 0; width: 34px; }
+  .action-item .do { font-weight: 600; color: var(--ink); }
+  .action-item p { font-size: 14.5px; margin-bottom: 0; color: #2b3950; }
+  .frontier { border: 2px dashed var(--blue); border-radius: 12px; padding: 30px 34px; background: var(--bg-soft); }
+  .frontier .q { font-family: 'Montserrat', sans-serif; font-weight: 700; font-size: 22px; line-height: 1.32; color: var(--blue-dark); margin-bottom: 16px; }
+  .frontier p { font-size: 15px; color: #2b3950; }
+  .oncam { margin-top: 18px; }
+  .oncam-col { border-radius: 10px; padding: 20px 24px; margin-bottom: 14px; }
+  .oncam-col.safe { background: var(--green-bg); border: 1px solid #bfe3cc; }
+  .oncam-col.caveat { background: var(--amber-bg); border: 1px solid #f0d9b5; }
+  .oncam-col.avoid { background: var(--red-bg); border: 1px solid #f3c9c9; }
+  .oncam-col h4 { font-family: 'Roboto Mono', monospace; font-size: 12px; font-weight: 600; letter-spacing: 0.1em; text-transform: uppercase; margin-bottom: 12px; }
+  .oncam-col.safe h4 { color: var(--green); }
+  .oncam-col.caveat h4 { color: var(--amber); }
+  .oncam-col.avoid h4 { color: var(--red); }
+  .oncam-col ul { list-style: none; }
+  .oncam-col li { font-size: 14px; color: #233; margin-bottom: 8px; padding-left: 16px; position: relative; line-height: 1.5; }
+  .oncam-col li::before { content: "•"; position: absolute; left: 0; font-weight: 700; }
+  .oncam-col.safe li::before { color: var(--green); }
+  .oncam-col.caveat li::before { color: var(--amber); }
+  .oncam-col.avoid li::before { color: var(--red); }
+  .refs { margin-top: 56px; padding-top: 26px; border-top: 2px solid var(--line); }
+  .refs h3 { font-family: 'Roboto Mono', monospace; font-size: 12px; font-weight: 600; letter-spacing: 0.14em; text-transform: uppercase; color: var(--muted); margin-bottom: 14px; }
+  .refs ul { list-style: none; }
+  .refs li { font-size: 12.5px; color: var(--muted); margin-bottom: 11px; padding-left: 16px; position: relative; line-height: 1.5; }
+  .refs li::before { content: "›"; position: absolute; left: 0; color: var(--blue); font-weight: 700; }
+  .refs a { color: #34507e; text-decoration: none; }
+  .refs a:hover { text-decoration: underline; }
+  .refs .vstat { font-family: 'Roboto Mono', monospace; font-size: 10px; font-weight: 600; letter-spacing: 0.05em; text-transform: uppercase; padding: 2px 6px; border-radius: 3px; margin-right: 6px; }
+  .vstat.ok { background: var(--green-bg); color: var(--green); }
+  .vstat.part { background: var(--amber-bg); color: var(--amber); }
+  .vstat.weak { background: var(--red-bg); color: var(--red); }
+  .footer { margin-top: 40px; font-family: 'Roboto Mono', monospace; font-size: 11px; color: #9aa6b8; text-align: center; }
+  @media (max-width: 640px) { .page { padding: 40px 24px 56px; } h1 { font-size: 30px; } }
+  @media print { body { background: #fff; } .page { box-shadow: none; max-width: 100%; padding: 0; } .connection, .oncam-col { -webkit-print-color-adjust: exact; print-color-adjust: exact; } }
+</style>
+</head>
+<body>
+<div class="page">
+
+  <header>
+    <div class="eyebrow">Storm Research &middot; v2 (verified)</div>
+    <h1>Cloning Wispr Flow: A Local-First AI Dictation Tool for Windows, FARA, and the Cloud</h1>
+    <p class="lede">A five-lens synthesis: practitioner, academic, skeptic, economist, and historian. Every claim independently checked against its primary source before publication.</p>
+    <div class="meta-row">
+      <span><b>Date</b> &nbsp;2 July 2026</span>
+      <span><b>Method</b> &nbsp;5 author-built expert lenses + contradiction map</span>
+      <span><b>Audience</b> &nbsp;A solo technical founder building a private dictation tool that also feeds a web app (FARA) and cloud</span>
+    </div>
+    <div class="verify-banner">
+      <span class="tag">Verified</span>
+      <span>All 21 citations independently checked against primary sources on 2 July 2026. <b>Result: 0 fabricated, 5 corrected, 2 demoted.</b> Confidence scores reflect post-verification evidence quality.</span>
+    </div>
+    <div class="howto">
+      <h4>How to read this</h4>
+      <ul>
+        <li><b>The panel was author-constructed.</b> All five lenses share one framing, so where they agree, treat it as a strong hypothesis, not independent proof.</li>
+        <li><b>Confidence is scored 1-10</b> on evidence quality: peer-reviewed causal work &gt; official policy/financial data &gt; single commissioned survey &gt; analogy &gt; preprint.</li>
+        <li><b>Measured fact and interpretation are flagged separately.</b> A high score means the data is solid, not that the strategic reading is certain.</li>
+      </ul>
+    </div>
+  </header>
+
+  <!-- ============ 01 CEO SUMMARY ============ -->
+  <section class="section">
+    <div class="section-num">01</div>
+    <h2><span class="bar"></span>The 60-Second Summary</h2>
+    <div class="ceo">
+      <p style="margin-bottom:0;">Wispr Flow ("WhisperFlow" is a common misspelling; the product name has no space) is a voice-dictation app that types your speech into any application, cleaned up by an LLM, at a felt-instant sub-second latency. The settled fact across all five lenses: <strong>the transcription itself is a commodity now, so the thing worth cloning is not the speech model but the workflow around it, low latency, context-aware cleanup, and reliable text insertion.</strong> Speech-to-text costs roughly $0.006/minute in the cloud and about $0 self-hosted, and OpenAI's 2022 open-source Whisper release made a strong model free to everyone. The contested interpretation is whether a fully local build can feel as good as Wispr: on a GPU, the best open model (NVIDIA Parakeet) matches or beats cloud accuracy on benchmarks, but the felt magic is streaming latency plus cleanup, and Whisper is a batch model that was never built to stream, so the runtime experience degrades unless you engineer around it. One correction to the brief up front: Ollama does not do speech-to-text at all; you need a dedicated speech model (Whisper or Parakeet) and Ollama, if used, is only the optional cleanup step. The pragmatic path is not to build from scratch but to fork a mature open-source clone (e.g. Handy) and point its cleanup at your own model, treating the FARA/cloud version as a genuinely separate second product.</p>
+    </div>
+  </section>
+
+  <!-- ============ 02 KEY FINDINGS ============ -->
+  <section class="section">
+    <div class="section-num">02</div>
+    <h2><span class="bar"></span>Five Key Findings, Ranked by Reliability</h2>
+
+    <!-- FINDING 1 -->
+    <div class="finding">
+      <div class="finding-head">
+        <div class="finding-title">The transcription is a commodity; the moat is the workflow layer (latency, cleanup, insertion, habit)</div>
+        <div class="finding-rank">1</div>
+      </div>
+      <div class="rel-row">
+        <div class="rel high">Reliability: High</div>
+        <div class="score"><b>9</b><span>/10</span></div>
+      </div>
+      <p>Every lens converges here from a different angle. The economist: cloud speech-to-text is ~$0.006/min and self-hosted is ~$0/min, yet Wispr is valued in the hundreds of millions to low billions, so the value sits in the dictation UX and lock-in, not compute. The historian: this is the exact pattern of Dragon and Nuance, once the recognition model commoditized, defensibility moved to who owns the point of text entry and the vertical workflow. The practitioner and skeptic: Wispr's own moat is the sub-second, context-aware LLM cleanup, not the raw transcript. <b>Implication for you: don't try to out-model anyone; the buildable edge is the insertion surface and the cleanup/formatting tuned to your use.</b></p>
+      <div class="chips">
+        <div class="chip-row"><span class="chip-label sup">Supported by</span><span class="who"><b>All five lenses.</b> Economist (STT unit cost vs valuation), Historian (Dragon/Nuance commoditization), Practitioner + Skeptic (cleanup is the moat), Academic (models are now open and near-parity)</span></div>
+        <div class="chip-row"><span class="chip-label chal">Challenged by</span><span class="who">No one on the core claim; the only tension is how easily the workflow layer can be reproduced locally</span></div>
+      </div>
+    </div>
+
+    <!-- FINDING 2 -->
+    <div class="finding">
+      <div class="finding-head">
+        <div class="finding-title">Ollama cannot transcribe; you need a dedicated speech model, and Ollama is only the optional cleanup LLM</div>
+        <div class="finding-rank">2</div>
+      </div>
+      <div class="rel-row">
+        <div class="rel high">Reliability: High</div>
+        <div class="score"><b>10</b><span>/10</span></div>
+      </div>
+      <p>This corrects the framing in the request. Ollama runs large language models; it has no speech-to-text capability. The pipeline is: microphone audio &rarr; voice-activity detection (Silero VAD) to cut speech from silence &rarr; a speech-to-text model (whisper.cpp / faster-whisper, or NVIDIA Parakeet) &rarr; optional LLM cleanup (this is where Ollama fits, running a small model to remove filler words, punctuate, and format) &rarr; inject the text into the active app. Treating the project as "just Ollama" omits the entire speech subsystem, which is most of the work. This is a plain architectural fact, not a contested interpretation.</p>
+      <div class="chips">
+        <div class="chip-row"><span class="chip-label sup">Supported by</span><span class="who"><b>Practitioner + Skeptic</b>, both citing working open-source pipelines (OpenWhispr, Handy) where Ollama/LLM is strictly the post-transcription stage</span></div>
+        <div class="chip-row"><span class="chip-label chal">Challenged by</span><span class="who">No one. This is documented model behavior</span></div>
+      </div>
+    </div>
+
+    <!-- FINDING 3 -->
+    <div class="finding">
+      <div class="finding-head">
+        <div class="finding-title">For English dictation, NVIDIA Parakeet beats Whisper on speed and felt-instant feel; Whisper wins on language breadth</div>
+        <div class="finding-rank">3</div>
+      </div>
+      <div class="rel-row">
+        <div class="rel medhigh">Reliability: Medium-High</div>
+        <div class="score"><b>8</b><span>/10</span></div>
+      </div>
+      <p>On the Hugging Face Open ASR Leaderboard, Parakeet-TDT-0.6B-v2 posts <b>6.05%</b> average word-error-rate at a throughput (RTFx ~3386) far above Whisper-large-v3, with native punctuation and capitalization. <b>Correction after verification: the exact speed multiple depends on how it is measured, reported gaps run from roughly 23x (leaderboard-paper conditions) to ~50x (against an older Whisper snapshot), not a single fixed "50x."</b> In practice this is still the difference between the transcript appearing the instant you stop speaking versus a multi-second wait on a CPU. Whisper's advantage is that it handles ~99 languages, where Parakeet's fast models are English-first. <b>The caveat that caps the score: leaderboard numbers are measured on pre-segmented, batched, read speech on a GPU; your live, spontaneous, VAD-cut speech on your own hardware will be slower and less accurate than any published figure.</b> Parakeet is CC-BY-4.0, usable commercially.</p>
+      <div class="chips">
+        <div class="chip-row"><span class="chip-label sup">Supported by</span><span class="who"><b>Practitioner</b> (instant-feel in real clones) + <b>Academic</b> (Open ASR Leaderboard, arXiv:2510.06961)</span></div>
+        <div class="chip-row"><span class="chip-label chal">Challenged by</span><span class="who">The <b>Academic's own caveat</b>: benchmark conditions do not match live dictation, so treat the WER as a ceiling you will not reach</span></div>
+      </div>
+    </div>
+
+    <!-- FINDING 4 -->
+    <div class="finding">
+      <div class="finding-head">
+        <div class="finding-title">Whisper is a batch model, not a streaming one; real-time dictation needs VAD, and naive streaming hallucinates</div>
+        <div class="finding-rank">4</div>
+      </div>
+      <div class="rel-row">
+        <div class="rel medhigh">Reliability: Medium-High</div>
+        <div class="score"><b>8</b><span>/10</span></div>
+      </div>
+      <p>Whisper always pads its input to a fixed 30-second window and was not designed for low-latency streaming. Feeding it short or non-speech audio produces hallucinated text; peer-reviewed work at Interspeech 2025 (the Calm-Whisper study) found Whisper large-v3 hallucinating on <b>99.97%</b> of non-speech segments. That is close to what a push-to-talk tool feeds it (leading/trailing non-speech), so a fast voice-activity detector (Silero VAD, which runs in a few milliseconds on CPU) is mandatory, not optional. Purpose-built streaming models degrade far less than chunked batch models when you push latency down. <b>The engineering effort in a good clone goes disproportionately into this streaming/VAD plumbing, not into the AI.</b></p>
+      <div class="chips">
+        <div class="chip-row"><span class="chip-label sup">Supported by</span><span class="who"><b>Academic</b> (Whisper-Streaming paper arXiv:2307.14743; Interspeech 2025 hallucination study) + <b>Skeptic</b></span></div>
+        <div class="chip-row"><span class="chip-label chal">Challenged by</span><span class="who">No one on the batch-architecture fact; the exact streaming WER penalty is the least-settled number</span></div>
+      </div>
+    </div>
+
+    <!-- FINDING 5 -->
+    <div class="finding">
+      <div class="finding-head">
+        <div class="finding-title">The base is already built and open-source; fork one and re-point the cleanup, don't start from zero</div>
+        <div class="finding-rank">5</div>
+      </div>
+      <div class="rel-row">
+        <div class="rel medhigh">Reliability: Medium-High</div>
+        <div class="score"><b>8</b><span>/10</span></div>
+      </div>
+      <p>Multiple mature, permissively-licensed local dictation apps already implement the exact stack (global hotkey, VAD, local STT, text injection). The strongest reference is Handy (MIT, Rust/Tauri, whisper.cpp + Parakeet + Silero VAD, clipboard+Ctrl+V injection; ~25.4k stars and actively developed as of July 2026). <b>Windows-relevant correction:</b> of the commonly-listed alternatives, OpenWhispr (MIT, cross-platform) and VoiceTypr (Tauri/Rust, Windows+macOS) run on Windows, but VoiceInk is macOS-only, Whispering has moved to the "Epicenter" project, and WhisperWriter is stale (last updated 2024), so do not assume every "top open-source Wispr alternative" listicle entry works for you. Rebuilding the base from scratch re-solves problems these projects already fought (and only half-won, on the Windows-injection side). The high-leverage move is to fork one, swap in your preferred model, and spend your time on the cleanup prompt and your own workflow. <b>This is a recommendation, so score it as a strong judgment call, not a measured fact.</b></p>
+      <div class="chips">
+        <div class="chip-row"><span class="chip-label sup">Supported by</span><span class="who"><b>Practitioner</b> (Handy as the reference stack) + <b>Skeptic</b> (cloning from zero is redundant)</span></div>
+        <div class="chip-row"><span class="chip-label chal">Challenged by</span><span class="who">Mild self-challenge: forking ties you to another project's architecture and its unfixed Windows-injection edge cases</span></div>
+      </div>
+    </div>
+
+    <!-- CONTESTED / DEMOTED -->
+    <div class="contested">
+      <div class="tag">Contested signal &middot; monitor, do not assert &middot; confidence 5/10</div>
+      <h4>"Local models are now as good as cloud"</h4>
+      <p>True only under the benchmark's conditions: batched, pre-segmented, read-aloud English on a GPU. In the mode a dictation clone actually runs (streaming, VAD-cut spontaneous speech, often on CPU) accuracy and latency both drop, and the gap to a tuned cloud service reopens. State it as "local can match cloud on clean batched benchmarks," never as a flat "local equals cloud in practice."</p>
+    </div>
+
+    <div class="contested">
+      <div class="tag">Contested signal &middot; monitor, do not assert &middot; confidence 5/10</div>
+      <h4>Wispr's specific latency, funding, and pricing numbers</h4>
+      <p>Verification confirmed most of these against primary sources: the sub-700ms p99 cleanup round-trip (Baseten case study), the $30M Series A led by Menlo (June 2025) plus a $25M extension to $81M total at a $700M valuation, and the free-tier limits (2,000 words/week desktop) and Pro price ($15/mo, $12 annual). The one to flag: the <b>~$2B valuation was reported by Bloomberg as "in talks," not a closed round</b>, and the retention and usage figures are Wispr's own numbers relayed by press, not independently audited. Treat those two as as-reported, not fact.</p>
+    </div>
+  </section>
+
+  <!-- ============ 03 HIDDEN CONNECTION ============ -->
+  <section class="section">
+    <div class="connection">
+      <div class="section-num">03</div>
+      <h2><span class="bar"></span>The Hidden Connection</h2>
+      <p>Two findings look like they pull apart. The academic says the open models are so good and so cheap that local is ready today. The skeptic and practitioner say the local build will disappoint, because the magic is latency and cleanup, and Whisper cannot stream.</p>
+      <p>The resolving link, visible only across all five lenses: the model was never the moat, so the model becoming free does not hand you the product. The economist shows the compute is a rounding error; the historian shows that every time the model commoditized (HMM to deep learning, then Whisper open-sourcing it), the winner was decided by who owned the point of text entry and the surrounding workflow, not who owned the best recognizer. The academic's "local is ready" and the skeptic's "local will disappoint" are both right, about different layers: the recognizer is ready, the workflow is what you still have to build well.</p>
+      <p class="punch">The transcription becoming free is exactly why the transcription is not your project. Your project is the 200 milliseconds and the cleanup and the paste, the layer Wispr charges for precisely because the model underneath is worth nothing.</p>
+    </div>
+  </section>
+
+  <!-- ============ 03b KEY ASSUMPTION / MISSING 6TH LENS ============ -->
+  <section class="section">
+    <div class="assume">
+      <h3>The assumption this briefing rests on (and the missing 6th lens)</h3>
+      <p>All five lenses assumed the goal is to reproduce Wispr's general-purpose dictation experience, and they froze two variables: your actual hardware (whether you have an NVIDIA GPU decides almost every latency claim here) and the sensitivity of what you dictate. The missing sixth lens is the <b>Security and Compliance</b> view, and it matters more for you than for a generic user, because FARA handles Singapore financial-adviser data under the PDPA. A dictation tool that (a) injects text into arbitrary apps and (b) optionally screenshots the active window for context is a real data-exposure surface; routing a client's spoken personal data through any cloud speech API turns that vendor into a data processor with obligations attached.</p>
+      <p>That sixth lens could invert the recommendation. For personal, non-sensitive dictation, fork-and-ship is right. For anything touching client PII inside FARA, "fully local, nothing leaves the machine" stops being a nice-to-have and becomes the requirement, which pushes you toward the local Parakeet path and away from the cheap cloud-STT shortcut, regardless of what the benchmarks say.</p>
+    </div>
+  </section>
+
+  <!-- ============ 04 ACTIONABLE INSIGHT ============ -->
+  <section class="section">
+    <div class="section-num">04</div>
+    <h2><span class="bar"></span>What To Actually Do Differently</h2>
+    <p class="body-lg" style="color:var(--muted);">For you, a solo technical builder on Windows who wants a private dictation tool that also feeds FARA and cloud. Specific moves, in build order:</p>
+    <div class="action-item">
+      <div class="action-mark">01</div>
+      <div><span class="do">Check your hardware first; it decides everything below.</span><p>If you have an NVIDIA GPU, Parakeet-TDT gives you the instant feel locally. If you are on CPU only, expect multi-second latency from Whisper-family models and plan for a smaller model or accept the delay. Every latency claim in this report is hardware-dependent; measure yours before committing to "local-first."</p></div>
+    </div>
+    <div class="action-item">
+      <div class="action-mark">02</div>
+      <div><span class="do">Fork Handy (or OpenWhispr), don't build the base from scratch.</span><p>They already ship the global hotkey, Silero VAD, local STT, and clipboard-paste injection. Handy is MIT-licensed Rust/Tauri and already supports both whisper.cpp and Parakeet. Your work becomes swapping the model and tuning cleanup, not re-solving audio capture and text injection.</p></div>
+    </div>
+    <div class="action-item">
+      <div class="action-mark">03</div>
+      <div><span class="do">Make the LLM cleanup asynchronous and optional; stream the raw transcript first, correct after.</span><p>Running an Ollama cleanup pass synchronously on every utterance adds 1-3 seconds and destroys the instant feel. Show the raw transcript immediately, then replace it with the cleaned version once the small local model returns. Gate cleanup behind end-of-speech from the VAD.</p></div>
+    </div>
+    <div class="action-item">
+      <div class="action-mark">04</div>
+      <div><span class="do">Treat clipboard injection as a data-safety bug waiting to happen, and expect it to fail in elevated apps.</span><p>Save the user's existing clipboard, paste, then restore it after a delay (restoring too early races the paste and corrupts it). Accept that injection into apps running as administrator will fail silently on Windows: User Interface Privilege Isolation (UIPI) lets a normal-integrity process inject input only into apps at equal or lesser integrity, and Microsoft's own docs note the failure returns no error. Document that limitation rather than chasing it.</p></div>
+    </div>
+    <div class="action-item">
+      <div class="action-mark">05</div>
+      <div><span class="do">Scope the FARA/cloud version as a separate product, not a config flag.</span><p>Browser microphone capture feeding a server-side speech endpoint shares almost no code with the desktop hotkey app: different audio path, different auth, different cost surface. Build the desktop tool first, then a small FARA speech endpoint (MediaRecorder in the browser to a server running the same STT model). Do not pretend one codebase does both.</p></div>
+    </div>
+    <div class="action-item">
+      <div class="action-mark">06</div>
+      <div><span class="do">For anything touching client data in FARA, keep the audio fully local and skip cloud STT.</span><p>Under the PDPA, a client's spoken personal data sent to a cloud speech vendor makes that vendor a data processor with obligations. Running Parakeet/Whisper on your own machine or your own server keeps the data in your control. This is the one place where the cheap cloud shortcut is the wrong call.</p></div>
+    </div>
+  </section>
+
+  <!-- ============ 04b CLAIM SAFETY GUIDE ============ -->
+  <section class="section">
+    <div class="section-num">04b</div>
+    <h2><span class="bar"></span>What's Safe to Assert</h2>
+    <div class="oncam">
+      <div class="oncam-col safe">
+        <h4>&#10003; Safe — verified against primary source</h4>
+        <ul>
+          <li>Ollama runs LLMs only; it cannot transcribe speech. A separate STT model (Whisper or Parakeet) is required.</li>
+          <li>Whisper pads input to a fixed 30-second window and was not built for streaming; VAD is needed to avoid hallucination on non-speech audio.</li>
+          <li>OpenAI open-sourced Whisper in September 2022 under an MIT license.</li>
+          <li>Cloud speech-to-text is cheap (order of $0.003-$0.006 per minute); self-hosted marginal cost is effectively zero on hardware you own.</li>
+          <li>Mature open-source local dictation apps (Handy and others) already implement the full stack.</li>
+        </ul>
+      </div>
+      <div class="oncam-col caveat">
+        <h4>&#9888; Say with a caveat</h4>
+        <ul>
+          <li>Parakeet "beats" Whisper: true for English throughput on GPU benchmarks; attribute to the Open ASR Leaderboard and note it is English-first.</li>
+          <li>Wispr's funding, valuation, and pricing figures: cite as "as reported" (press/company statements), and note the ~$2B figure was reported as in-talks, not closed.</li>
+          <li>Local self-hosting is cheaper than subscribing: true on cash cost, but it trades a subscription for unpriced maintenance labor.</li>
+        </ul>
+      </div>
+      <div class="oncam-col avoid">
+        <h4>&#10007; Don't assert</h4>
+        <ul>
+          <li>"Local models are as good as cloud" as a flat statement; only true under batched GPU benchmark conditions.</li>
+          <li>Any single exact latency figure for Wispr (e.g. a precise millisecond p99) as an audited fact.</li>
+          <li>"Just use Ollama to clone Wispr", it is only the cleanup stage and cannot do the core job.</li>
+          <li>Exact WER/RTFx numbers as fixed; leaderboards update and your runtime numbers will differ.</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ 05 FRONTIER QUESTION ============ -->
+  <section class="section">
+    <div class="section-num">05</div>
+    <h2><span class="bar"></span>The Frontier Question</h2>
+    <div class="frontier">
+      <div class="q">What is the real end-to-end p95 latency of a fully local pipeline (VAD &rarr; Parakeet/Whisper &rarr; async cleanup &rarr; paste) on your actual Windows machine, and can it hit Wispr's felt-instant bar without a GPU?</div>
+      <p>This is the single empirical question that settles the whole build-vs-fork-vs-subscribe decision, and no lens could answer it because it depends entirely on hardware you have not specified. If a local pipeline on your machine lands under ~1 second end-to-end, local-first is clearly right and the cloud STT shortcut is unnecessary. If it lands at three or four seconds on CPU, you either buy a GPU, accept a worse experience than Wispr, or use cloud STT for the desktop tool and reserve local-only for FARA's client-data path. Measure it on day one with a throwaway script before you invest in any architecture.</p>
+    </div>
+  </section>
+
+  <!-- ============ REFERENCES ============ -->
+  <div class="refs">
+    <h3>Evidence base &middot; verification status</h3>
+    <ul>
+      <li><span class="vstat ok">Confirmed</span> OpenAI, "Introducing Whisper" (Sept 2022), MIT license, 680,000 hours of training audio. <a href="https://openai.com/index/whisper/">openai.com</a></li>
+      <li><span class="vstat ok">Confirmed</span> Radford et al. (2022), "Robust Speech Recognition via Large-Scale Weak Supervision," arXiv:2212.04356, preprint (Whisper WER scales with size; tiny = 39M params). <a href="https://arxiv.org/abs/2212.04356">arxiv.org</a></li>
+      <li><span class="vstat part">Corrected</span> Open ASR Leaderboard + paper arXiv:2510.06961 (preprint): Parakeet-TDT-0.6B-v2 = 6.05% avg WER, RTFx 3386, 600M params, CC-BY-4.0. Speed gap vs Whisper-large-v3 is ~23x (paper conditions) to ~50x (older snapshot), not a fixed 50x. <a href="https://huggingface.co/nvidia/parakeet-tdt-0.6b-v2">huggingface.co</a></li>
+      <li><span class="vstat ok">Confirmed</span> Gandhi et al. (2023), "Distil-Whisper," arXiv:2311.00430, preprint (5.8x faster, 51% fewer params, within 1% WER, less prone to long-form hallucination). <a href="https://arxiv.org/abs/2311.00430">arxiv.org</a></li>
+      <li><span class="vstat ok">Confirmed</span> Mach&aacute;&ccaron;ek et al. (2023), "Turning Whisper into Real-Time Transcription System," arXiv:2307.14743 (Whisper-Streaming / LocalAgreement; system demo at IJCNLP-AACL 2023). <a href="https://arxiv.org/abs/2307.14743">arxiv.org</a></li>
+      <li><span class="vstat ok">Confirmed</span> Wang et al. (2025), "Calm-Whisper," Interspeech 2025 (peer-reviewed): Whisper large-v3 hallucinates on 99.97% of non-speech (environmental sound, not silence); VAD required. <a href="https://www.isca-archive.org/interspeech_2025/wang25b_interspeech.html">isca-archive.org</a></li>
+      <li><span class="vstat ok">Confirmed</span> Silero VAD, RTF ~0.004 on CPU (vendor benchmark). <a href="https://github.com/snakers4/silero-vad/wiki/Performance-Metrics">github.com</a></li>
+      <li><span class="vstat part">Corrected</span> Handy (MIT; Rust/Tauri; whisper.cpp + Parakeet V3 + Silero VAD + rdev; injection = clipboard write + synthetic Ctrl+V via enigo). ~25,374 stars, active (pushed 1 Jul 2026), not the earlier "~22k." <a href="https://github.com/cjpais/Handy">github.com</a></li>
+      <li><span class="vstat ok">Confirmed</span> OpenWhispr (MIT, cross-platform local dictation; LLM/Ollama used only for cleanup, never STT). <a href="https://github.com/OpenWhispr/openwhispr">github.com</a>; VoiceTypr (Windows+macOS) <a href="https://github.com/moinulmoin/voicetypr">github.com</a>; Whispering moved to <a href="https://github.com/EpicenterHQ/epicenter">Epicenter</a></li>
+      <li><span class="vstat part">Corrected</span> Microsoft Learn, SendInput: UIPI lets a process inject input only into apps at equal or lesser integrity, and a UIPI-blocked call fails silently (no error). It does not mention the UAC "secure desktop"; PostMessage-unreliability is community knowledge, not a documented quote. <a href="https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-sendinput">learn.microsoft.com</a></li>
+      <li><span class="vstat part">Corrected</span> Wispr AI funding: $30M Series A led by Menlo Ventures (24 Jun 2025, ~$56M total then); $25M extension led by Notable Capital + Flight Fund to $81M at a $700M valuation; reported ~$2B "in talks" (Bloomberg), not closed. <a href="https://techcrunch.com/2025/11/20/as-its-voice-dectation-app-takes-off-wispr-secures-25m-from-notable-capital/">techcrunch.com</a></li>
+      <li><span class="vstat ok">Confirmed</span> Wispr Flow pricing: Basic free = 2,000 words/week desktop (1,000/week iPhone); Pro = $15/mo or $12/mo billed annually, unlimited. <a href="https://wisprflow.ai/pricing">wisprflow.ai</a></li>
+      <li><span class="vstat ok">Confirmed</span> Wispr Flow cleanup: fine-tuned Meta Llama on Baseten/AWS, TensorRT-LLM, &lt;700ms p99 end-to-end (company/Baseten figures). <a href="https://www.baseten.co/resources/customers/wispr-flow/">baseten.co</a></li>
+      <li><span class="vstat ok">Confirmed</span> Cloud STT per-minute pricing: OpenAI gpt-4o-transcribe $0.006/min, gpt-4o-mini-transcribe $0.003/min; Deepgram Nova-3 batch ~$0.0043 (streaming ~$0.0077); AssemblyAI from $0.0025/min. <a href="https://developers.openai.com/api/docs/pricing">openai.com</a></li>
+      <li><span class="vstat weak">Demoted</span> Global speech/voice recognition market: $9.66B (2025) to $23.11B (2030), 19.1% CAGR, MarketsandMarkets only; other firms' sizings vary widely. <a href="https://www.prnewswire.com/news-releases/speech-and-voice-recognition-market-worth-23-11-billion-by-2030---exclusive-report-by-marketsandmarkets-302538602.html">prnewswire.com</a></li>
+      <li><span class="vstat ok">Confirmed</span> Microsoft completed the Nuance acquisition for $19.7B, closed 4 March 2022. <a href="https://news.microsoft.com/2022/03/04/microsoft-completes-acquisition-of-nuance-ushering-in-new-era-of-outcomes-based-ai/">news.microsoft.com</a></li>
+      <li><span class="vstat ok">Confirmed</span> Dragon NaturallySpeaking (1997); Dragon Systems sold to Lernout &amp; Hauspie for ~$580M in stock (2000); L&amp;H accounting-fraud collapse; assets to ScanSoft at auction (Dec 2001, ~$39.5M), rebranded Nuance (2005). <a href="https://en.wikipedia.org/wiki/Dragon_NaturallySpeaking">wikipedia.org</a></li>
+      <li><span class="vstat ok">Confirmed</span> Google AI blog (12 March 2019), all-neural on-device RNN-T speech recognizer (~80MB) in Gboard. <a href="https://research.google/blog/an-all-neural-on-device-speech-recognizer/">research.google</a></li>
+      <li><span class="vstat ok">Confirmed</span> Apple iOS 15 (WWDC 2021, shipped Sept 2021), on-device Siri/dictation via the Neural Engine. <a href="https://www.apple.com/newsroom/2021/06/apple-unveils-new-privacy-features-at-wwdc21/">apple.com</a></li>
+      <li><span class="vstat part">Corrected</span> 2012 deep-learning breakthrough: Switchboard Hub5'00-SWB fell 23.6% to 17.0% WER (~28% relative). Numbers originate with Seide, Li &amp; Yu (Microsoft, Interspeech 2011); "Dahl/Hinton" is loose shorthand and exact WER varies with training config. <a href="https://www.microsoft.com/en-us/research/publication/conversational-speech-transcription-using-context-dependent-deep-neural-networks/">microsoft.com</a></li>
+      <li><span class="vstat weak">Demoted</span> "WhisperFlow" arXiv:2412.11272 is a distinct academic paper, not the Wispr Flow product; do not conflate the two. <a href="https://arxiv.org/abs/2412.11272">arxiv.org</a></li>
+    </ul>
+  </div>
+
+  <div class="footer">Storm Research v2 &middot; 21/21 citations independently verified against primary sources, 2 July 2026 &middot; 0 fabricated, 5 corrected, 2 demoted &middot; Reliability = evidence quality, not author confidence</div>
+
+</div>
+</body>
+</html>
