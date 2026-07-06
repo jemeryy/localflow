@@ -41,6 +41,34 @@ from localflow.desktop.inject import inject_text
 log = logging.getLogger("localflow.desktop.app")
 
 
+def _process_age_s() -> float | None:
+    """Seconds since this process was created (Windows). Anchors the M6
+    startup breakdown: everything before this module finished importing is
+    interpreter + imports (numpy/openvino load via the imports above)."""
+    try:
+        import ctypes
+        from ctypes import wintypes
+        k32 = ctypes.windll.kernel32
+        created, exited, kern, user = (wintypes.FILETIME() for _ in range(4))
+        # GetCurrentProcess() through argtype-less ctypes truncates the -1
+        # pseudo-handle on 64-bit Python — build the HANDLE explicitly.
+        if not k32.GetProcessTimes(wintypes.HANDLE(-1),
+                                   ctypes.byref(created), ctypes.byref(exited),
+                                   ctypes.byref(kern), ctypes.byref(user)):
+            return None
+        now = wintypes.FILETIME()
+        k32.GetSystemTimeAsFileTime(ctypes.byref(now))
+        t0 = (created.dwHighDateTime << 32) | created.dwLowDateTime
+        t1 = (now.dwHighDateTime << 32) | now.dwLowDateTime
+        return max(0.0, (t1 - t0) / 1e7)  # FILETIME ticks are 100ns
+    except Exception:
+        return None
+
+
+_IMPORT_AGE_S = _process_age_s()   # launch -> end of this module's imports
+_T_MODULE = time.perf_counter()    # perf-counter anchor for the same moment
+
+
 def to_pynput_combo(combo: str) -> str:
     """'ctrl+space' -> '<ctrl>+<space>' (pynput HotKey.parse format).
 
@@ -130,10 +158,24 @@ class LocalFlowApp:
         self.cleanup = cleanup
         self._cleanup_loader = cleanup_loader
         self._cleanup_loading = False
+        # Serializes toggle_cleanup: the tray thread and the startup warmup
+        # thread (cleanup_enabled preload) can both ask for a load - without
+        # this, a check-then-spawn race could load two 2-3GB engines.
+        self._cleanup_lock = threading.Lock()
+        self._cleanup_user_touched = False  # tray toggle beats the preload
         self.cleanup_active = cleanup is not None
         # FR-2 hook: called with 'idle' | 'rec' | 'busy' (tray sets this).
         self.on_state = on_state
         self.latencies_ms: list[int] = []  # release-to-paste totals (AT-4)
+        # M6: warmup (VadGate build + warm pass) runs on a background thread
+        # after the hotkey goes live. `warm` gates the worker's first
+        # transcribe so the engine is never driven from two threads at once.
+        # An app constructed with its VAD already in hand is warm by
+        # definition (tests, embedders); _run() passes vad=None and sets
+        # `self.vad` + the event from its warmup thread.
+        self.warm = threading.Event()
+        if vad is not None:
+            self.warm.set()
         self._work: queue.Queue = queue.Queue()
         self._worker = threading.Thread(target=self._drain, daemon=True)
 
@@ -177,7 +219,24 @@ class LocalFlowApp:
         """Tray toggle (FR-14). ON lazy-loads the model in the background
         (dictation keeps working raw meanwhile); OFF unloads it again, so
         the ~2-3GB of shared iGPU memory is only held while cleanup is
-        actually wanted. No-op (False) when no model is available at all."""
+        actually wanted. No-op (False) when no model is available at all.
+        Thread-safe: the tray thread and the startup preload both come
+        through here."""
+        self._cleanup_user_touched = True
+        with self._cleanup_lock:
+            return self._toggle_cleanup_locked()
+
+    def preload_cleanup(self) -> None:
+        """cleanup_enabled=true startup preload (M6: runs after warmup, off
+        the critical path). Turns cleanup ON unless the user already used
+        the tray toggle during warmup - the user's action always wins."""
+        with self._cleanup_lock:
+            if (self._cleanup_user_touched or self.cleanup is not None
+                    or self.cleanup_active or self._cleanup_loading):
+                return
+            self._toggle_cleanup_locked()
+
+    def _toggle_cleanup_locked(self) -> bool:
         if self.cleanup is None:
             if self._cleanup_loader is None:
                 return False
@@ -212,20 +271,31 @@ class LocalFlowApp:
     def _load_cleanup(self) -> None:
         try:
             engine = self._cleanup_loader()
-            if not self.cleanup_active:  # toggled back off mid-load
-                close = getattr(engine, "close", None)
-                if close is not None:
-                    close()
-                log.info("cleanup model loaded but toggled off mid-load — "
-                         "discarded to free its memory")
-            else:
-                self.cleanup = engine
-                log.info("cleanup model loaded — cleanup is ON")
         except Exception:
             log.exception("cleanup model failed to load — cleanup stays OFF")
-            self.cleanup_active = False
-        finally:
+            with self._cleanup_lock:
+                self.cleanup_active = False
+                self._cleanup_loading = False
+            return
+        # The attach-or-discard decision must be atomic with the toggle: a
+        # tray OFF that lands mid-load flips cleanup_active under the lock,
+        # and this block must see it — otherwise the engine gets attached
+        # anyway and 2-3GB stays resident behind an unchecked toggle.
+        discard = None
+        with self._cleanup_lock:
             self._cleanup_loading = False
+            if self.cleanup_active:
+                self.cleanup = engine
+            else:
+                discard = engine             # toggled back off mid-load
+        if discard is not None:
+            close = getattr(discard, "close", None)
+            if close is not None:
+                close()
+            log.info("cleanup model loaded but toggled off mid-load — "
+                     "discarded to free its memory")
+        else:
+            log.info("cleanup model loaded — cleanup is ON")
 
     def _drain(self) -> None:
         while True:
@@ -235,7 +305,13 @@ class LocalFlowApp:
             except Exception:
                 log.exception("utterance failed — app keeps running")
             finally:
-                self._set_state("idle")
+                # Back to idle only when nothing else is in flight: another
+                # dictation may be queued behind this one (likelier now that
+                # warmup can park the first), or the user may already be
+                # recording the next - never stomp those indicators.
+                if self._work.empty() and not (
+                        self.recorder is not None and self.recorder.recording):
+                    self._set_state("idle")
 
     def _process(self, audio: np.ndarray, rate: int, t_release: float) -> None:
         if len(audio) == 0:
@@ -248,6 +324,15 @@ class LocalFlowApp:
                         self.recorder.device_name)
             print("[--] nothing captured - mic delivered no audio", flush=True)
             return
+        if not self.warm.is_set():
+            # A dictation in the first seconds after launch waits for the
+            # background warmup instead of racing it - the engine must NEVER
+            # be driven from two threads, so there is no timeout escape here.
+            # The warmup thread sets the event in a `finally`, so this wait
+            # always ends; the utterance runs later, it is never dropped.
+            log.info("dictation arrived before warmup finished - waiting")
+            print("[..] still warming up - transcribing shortly", flush=True)
+            self.warm.wait()
         audio16 = ensure_16k_mono(audio, rate)
         cleanup = self.cleanup if self.cleanup_active else None
         result = transcribe_audio(audio16, self.engine, cleanup=cleanup,
@@ -421,12 +506,34 @@ def _run(args: argparse.Namespace) -> int:
         initial_prompt = "Vocabulary: " + ", ".join(cfg.hot_words) + "."
 
     # Build everything ONCE at startup, never per utterance (FR-14).
+    # M6: the SttEngine is the ONE thing dictation cannot start without, so
+    # it builds first and everything slow-but-optional (VadGate, warmup, the
+    # cleanup LLM preload) moves to a background thread. Hotkey target: live
+    # in <=8s instead of 14-19s.
     print("Loading models (GPU warm load is ~1-3s)...", flush=True)
+    # The mic stream open costs ~1s of PortAudio/WASAPI work and touches
+    # nothing the engine build needs — overlap the two (M6). Opening now,
+    # not on key-down, also keeps the M3 fix: a per-keydown open ate the
+    # first spoken words. Idle audio is discarded after 0.3s.
+    recorder = StreamRecorder(input_device=input_device)
+    mic_open_err: list[BaseException] = []
+
+    def open_recorder() -> None:
+        try:
+            recorder.open()
+        except BaseException as e:      # re-raised on the main thread below
+            mic_open_err.append(e)
+
+    mic_open = threading.Thread(target=open_recorder, daemon=True,
+                                name="localflow-mic-open")
+    mic_open.start()
+
+    t_engine0 = time.perf_counter()
     engine = SttEngine(cfg.stt_model_dir, device=cfg.device,
                        fallback_device=cfg.fallback_device,
                        cache_dir=cfg.cache_dir,
                        initial_prompt=initial_prompt)
-    vad = VadGate()
+    engine_build_ms = int((time.perf_counter() - t_engine0) * 1000)
 
     # Audio cleanup before STT (FR-13): high-pass + gentle spectral denoise
     # and loudness normalization. Helps the quiet/noisy built-in mic array
@@ -455,13 +562,10 @@ def _run(args: argparse.Namespace) -> int:
                 log.debug("cleanup warmup failed", exc_info=True)
             return engine
         if cfg.cleanup_enabled:
-            try:
-                print("Loading cleanup model (slower, cleaner mode)...",
-                      flush=True)
-                cleanup = cleanup_loader()
-            except Exception:
-                log.exception("cleanup model failed to load — dictation "
-                              "continues with raw transcripts only")
+            # M6: the preload moved into the background warmup thread below
+            # so a multi-second LLM load never delays the hotkey going live.
+            log.info("cleanup_enabled=true — the model loads in the "
+                     "background after warmup")
         else:
             log.info("cleanup model found — not loading it at startup; the "
                      "tray toggle loads it on demand")
@@ -469,11 +573,9 @@ def _run(args: argparse.Namespace) -> int:
         log.warning("cleanup_enabled=true but the model dir %s does not "
                     "exist — cleanup unavailable", cfg.cleanup_model_dir)
 
-    warmup(engine, vad, cleanup, preprocess)
-    recorder = StreamRecorder(input_device=input_device)
-    # Open the mic stream now, not on key-down: opening costs ~300ms and was
-    # eating the first spoken words. Idle audio is discarded after 0.3s.
-    recorder.open()
+    mic_open.join()
+    if mic_open_err:
+        raise mic_open_err[0]
 
     # No pinned mic -> follow the Windows default, live (hot-swaps the
     # stream when the default capture endpoint changes).
@@ -490,7 +592,9 @@ def _run(args: argparse.Namespace) -> int:
                           "fixed for this session")
             watcher = None
 
-    app = LocalFlowApp(engine, vad, recorder, inject_mode=cfg.inject_mode,
+    # vad=None: the VadGate arrives from the warmup thread below; the worker
+    # waits on app.warm before its first transcribe (never crashes or drops).
+    app = LocalFlowApp(engine, None, recorder, inject_mode=cfg.inject_mode,
                        cleanup=cleanup, cleanup_loader=cleanup_loader,
                        restore_delay_s=cfg.restore_delay_ms / 1000.0,
                        preprocess=preprocess)
@@ -531,16 +635,54 @@ def _run(args: argparse.Namespace) -> int:
         overlay.settings_path = settings_path
         overlay.on_toggle = app.toggle_recording
         overlay.on_quit = request_quit
-        overlay.set_state("ready")  # flashes the hint, then idles to the chip
+        overlay.set_state("warming")  # dictation works; warmup still running
 
+    hotkey_live_s = (_IMPORT_AGE_S or 0.0) + (time.perf_counter() - _T_MODULE)
     quit_hint = ("quit from the tray menu" if tray is not None
                  else "Ctrl+C here to quit")
     print(f"\nLocalFlow ready on {engine.device} - hold {cfg.hotkey} and speak; "
           f"release to paste into the focused app. {quit_hint}.\n"
+          f"(Warming up in the background - the first dictation may run a "
+          f"little slower.)\n"
           f"(Note: pasting into elevated/admin windows silently fails - FR-11.)",
           flush=True)
-    log.info("ready on %s - hotkey %s, inject_mode %s",
-             engine.device, cfg.hotkey, cfg.inject_mode)
+    log.info("hotkey live on %s at %.1fs - hotkey %s, inject_mode %s "
+             "(warmup continues in the background)",
+             engine.device, hotkey_live_s, cfg.hotkey, cfg.inject_mode)
+
+    def warm_in_background() -> None:
+        # VadGate build + warm pass off the critical path (M6). The worker
+        # waits on app.warm, so the engine is never used from two threads.
+        try:
+            app.vad = VadGate()
+            warmup(engine, app.vad, app.cleanup, preprocess)
+        except Exception:
+            log.exception("background warmup failed — dictation continues "
+                          "unwarmed (first utterance runs slower)")
+        finally:
+            app.warm.set()
+        warm_s = (_IMPORT_AGE_S or 0.0) + (time.perf_counter() - _T_MODULE)
+        imports_note = (f"{_IMPORT_AGE_S:.1f}s" if _IMPORT_AGE_S is not None
+                        else "n/a")
+        log.info("startup breakdown: interpreter+imports %s, engine build "
+                 "%dms, hotkey live at %.1fs, fully warm at %.1fs",
+                 imports_note, engine_build_ms, hotkey_live_s, warm_s)
+        if overlay is not None:
+            # Unconditional: the overlay's own queue ordering decides — its
+            # apply() skips "ready" while rec/busy/menu is showing, so this
+            # can never clobber an in-flight dictation, and a queued-but-
+            # unprocessed "warming" can never strand the pill.
+            overlay.set_state("ready")  # flash the hint, then idle chip
+        if cfg.cleanup_enabled and cleanup_loader is not None:
+            # cleanup_enabled=true preloads the LLM here, AFTER warm is set,
+            # so the multi-second load never delays dictation readiness.
+            # Same lock as the tray toggle - no double load, and a user
+            # toggle during warmup always wins over the config preload.
+            print("Loading cleanup model (slower, cleaner mode)...", flush=True)
+            app.preload_cleanup()
+
+    threading.Thread(target=warm_in_background, daemon=True,
+                     name="localflow-warmup").start()
 
     try:
         if tray is not None:

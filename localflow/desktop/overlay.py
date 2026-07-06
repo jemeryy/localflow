@@ -89,7 +89,9 @@ def system_scale() -> float:
 
 
 class WaveformOverlay:
-    """States: loading | ready (flash) | rec | busy | menu | idle (chip)."""
+    """States: loading | warming | ready (flash) | rec | busy | menu | idle
+    (chip). `warming` (M6): models are live but the background warmup pass
+    is still running — dictation already works, just a touch slower."""
 
     def __init__(self, hotkey: str = "alt+`", settings_path=None,
                  on_toggle=None, on_quit=None):
@@ -265,10 +267,18 @@ class WaveformOverlay:
                                    fill=_DOT_REC, outline=_DOT_REC, tags="wave")
 
         def apply(state: str) -> None:
+            if state == "ready" and self._state in ("rec", "busy", "menu"):
+                # The post-warmup "ready" flash (M6) arrives from the warmup
+                # thread; if a dictation or the menu is on screen, it loses.
+                return
             self._state = state
             if state == "loading":
                 layout(_EXP_W, _EXP_H)
                 center_text("LocalFlow - loading models...")
+            elif state == "warming":
+                layout(_EXP_W, _EXP_H)
+                center_text(f"Warming up... ({self._hotkey} already works)",
+                            _TEXT_DIM)
             elif state == "ready":
                 layout(_EXP_W, _EXP_H)
                 center_text(f"Ready - hold {self._hotkey} or click to dictate")
@@ -327,14 +337,14 @@ class WaveformOverlay:
                     call_safely(self.on_quit, "quit")
                 else:                        # clicked off a button -> dismiss
                     apply("idle")
-            elif st in ("idle", "ready", "rec"):
+            elif st in ("idle", "ready", "warming", "rec"):
                 # toggle dictation; focus stays on the paste target thanks
                 # to WS_EX_NOACTIVATE
                 call_safely(self.on_toggle, "toggle")
             # loading/busy: ignore clicks
 
         def on_rclick(_event) -> None:
-            if self._state in ("idle", "ready", "busy"):
+            if self._state in ("idle", "ready", "warming", "busy"):
                 apply("menu")
 
         def on_motion(event) -> None:

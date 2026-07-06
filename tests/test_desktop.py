@@ -589,3 +589,73 @@ def test_tray_state_images_are_distinct():
     centers = {s: img.getpixel((32, 32)) for s, img in images.items()}
     assert len(set(centers.values())) == 3   # three visually distinct dots
     assert all(c[3] == 255 for c in centers.values())  # opaque dot centers
+
+
+# -- M6: background warmup gate ---------------------------------------------
+
+
+def test_app_with_vad_is_warm_immediately():
+    from localflow.desktop.app import LocalFlowApp
+
+    app = LocalFlowApp(engine=None, vad=object(), recorder=None)
+    assert app.warm.is_set()
+
+
+def test_worker_waits_for_warm_event(monkeypatch):
+    """M6: a dictation queued before warmup finishes must NOT reach the
+    engine until app.warm is set (the engine must never be driven from two
+    threads at once), and must then complete normally - never dropped."""
+    import time
+    import types
+
+    from localflow.desktop import app as app_module
+
+    transcribed: list[str] = []
+
+    def fake_transcribe(audio, engine, cleanup=None, vad=None, preprocess=None):
+        transcribed.append("call")
+        return types.SimpleNamespace(raw_text="hello", clean_text=None,
+                                     cleanup_ms=None, stt_ms=1, device="CPU")
+
+    monkeypatch.setattr(app_module, "ensure_16k_mono", lambda a, r: a)
+    monkeypatch.setattr(app_module, "transcribe_audio", fake_transcribe)
+    monkeypatch.setattr(app_module, "inject_text", lambda *a, **k: True)
+
+    app = app_module.LocalFlowApp(engine=None, vad=None, recorder=None)
+    assert not app.warm.is_set()
+    app.start_worker()
+    app._work.put((np.ones(160, dtype=np.float32), 16_000, time.perf_counter()))
+
+    time.sleep(0.25)                      # worker had ample time to run...
+    assert transcribed == []              # ...but is parked on app.warm
+
+    app.warm.set()
+    assert _wait(lambda: transcribed == ["call"])   # released, ran once
+    assert _wait(lambda: len(app.latencies_ms) == 1)  # pasted, not dropped
+
+
+def test_preload_cleanup_loads_when_user_never_touched():
+    from localflow.desktop.app import LocalFlowApp
+
+    fake_engine = object()
+    app = LocalFlowApp(engine=None, vad=None, recorder=None,
+                       cleanup_loader=lambda: fake_engine)
+    app.preload_cleanup()
+    assert _wait(lambda: app.cleanup is fake_engine)
+    assert app.cleanup_active is True
+
+
+def test_preload_cleanup_never_overrides_a_user_toggle():
+    """cleanup_enabled=true preload runs AFTER warmup; if the user already
+    toggled cleanup on and back off during warmup, their OFF wins."""
+    from localflow.desktop.app import LocalFlowApp
+
+    app = LocalFlowApp(engine=None, vad=None, recorder=None,
+                       cleanup_loader=lambda: object())
+    assert app.toggle_cleanup() is True      # user: ON (load kicks off)
+    assert app.toggle_cleanup() is False     # user: changed mind, OFF
+    assert _wait(lambda: not app._cleanup_loading)
+    app.preload_cleanup()                    # config preload arrives late
+    assert _wait(lambda: not app._cleanup_loading)
+    assert app.cleanup is None               # user's OFF was respected
+    assert app.cleanup_active is False
