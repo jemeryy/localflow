@@ -59,6 +59,72 @@ def test_vad_gates_silence():
     assert VadGate().trim(np.zeros(2 * 16_000, dtype=np.float32)) is None
 
 
+def test_normalize_peak_boosts_quiet_signal():
+    from localflow.core.preprocess import normalize_peak
+
+    t = np.linspace(0, 1.0, 16_000, endpoint=False)
+    quiet = (0.1 * np.sin(2 * np.pi * 220 * t)).astype(np.float32)  # ~-20 dBFS
+    out = normalize_peak(quiet, target_peak=0.95)
+    assert out.dtype == np.float32
+    assert len(out) == len(quiet)
+    assert 0.8 < float(np.max(np.abs(out))) <= 1.0  # brought up near full scale
+
+
+def test_normalize_peak_leaves_silence_alone():
+    from localflow.core.preprocess import normalize_peak
+
+    out = normalize_peak(np.zeros(16_000, dtype=np.float32))
+    assert float(np.max(np.abs(out))) == 0.0  # never amplify a silent buffer
+
+
+def test_high_pass_attenuates_low_rumble_keeps_voice():
+    from localflow.core.preprocess import high_pass
+
+    t = np.linspace(0, 1.0, 16_000, endpoint=False)
+    rms = lambda x: float(np.sqrt(np.mean(x * x)))
+    rumble = np.sin(2 * np.pi * 30 * t).astype(np.float32)    # below speech band
+    voice = np.sin(2 * np.pi * 1_000 * t).astype(np.float32)  # in band
+    assert rms(high_pass(rumble)) < 0.3 * rms(rumble)
+    assert rms(high_pass(voice)) > 0.8 * rms(voice)
+
+
+def test_reduce_noise_pulls_down_noise_floor_and_keeps_length():
+    from localflow.core.preprocess import reduce_noise
+
+    rng = np.random.default_rng(1)
+    n = 32_000
+    t = np.linspace(0, 2.0, n, endpoint=False)
+    noisy = (0.05 * rng.standard_normal(n)).astype(np.float32)
+    noisy[n // 2:] += (0.4 * np.sin(2 * np.pi * 300 * t[n // 2:])).astype(np.float32)
+    out = reduce_noise(noisy, denoise_strength=0.8)
+    assert len(out) == n
+    rms = lambda x: float(np.sqrt(np.mean(x * x)))
+    assert rms(out[:n // 2]) < rms(noisy[:n // 2])  # noise-only half attenuated
+
+
+def test_preprocessor_passthrough_when_disabled():
+    from localflow.core import AudioPreprocessor
+
+    pp = AudioPreprocessor(denoise=False, normalize=False)
+    assert pp.active is False
+    x = np.linspace(-0.3, 0.3, 8_000, dtype=np.float32)
+    assert np.array_equal(pp.process(x), x)
+
+
+def test_preprocessor_preserves_shape_and_handles_edges():
+    from localflow.core import AudioPreprocessor
+
+    pp = AudioPreprocessor()
+    assert pp.active is True
+    rng = np.random.default_rng(2)
+    x = (0.1 * rng.standard_normal(24_000)).astype(np.float32)
+    out = pp.process(x)
+    assert out.dtype == np.float32 and len(out) == len(x)
+    assert len(pp.process(np.zeros(0, dtype=np.float32))) == 0  # empty is fine
+    silent = pp.process(np.zeros(16_000, dtype=np.float32))
+    assert float(np.max(np.abs(silent))) < 1e-3  # silence not amplified to noise
+
+
 @needs_wav
 def test_vad_finds_speech_in_test_wav():
     import soundfile as sf
@@ -102,3 +168,19 @@ def test_silence_produces_empty_result(engine):
     result = transcribe_audio(np.zeros(3 * 16_000, dtype=np.float32), engine, vad=VadGate())
     assert result.raw_text == ""
     assert result.stt_ms == 0 and result.duration_s == 0.0
+
+
+def test_validate_cleanup_guardrails():
+    """FR-9: cleanup may edit, never expand or blank the transcript."""
+    from localflow.core.cleanup import validate_cleanup
+
+    raw = "um so the meeting is uh on tuesday"
+    assert validate_cleanup(raw, "The meeting is on Tuesday.") == \
+        "The meeting is on Tuesday."
+    # models love wrapping the answer in quotes — strip them
+    assert validate_cleanup(raw, '"The meeting is on Tuesday."') == \
+        "The meeting is on Tuesday."
+    with pytest.raises(ValueError, match="empty"):
+        validate_cleanup(raw, "   ")
+    with pytest.raises(ValueError, match="long"):
+        validate_cleanup("hi", "x" * 200)  # answered instead of edited
