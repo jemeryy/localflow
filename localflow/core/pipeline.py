@@ -10,6 +10,7 @@ import numpy as np
 
 from .audio import TARGET_RATE
 from .cleanup import CleanupEngine
+from .preprocess import AudioPreprocessor
 from .stt import SttEngine
 from .vad import VadGate
 
@@ -32,13 +33,21 @@ def transcribe_audio(
     stt: SttEngine,
     cleanup: CleanupEngine | None = None,
     vad: VadGate | None = None,
+    preprocess: AudioPreprocessor | None = None,
 ) -> TranscriptResult:
-    """Run the core pipeline: (optional) VAD trim -> STT -> (optional) cleanup.
+    """Run the core pipeline: (optional) preprocess -> (optional) VAD trim ->
+    STT -> (optional) cleanup.
 
-    If the VAD gate finds no speech, returns a result with raw_text == "" and
-    zero timings — callers must treat that as "produce no output" (FR-4).
+    Preprocessing (high-pass / denoise / normalize) runs first, on the full
+    buffer, so the noise estimate can see the non-speech regions and both the
+    VAD and Whisper receive the cleaned signal. If the VAD gate then finds no
+    speech, returns a result with raw_text == "" and zero timings — callers
+    must treat that as "produce no output" (FR-4).
     """
     audio = np.ascontiguousarray(audio_16k_mono, dtype=np.float32)
+
+    if preprocess is not None:
+        audio = preprocess.process(audio)
 
     if vad is not None:
         trimmed = vad.trim(audio)
