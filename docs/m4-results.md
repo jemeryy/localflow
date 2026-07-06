@@ -1,9 +1,10 @@
 # M4 results — config file + tray + fallback + latency
 
 **Date:** 2 July 2026
-**Verdict: machine-verifiable work DONE (FR-13 config, FR-14/FR-2 tray,
-AT-5 fallback, startup warmup, AT-4 instrumentation). AT-4 and AT-6 need
-Jeremy live at the mic — checklist at the bottom.**
+**Verdict: PASS — M4 CLOSED.** Machine-verifiable work done 2 July (FR-13
+config, FR-14/FR-2 tray, AT-5 fallback, startup warmup, AT-4
+instrumentation). AT-4 and AT-6 signed off live by Jeremy on 6 July 2026
+(Gate 0 for the v1.1 plan; confirmed verbally, no recorded numbers).
 
 ## What was built
 

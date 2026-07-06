@@ -1,9 +1,9 @@
 # M5 results — LLM cleanup (S1 / FR-8 / FR-9) + follow-ups
 
 **Date:** 3 July 2026
-**Verdict: AT-8 PASS (machine-verified on GPU).** Cleanup is live on
-Jeremy's machine, toggleable from the tray. Live dictation feel-check by
-Jeremy still to come.
+**Verdict: AT-8 PASS (machine-verified on GPU) — M5 CLOSED.** Cleanup is
+live on Jeremy's machine, toggleable from the tray. Live feel-check signed
+off by Jeremy on 6 July 2026 as part of the v1 sign-off (Gate 0 for v1.1).
 
 ## Same-day follow-ups shipped before M5 (Jeremy's requests)
 
