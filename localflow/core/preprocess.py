@@ -51,10 +51,28 @@ def high_pass(audio: np.ndarray, sample_rate: int = TARGET_RATE,
         return audio
 
 
+def estimate_noise_floor(audio: np.ndarray, sample_rate: int = TARGET_RATE,
+                         n_fft: int = 512, hop: int = 128) -> np.ndarray:
+    """Per-frequency noise floor of a (quiet, speech-free) calibration clip
+    (M9). Same STFT parameters as reduce_noise, so the result can be passed
+    straight in as ``noise_floor``. Median magnitude per bin: robust to the
+    odd keyboard click in an otherwise steady room tone. Pure: the caller
+    owns persistence (core does no file I/O). Shape: (n_fft // 2 + 1, 1)."""
+    import scipy.signal as sps
+
+    audio = np.ascontiguousarray(audio, dtype=np.float32)
+    if len(audio) < n_fft * 2:
+        raise ValueError(f"calibration clip too short: {len(audio)} samples")
+    _, _, Z = sps.stft(audio, fs=sample_rate, nperseg=n_fft,
+                       noverlap=n_fft - hop)
+    return np.median(np.abs(Z), axis=1, keepdims=True).astype(np.float32)
+
+
 def reduce_noise(audio: np.ndarray, sample_rate: int = TARGET_RATE,
                  n_fft: int = 512, hop: int = 128, noise_percentile: float = 30.0,
                  gate_factor: float = 1.5, denoise_strength: float = 0.6,
-                 smooth_freq: int = 2, smooth_time: int = 3) -> np.ndarray:
+                 smooth_freq: int = 2, smooth_time: int = 3,
+                 noise_floor: np.ndarray | None = None) -> np.ndarray:
     """Stationary spectral-gating denoise.
 
     Estimates the noise floor per frequency from the quietest frames
@@ -62,7 +80,13 @@ def reduce_noise(audio: np.ndarray, sample_rate: int = TARGET_RATE,
     attenuates the rest to a floor of ``(1 - denoise_strength)``, smooths that
     mask in time and frequency to suppress musical noise, then reconstructs.
     ``denoise_strength`` in [0, 1]: 0 disables, ~0.6 gentle, ~0.9 aggressive
-    (risks eating quiet speech)."""
+    (risks eating quiet speech).
+
+    ``noise_floor`` (M9): a calibrated per-frequency floor from
+    estimate_noise_floor(). Better than the per-clip percentile when the
+    clip is mostly speech (the percentile then overestimates the floor and
+    eats quiet speech). Falls back to the per-clip estimate on any shape
+    mismatch (e.g. a profile from different STFT settings)."""
     if denoise_strength <= 0 or len(audio) < n_fft * 2:
         return audio
     try:
@@ -75,7 +99,15 @@ def reduce_noise(audio: np.ndarray, sample_rate: int = TARGET_RATE,
         _, _, Z = sps.stft(audio, fs=sample_rate, nperseg=n_fft,
                            noverlap=n_fft - hop)
         mag = np.abs(Z)
-        floor = np.percentile(mag, noise_percentile, axis=1, keepdims=True)
+        if (noise_floor is not None
+                and noise_floor.shape[0] == mag.shape[0]):
+            floor = noise_floor.reshape(-1, 1)
+        else:
+            if noise_floor is not None:
+                log.debug("noise profile shape %s does not fit %s bins — "
+                          "using the per-clip estimate",
+                          noise_floor.shape, mag.shape[0])
+            floor = np.percentile(mag, noise_percentile, axis=1, keepdims=True)
         keep = (mag >= floor * gate_factor).astype(np.float32)
         gain = keep + (1.0 - keep) * (1.0 - denoise_strength)
         gain = uniform_filter(gain, size=(max(1, smooth_freq), max(1, smooth_time)))
@@ -117,13 +149,18 @@ class AudioPreprocessor:
 
     def __init__(self, sample_rate: int = TARGET_RATE, denoise: bool = True,
                  normalize: bool = True, denoise_strength: float = 0.6,
-                 high_pass_hz: float = 80.0, target_peak: float = 0.95):
+                 high_pass_hz: float = 80.0, target_peak: float = 0.95,
+                 noise_floor: np.ndarray | None = None):
         self.sample_rate = sample_rate
         self.denoise = denoise
         self.normalize = normalize
         self.denoise_strength = float(np.clip(denoise_strength, 0.0, 1.0))
         self.high_pass_hz = high_pass_hz if denoise else 0.0
         self.target_peak = target_peak
+        # M9: calibrated per-frequency floor (estimate_noise_floor); None =
+        # per-clip percentile estimate. Passed in by the desktop layer -
+        # the profile FILE lives there, core stays pure.
+        self.noise_floor = noise_floor
 
     @property
     def active(self) -> bool:
@@ -134,7 +171,8 @@ class AudioPreprocessor:
         if self.high_pass_hz:
             parts.append(f"high-pass {self.high_pass_hz:.0f}Hz")
         if self.denoise:
-            parts.append(f"denoise {self.denoise_strength:.2f}")
+            note = " (calibrated)" if self.noise_floor is not None else ""
+            parts.append(f"denoise {self.denoise_strength:.2f}{note}")
         if self.normalize:
             parts.append(f"normalize -> {self.target_peak:.2f}")
         return ", ".join(parts) if parts else "off"
@@ -148,7 +186,8 @@ class AudioPreprocessor:
             audio = high_pass(audio, self.sample_rate, self.high_pass_hz)
         if self.denoise:
             audio = reduce_noise(audio, self.sample_rate,
-                                 denoise_strength=self.denoise_strength)
+                                 denoise_strength=self.denoise_strength,
+                                 noise_floor=self.noise_floor)
         if self.normalize:
             audio = normalize_peak(audio, self.target_peak)
         return np.ascontiguousarray(audio, dtype=np.float32)

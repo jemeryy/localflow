@@ -32,6 +32,8 @@ from localflow.core import (
     SttEngine,
     VadGate,
     ensure_16k_mono,
+    estimate_noise_floor,
+    high_pass,
     transcribe_audio,
 )
 from localflow.desktop import config
@@ -182,6 +184,11 @@ class LocalFlowApp:
         # the 3s test is refused instead of truncating both captures).
         self.engine_lock = threading.Lock()
         self.mic_test_active = False
+        # Serializes CLAIMING the recorder: Test mic, Calibrate and a
+        # hotkey press can all race check-then-act on recorder.recording
+        # (found by review) - claim_mic_session() and on_hotkey_down both
+        # decide under this lock, so exactly one owner wins.
+        self.mic_session_lock = threading.Lock()
         # A refused key-down must also swallow its key-up: the listener
         # tracks the combo as active regardless, and an unpaired
         # on_hotkey_up would stop (steal) the mic test's recording.
@@ -197,15 +204,26 @@ class LocalFlowApp:
         except Exception:
             log.exception("state callback failed — app keeps running")
 
+    def claim_mic_session(self) -> bool:
+        """Atomically take the recorder for a mic test / calibration (M8/
+        M9). False when a dictation is running or another session owns it;
+        the winner must clear mic_test_active in a finally."""
+        with self.mic_session_lock:
+            if self.mic_test_active or self.recorder.recording:
+                return False
+            self.mic_test_active = True
+            return True
+
     def on_hotkey_down(self) -> None:
-        if self.mic_test_active:
-            # The settings "Test mic" owns the recorder for ~3s; a dictation
-            # starting mid-test would truncate both captures (M8).
-            self._hotkey_suppressed = True
-            print("[--] mic test in progress - try again in a moment",
-                  flush=True)
-            return
-        self.recorder.start()
+        with self.mic_session_lock:
+            if self.mic_test_active:
+                # The settings "Test mic"/"Calibrate" owns the recorder; a
+                # dictation starting mid-test would truncate both captures.
+                self._hotkey_suppressed = True
+                print("[--] mic test in progress - try again in a moment",
+                      flush=True)
+                return
+            self.recorder.start()
         self._set_state("rec")
         # FR-2 indicator (tray dot; console line kept for --no-tray). ASCII
         # only: Windows consoles often run cp1252, which can't encode glyphs.
@@ -449,6 +467,8 @@ def apply_settings(changes: dict, cfg: config.Config, hooks: dict) -> set[str]:
             hooks["inject_mode"](value)
         elif key == "input_device":
             hooks["input_device"](value)
+        elif key == "vad_threshold":
+            hooks["vad"](value)
         elif key == "overlay_visibility":
             hooks["visibility"](value)
         elif key == "pill_size":
@@ -640,11 +660,26 @@ def _run(args: argparse.Namespace) -> int:
     # Audio cleanup before STT (FR-13): high-pass + gentle spectral denoise
     # and loudness normalization. Helps the quiet/noisy built-in mic array
     # most; toggle in localflow.toml if it ever costs accuracy.
-    preprocess = None
-    if cfg.denoise_enabled or cfg.normalize_audio:
-        preprocess = AudioPreprocessor(denoise=cfg.denoise_enabled,
-                                       normalize=cfg.normalize_audio,
-                                       denoise_strength=cfg.denoise_strength)
+    def build_preprocessor() -> AudioPreprocessor | None:
+        """One builder for startup + live-apply + calibration (M9): attaches
+        the calibrated noise floor when a saved profile matches the mic."""
+        if not (cfg.denoise_enabled or cfg.normalize_audio):
+            return None
+        floor = None
+        if cfg.denoise_enabled:
+            try:
+                from localflow.desktop import noiseprofile
+                floor = noiseprofile.load_for_device(recorder.device_name)
+            except Exception:
+                log.exception("noise profile load failed — using the "
+                              "per-clip estimate")
+        return AudioPreprocessor(denoise=cfg.denoise_enabled,
+                                 normalize=cfg.normalize_audio,
+                                 denoise_strength=cfg.denoise_strength,
+                                 noise_floor=floor)
+
+    preprocess = build_preprocessor()
+    if preprocess is not None:
         log.info("audio preprocessing: %s", preprocess.describe())
 
     # Cleanup LLM: ~2-3GB of shared iGPU memory + seconds of load time, so it
@@ -679,22 +714,9 @@ def _run(args: argparse.Namespace) -> int:
     if mic_open_err:
         raise mic_open_err[0]
 
-    # Follow the Windows default mic, live. The watcher now always runs
-    # (M8: the mic can be pinned/unpinned from the settings window without
-    # a restart); check_once() itself no-ops the switch while pinned and
-    # keeps the heal tick either way.
-    watcher = None
-    try:
-        from localflow.desktop.micwatch import DefaultMicWatcher
-        watcher = DefaultMicWatcher(recorder)
-        watcher.start()
-        if input_device is None:
-            log.info("following the system default mic (pin one in "
-                     "Settings or localflow.toml to disable)")
-    except Exception:
-        log.exception("default-mic watcher unavailable — the mic is "
-                      "fixed for this session")
-        watcher = None
+    # (The default-mic watcher starts AFTER the live-apply hooks exist -
+    # its on_switch rebuilds the preprocessor so a calibrated noise floor
+    # never outlives its mic. Nothing needs it in the first second.)
 
     # vad=None: the VadGate arrives from the warmup thread below; the worker
     # waits on app.warm before its first transcribe (never crashes or drops).
@@ -792,14 +814,17 @@ def _run(args: argparse.Namespace) -> int:
         log.info("hotkey rebuilt live -> %s", combo)
 
     def hook_preprocess() -> None:
-        if cfg.denoise_enabled or cfg.normalize_audio:
-            app.preprocess = AudioPreprocessor(
-                denoise=cfg.denoise_enabled, normalize=cfg.normalize_audio,
-                denoise_strength=cfg.denoise_strength)
-            log.info("audio preprocessing now: %s", app.preprocess.describe())
-        else:
-            app.preprocess = None
-            log.info("audio preprocessing now: off")
+        app.preprocess = build_preprocessor()
+        log.info("audio preprocessing now: %s",
+                 app.preprocess.describe() if app.preprocess else "off")
+
+    def hook_vad(value: float) -> None:
+        # VadGate.trim reads self.threshold per call, so this is live. If
+        # warmup hasn't built the gate yet, it constructs from cfg (already
+        # mutated by apply_settings) - either order lands the new value.
+        if app.vad is not None:
+            app.vad.threshold = float(value)
+        log.info("vad threshold -> %.2f", value)
 
     def hook_input_device(value) -> None:
         dev = value
@@ -828,9 +853,28 @@ def _run(args: argparse.Namespace) -> int:
     def hook_inject_mode(mode: str) -> None:
         app.inject_mode = mode
 
+    # Follow the Windows default mic, live. Always runs (M8: the mic can be
+    # pinned/unpinned from the settings window without a restart);
+    # check_once() no-ops switches while pinned but keeps the heal tick.
+    # on_switch rebuilds the preprocessor: a calibrated noise floor belongs
+    # to ONE mic and must not survive a hot-swap (M9 review finding).
+    watcher = None
+    try:
+        from localflow.desktop.micwatch import DefaultMicWatcher
+        watcher = DefaultMicWatcher(recorder, on_switch=hook_preprocess)
+        watcher.start()
+        if input_device is None:
+            log.info("following the system default mic (pin one in "
+                     "Settings or localflow.toml to disable)")
+    except Exception:
+        log.exception("default-mic watcher unavailable — the mic is "
+                      "fixed for this session")
+        watcher = None
+
     live_hooks = {
         "hotkey": hook_hotkey,
         "preprocess": hook_preprocess,
+        "vad": hook_vad,
         "restore_delay": hook_restore_delay,
         "inject_mode": hook_inject_mode,
         "input_device": hook_input_device,
@@ -871,12 +915,13 @@ def _run(args: argparse.Namespace) -> int:
 
     def test_mic(on_done) -> bool:
         """Settings 'Test mic': ~3s capture through the real pipeline, no
-        injection. Async (worker thread); False when a dictation is live."""
-        if recorder.recording:
+        injection. Async (worker thread); False when a dictation or another
+        mic session is live (claimed atomically - review found the
+        check-then-spawn race with Calibrate and the hotkey)."""
+        if not app.claim_mic_session():
             return False
 
         def run() -> None:
-            app.mic_test_active = True     # hotkey presses refuse mid-test
             try:
                 # No timeout escape: warmup drives the engine without
                 # holding engine_lock, so proceeding early could run the
@@ -911,6 +956,66 @@ def _run(args: argparse.Namespace) -> int:
         """Raises ValueError on an unusable combo (settings capture box)."""
         keyboard.HotKey.parse(to_pynput_combo(combo))
 
+    def calibrate_noise(on_done) -> bool:
+        """Settings 'Calibrate room noise' (M9): record 2s of QUIET room,
+        estimate the per-frequency floor, save it for the active mic and
+        attach it live. Async; False while a dictation or another mic
+        session is running (atomic claim, same as Test mic)."""
+        if not app.claim_mic_session():
+            return False
+
+        def run() -> None:
+            try:
+                app.warm.wait()
+                recorder.start()
+                time.sleep(2.0)
+                audio, rate = recorder.stop()
+                if len(audio) == 0:
+                    on_done("(no audio captured - mic delivered nothing)")
+                    return
+                audio16 = ensure_16k_mono(audio, rate)
+                if app.vad is not None:
+                    with app.engine_lock:  # vad is also used by the worker
+                        speech = app.vad.trim(audio16)
+                    if speech is not None:
+                        on_done("(speech detected - stay quiet during "
+                                "calibration and try again)")
+                        return
+                # Same high-pass as the live chain: the floor must describe
+                # what reduce_noise actually sees.
+                floor = estimate_noise_floor(high_pass(audio16))
+                from localflow.desktop import noiseprofile
+                noiseprofile.save_profile(floor, recorder.device_name)
+                app.preprocess = build_preprocessor()  # attach immediately
+                on_done(f"Calibrated for {recorder.device_name}")
+            except Exception as e:
+                log.exception("noise calibration failed")
+                try:
+                    on_done(f"(calibration failed: {e})")
+                except Exception:
+                    pass
+            finally:
+                app.mic_test_active = False
+
+        threading.Thread(target=run, daemon=True,
+                         name="localflow-calibrate").start()
+        return True
+
+    def clear_noise_calibration() -> str:
+        from localflow.desktop import noiseprofile
+        removed = noiseprofile.clear_profile()
+        app.preprocess = build_preprocessor()
+        return "Calibration cleared" if removed else "No calibration saved"
+
+    def calibration_status() -> str:
+        from localflow.desktop import noiseprofile
+        loaded = noiseprofile.load_profile()
+        if loaded is None:
+            return "No room-noise calibration saved"
+        _floor, device, saved_at = loaded
+        when = time.strftime("%d %b %H:%M", time.localtime(saved_at))
+        return f"Calibrated for {device} ({when})"
+
     def wire_settings_ui(ov) -> None:
         """Give an overlay the settings-window factory (runs on ITS UI
         thread via the overlay command queue)."""
@@ -929,6 +1034,9 @@ def _run(args: argparse.Namespace) -> int:
             latest_level=lambda: latest_level["rms"],
             test_mic=test_mic,
             validate_hotkey=validate_hotkey,
+            calibrate=calibrate_noise,
+            clear_calibration=clear_noise_calibration,
+            calibration_status=calibration_status,
             reset_pill_position=reset_pill_position,
             open_config_file=lambda: config.open_settings_editor(settings_path),
             status_text=f"{engine.model_name} on {engine.device}",
@@ -990,7 +1098,7 @@ def _run(args: argparse.Namespace) -> int:
         # VadGate build + warm pass off the critical path (M6). The worker
         # waits on app.warm, so the engine is never used from two threads.
         try:
-            app.vad = VadGate()
+            app.vad = VadGate(threshold=cfg.vad_threshold)
             warmup(engine, app.vad, app.cleanup, preprocess)
         except Exception:
             log.exception("background warmup failed — dictation continues "

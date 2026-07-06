@@ -40,21 +40,25 @@ _VIS_BY_LABEL = {v: k for k, v in _VIS_LABELS.items()}
 
 # -- pure helpers (unit-tested, no Tk) -----------------------------------
 
-# Environment presets set ONLY the two audio controls (denoise strength +
-# normalize). Values are first guesses from the v1.1 plan; M9 tunes them live.
-PRESETS: dict[str, tuple[float, bool]] = {
-    "Quiet room": (0.3, True),
-    "Noisy room": (0.75, True),
-    "Headset": (0.2, True),
+# Environment presets set the audio controls (denoise strength, speech
+# sensitivity, normalize). Values are first guesses from the v1.1 plan;
+# M9 tunes them live.
+PRESETS: dict[str, tuple[float, float, bool]] = {
+    "Quiet room": (0.3, 0.5, True),
+    "Noisy room": (0.75, 0.6, True),
+    "Headset": (0.2, 0.45, True),
 }
 
 
-def preset_name_for(denoise_strength: float, normalize: bool) -> str:
+def preset_name_for(denoise_strength: float, sensitivity: float,
+                    normalize: bool) -> str:
     """Which preset matches the current audio values (tolerance 0.01), else
     'Custom'. Used both to initialize the combobox and to flip it back when
     a hand-moved slider happens to land exactly on a preset."""
-    for name, (strength, norm) in PRESETS.items():
-        if abs(strength - denoise_strength) <= 0.01 and norm == bool(normalize):
+    for name, (strength, sens, norm) in PRESETS.items():
+        if (abs(strength - denoise_strength) <= 0.01
+                and abs(sens - sensitivity) <= 0.01
+                and norm == bool(normalize)):
             return name
     return "Custom"
 
@@ -154,6 +158,7 @@ def collect_changes(initial: dict, current: dict) -> dict:
 
 _COERCERS = {
     "denoise_strength": float,
+    "vad_threshold": float,
     "restore_delay_ms": int,
     "pill_size": float,
     "cleanup_enabled": bool,
@@ -187,7 +192,8 @@ class SettingsContext:
     def __init__(self, *, cfg, apply, list_mics, mic_name, fallback_active,
                  latest_level, test_mic, validate_hotkey, reset_pill_position,
                  open_config_file, status_text, cleanup_available,
-                 cleanup_active):
+                 cleanup_active, calibrate=None, clear_calibration=None,
+                 calibration_status=None):
         self.cfg = cfg
         self.apply = apply
         self.list_mics = list_mics
@@ -201,6 +207,11 @@ class SettingsContext:
         self.status_text = status_text
         self.cleanup_available = cleanup_available
         self.cleanup_active = cleanup_active
+        # M9: room-noise calibration (None on older wiring = buttons stay
+        # disabled, same as the M8 placeholders).
+        self.calibrate = calibrate
+        self.clear_calibration = clear_calibration
+        self.calibration_status = calibration_status
 
 
 # -- the window (overlay UI thread only) ----------------------------------
@@ -380,6 +391,7 @@ class _SettingsWindow:
         box.pack(fill="x", pady=(0, 6))
         self.preset_var = tk.StringVar(value=preset_name_for(
             round(float(self.ctx.cfg.denoise_strength), 2),
+            round(float(self.ctx.cfg.vad_threshold), 2),
             bool(self.ctx.cfg.normalize_audio)))
         combo = ttk.Combobox(box, state="readonly", width=20,
                              textvariable=self.preset_var,
@@ -407,11 +419,16 @@ class _SettingsWindow:
         row = ttk.Frame(box)
         row.pack(fill="x", pady=(4, 0))
         ttk.Label(row, text="Speech sensitivity", width=18).pack(side="left")
-        sens = ttk.Scale(row, from_=0.0, to=1.0, length=180)
-        sens.state(["disabled"])
-        sens.pack(side="left")
-        ttk.Label(row, text="(coming in M9)",
-                  foreground=_DIM).pack(side="left", padx=(6, 0))
+        self.sens_var = tk.DoubleVar(
+            value=round(float(self.ctx.cfg.vad_threshold), 2))
+        ttk.Scale(row, from_=0.3, to=0.7, variable=self.sens_var, length=180,
+                  command=self._safe(self._on_sens_moved)).pack(side="left")
+        self.sens_val = ttk.Label(row, text=f"{self.sens_var.get():.2f}",
+                                  width=5)
+        self.sens_val.pack(side="left", padx=(6, 0))
+        ttk.Label(box, text="lower = quiet speech accepted, "
+                            "higher = background noise gated",
+                  foreground=_DIM).pack(anchor="w")
 
         self.normalize_var = tk.BooleanVar(
             value=bool(self.ctx.cfg.normalize_audio))
@@ -420,13 +437,24 @@ class _SettingsWindow:
                         command=self._safe(self._on_audio_touched)
                         ).pack(anchor="w", pady=(4, 0))
 
+        # M9: room-noise calibration. Buttons stay disabled when the app
+        # wiring predates the feature (ctx.calibrate is None).
         row = ttk.Frame(box)
         row.pack(fill="x", pady=(4, 0))
-        calibrate = ttk.Button(row, text="Calibrate room noise")
-        calibrate.state(["disabled"])
-        calibrate.pack(side="left")
-        ttk.Label(row, text="(coming in M9)",
-                  foreground=_DIM).pack(side="left", padx=(6, 0))
+        self.calibrate_btn = ttk.Button(
+            row, text="Calibrate room noise",
+            command=self._safe(self._on_calibrate))
+        self.calibrate_btn.pack(side="left")
+        self.clear_cal_btn = ttk.Button(
+            row, text="Clear calibration",
+            command=self._safe(self._on_clear_calibration))
+        self.clear_cal_btn.pack(side="left", padx=(6, 0))
+        if self.ctx.calibrate is None:
+            self.calibrate_btn.state(["disabled"])
+            self.clear_cal_btn.state(["disabled"])
+        self.cal_status = ttk.Label(box, text=self._calibration_text(),
+                                    foreground=_DIM, wraplength=_WRAP)
+        self.cal_status.pack(anchor="w", pady=(4, 0))
 
     def _build_hotkey(self, parent) -> None:
         box = ttk.LabelFrame(parent, text="Hotkey", padding=8)
@@ -654,10 +682,12 @@ class _SettingsWindow:
         # that programmatic move from flipping the combobox straight back.
         self._applying_preset = True
         try:
-            strength, normalize = preset
+            strength, sensitivity, normalize = preset
             self.denoise_var.set(strength)
+            self.sens_var.set(sensitivity)
             self.normalize_var.set(normalize)
             self.denoise_val.config(text=f"{strength:.2f}")
+            self.sens_val.config(text=f"{sensitivity:.2f}")
         finally:
             self._applying_preset = False
 
@@ -665,15 +695,69 @@ class _SettingsWindow:
         self.denoise_val.config(text=f"{self.denoise_var.get():.2f}")
         self._on_audio_touched()
 
+    def _on_sens_moved(self) -> None:
+        self.sens_val.config(text=f"{self.sens_var.get():.2f}")
+        self._on_audio_touched()
+
     def _on_audio_touched(self) -> None:
         if self._applying_preset:
             return
         self.preset_var.set(preset_name_for(
             round(float(self.denoise_var.get()), 2),
+            round(float(self.sens_var.get()), 2),
             bool(self.normalize_var.get())))
 
     def _on_pill_moved(self) -> None:
         self.pill_val.config(text=f"{self.pill_var.get():.2f}")
+
+    # -- room-noise calibration (M9) ---------------------------------------
+
+    def _calibration_text(self) -> str:
+        if self.ctx.calibration_status is None:
+            return "(calibration not wired)"
+        try:
+            return str(self.ctx.calibration_status())
+        except Exception:
+            log.exception("calibration status failed")
+            return ""
+
+    def _on_calibrate(self) -> None:
+        if self.ctx.calibrate is None:
+            return
+        self.calibrate_btn.state(["disabled"])
+        self.cal_status.config(text="Recording 2s - stay QUIET...",
+                               foreground=_WARN)
+
+        def done(message: str) -> None:
+            # arrives on the calibration worker thread - marshal to Tk;
+            # the window may be gone (pill rebuild), which is fine
+            def show() -> None:
+                self.cal_status.config(
+                    text=f"{message}  |  {self._calibration_text()}",
+                    foreground=_DIM)
+                self.calibrate_btn.state(["!disabled"])
+            try:
+                self.top.after(0, self._safe(show))
+            except tk.TclError:
+                pass
+
+        started = self.ctx.calibrate(done)
+        if not started:
+            self.cal_status.config(
+                text="A dictation is running - try again in a moment",
+                foreground=_WARN)
+            self.calibrate_btn.state(["!disabled"])
+
+    def _on_clear_calibration(self) -> None:
+        if self.ctx.clear_calibration is None:
+            return
+        try:
+            note = str(self.ctx.clear_calibration())
+        except Exception:
+            log.exception("clear calibration failed")
+            note = "(clear failed - see the log)"
+        self.cal_status.config(text=f"{note}  |  {self._calibration_text()}",
+                               foreground=_DIM)
 
     # -- hotkey capture --------------------------------------------------------
 
@@ -765,6 +849,7 @@ class _SettingsWindow:
             idx = self._mic_index
         values["input_device"] = self._mic_rows[idx][1]
         values["denoise_strength"] = round(float(self.denoise_var.get()), 2)
+        values["vad_threshold"] = round(float(self.sens_var.get()), 2)
         values["normalize_audio"] = bool(self.normalize_var.get())
         values["hotkey"] = self.hotkey_var.get()
         values["overlay_visibility"] = _VIS_BY_LABEL.get(

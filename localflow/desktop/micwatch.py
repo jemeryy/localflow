@@ -33,10 +33,15 @@ class DefaultMicWatcher:
     """Polls the default capture endpoint; calls
     recorder.refresh_default_device() when it changes."""
 
-    def __init__(self, recorder, interval_s: float = 2.0, get_id=None):
+    def __init__(self, recorder, interval_s: float = 2.0, get_id=None,
+                 on_switch=None):
         self._recorder = recorder
         self._interval = interval_s
         self._get_id = get_id or _default_endpoint_id
+        # M9: fired (no args) after a successful device swap so the app can
+        # rebuild anything device-bound - e.g. the calibrated noise floor,
+        # which belongs to ONE mic and must not survive a hot-swap.
+        self._on_switch = on_switch
         self._last: str | None = None
         self._stop = threading.Event()
         self._thread = threading.Thread(
@@ -76,6 +81,11 @@ class DefaultMicWatcher:
         self._last = current
         log.info("default mic changed -> now recording from %r",
                  self._recorder.device_name)
+        if self._on_switch is not None:
+            try:
+                self._on_switch()
+            except Exception:
+                log.exception("on_switch callback failed - watcher continues")
         return True
 
     def _watch(self) -> None:

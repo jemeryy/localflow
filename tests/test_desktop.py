@@ -844,3 +844,34 @@ def test_mic_test_suppresses_hotkey_down_and_its_release(recorder):
     app.on_hotkey_up()
     assert app._work.qsize() == 1
     assert states == ["rec", "busy"]
+
+
+def test_claim_mic_session_is_exclusive(recorder):
+    """M9 review: Test mic / Calibrate / hotkey all want the recorder;
+    exactly one owner may win, atomically."""
+    app = _bare_app(recorder=recorder)
+    assert app.claim_mic_session() is True
+    assert app.claim_mic_session() is False      # second claimant loses
+    app.mic_test_active = False                  # owner released (finally)
+    recorder.start()                             # a dictation is running
+    assert app.claim_mic_session() is False
+    recorder.stop()
+    assert app.claim_mic_session() is True
+
+
+def test_mic_watcher_on_switch_fires_after_swap(recorder, monkeypatch):
+    from localflow.desktop import capture
+    from localflow.desktop.micwatch import DefaultMicWatcher
+
+    monkeypatch.setattr(capture.sd, "_terminate", lambda: None)
+    monkeypatch.setattr(capture.sd, "_initialize", lambda: None)
+
+    fired: list[int] = []
+    current = {"id": "mic-A"}
+    watcher = DefaultMicWatcher(recorder, get_id=lambda: current["id"],
+                                on_switch=lambda: fired.append(1))
+    watcher.check_once()                         # baseline
+    assert fired == []
+    current["id"] = "mic-B"
+    assert watcher.check_once() is True          # swapped...
+    assert fired == [1]                          # ...and the app was told

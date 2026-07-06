@@ -52,6 +52,8 @@ denoise_enabled = true    # high-pass + gentle spectral noise reduction
 normalize_audio = true    # boost quiet mics toward a consistent loudness
 denoise_strength = 0.6    # 0 = off, ~0.6 gentle, ~0.9 aggressive (can eat
                           # quiet speech — dial DOWN if accuracy regresses)
+vad_threshold = 0.5       # speech sensitivity: lower = quiet speech accepted,
+                          # higher = background noise gated (slider 0.3-0.7)
 
 # Mic: sounddevice index or name substring; omit to follow the system
 # default (LocalFlow auto-switches when the Windows default mic changes).
@@ -116,6 +118,17 @@ class Config(BaseModel):
     denoise_enabled: bool = True
     normalize_audio: bool = True
     denoise_strength: float = 0.6
+    # M9: Silero VAD speech-probability threshold. Lower accepts quiet
+    # speech; higher gates background noise. The settings slider exposes
+    # 0.3-0.7; the config tolerates a little more headroom.
+    vad_threshold: float = 0.5
+
+    @field_validator("vad_threshold")
+    @classmethod
+    def _vad_threshold_sane(cls, v: float) -> float:
+        if not 0.1 <= v <= 0.9:
+            raise ValueError("vad_threshold must be between 0.1 and 0.9")
+        return v
     input_device: int | str | None = None
     # Jargon Whisper mishears — biases transcription toward these spellings.
     # Takes effect on restart.

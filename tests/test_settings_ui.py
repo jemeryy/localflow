@@ -14,31 +14,34 @@ from localflow.desktop import settings_ui as ui
 
 # -- environment presets -------------------------------------------------
 
-def test_presets_set_only_the_two_audio_controls():
-    assert ui.PRESETS["Quiet room"] == (0.3, True)
-    assert ui.PRESETS["Noisy room"] == (0.75, True)
-    assert ui.PRESETS["Headset"] == (0.2, True)
+def test_presets_set_the_audio_controls():
+    # (denoise_strength, speech sensitivity, normalize) - M9 added the
+    # sensitivity value from the v1.1 plan's starting guesses.
+    assert ui.PRESETS["Quiet room"] == (0.3, 0.5, True)
+    assert ui.PRESETS["Noisy room"] == (0.75, 0.6, True)
+    assert ui.PRESETS["Headset"] == (0.2, 0.45, True)
 
 
 def test_preset_name_for_exact_matches():
-    assert ui.preset_name_for(0.3, True) == "Quiet room"
-    assert ui.preset_name_for(0.75, True) == "Noisy room"
-    assert ui.preset_name_for(0.2, True) == "Headset"
+    assert ui.preset_name_for(0.3, 0.5, True) == "Quiet room"
+    assert ui.preset_name_for(0.75, 0.6, True) == "Noisy room"
+    assert ui.preset_name_for(0.2, 0.45, True) == "Headset"
 
 
 def test_preset_name_for_tolerance():
     # slider floats land near, not on, the preset value
-    assert ui.preset_name_for(0.301, True) == "Quiet room"
-    assert ui.preset_name_for(0.291, True) == "Quiet room"
-    assert ui.preset_name_for(0.32, True) == "Custom"
+    assert ui.preset_name_for(0.301, 0.5, True) == "Quiet room"
+    assert ui.preset_name_for(0.291, 0.499, True) == "Quiet room"
+    assert ui.preset_name_for(0.32, 0.5, True) == "Custom"
 
 
-def test_preset_name_for_normalize_must_match():
-    assert ui.preset_name_for(0.3, False) == "Custom"
+def test_preset_name_for_every_value_must_match():
+    assert ui.preset_name_for(0.3, 0.5, False) == "Custom"   # normalize off
+    assert ui.preset_name_for(0.3, 0.6, True) == "Custom"    # wrong sens
 
 
 def test_preset_name_for_unmatched_is_custom():
-    assert ui.preset_name_for(0.6, True) == "Custom"
+    assert ui.preset_name_for(0.6, 0.5, True) == "Custom"
 
 
 # -- hotkey capture conversion --------------------------------------------
