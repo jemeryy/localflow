@@ -194,6 +194,9 @@ class WaveformOverlay:
         self.on_quit = on_quit        # menu Quit: ask the app to shut down
         self.on_position_change = None  # called with [x, y] on drag, None on reset
         self.on_settings = None       # menu Settings row; None -> open the toml
+        # M8: app-provided factory building the settings window on THIS
+        # overlay's UI thread (called with the Tk root). None -> toml.
+        self.settings_factory = None
         self._pill_size = min(2.0, max(0.5, float(pill_size)))
         self._visibility = visibility if visibility in (
             "always", "dictating", "never") else "always"
@@ -221,6 +224,10 @@ class WaveformOverlay:
     def reset_position(self) -> None:
         """Back to default bottom-center; reports None to on_position_change."""
         self._cmd.put(("reset_pos", None))
+
+    def open_settings(self) -> None:
+        """Open the settings window on the UI thread (tray + pill menu)."""
+        self._cmd.put(("open_settings", None))
 
     def close(self) -> None:
         self._cmd.put("quit")
@@ -658,6 +665,14 @@ class WaveformOverlay:
                             self._pos = None
                             apply(self._state)     # snap to bottom-center
                             notify_position(None)
+                        elif op == "open_settings":
+                            if self.settings_factory is not None:
+                                try:
+                                    self.settings_factory(root)
+                                except Exception:
+                                    log.exception("settings window failed")
+                            else:
+                                open_settings()    # escape hatch: the toml
                         continue
                     apply(cmd)
             except queue.Empty:

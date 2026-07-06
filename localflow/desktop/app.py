@@ -176,6 +176,16 @@ class LocalFlowApp:
         self.warm = threading.Event()
         if vad is not None:
             self.warm.set()
+        # M8: the settings "Test mic" runs a transcription off the worker
+        # thread; this lock keeps the engine strictly single-threaded, and
+        # the flag keeps the RECORDER single-owner (a hotkey press during
+        # the 3s test is refused instead of truncating both captures).
+        self.engine_lock = threading.Lock()
+        self.mic_test_active = False
+        # A refused key-down must also swallow its key-up: the listener
+        # tracks the combo as active regardless, and an unpaired
+        # on_hotkey_up would stop (steal) the mic test's recording.
+        self._hotkey_suppressed = False
         self._work: queue.Queue = queue.Queue()
         self._worker = threading.Thread(target=self._drain, daemon=True)
 
@@ -188,6 +198,13 @@ class LocalFlowApp:
             log.exception("state callback failed — app keeps running")
 
     def on_hotkey_down(self) -> None:
+        if self.mic_test_active:
+            # The settings "Test mic" owns the recorder for ~3s; a dictation
+            # starting mid-test would truncate both captures (M8).
+            self._hotkey_suppressed = True
+            print("[--] mic test in progress - try again in a moment",
+                  flush=True)
+            return
         self.recorder.start()
         self._set_state("rec")
         # FR-2 indicator (tray dot; console line kept for --no-tray). ASCII
@@ -195,6 +212,9 @@ class LocalFlowApp:
         print("[rec] recording - release to transcribe", flush=True)
 
     def on_hotkey_up(self) -> None:
+        if self._hotkey_suppressed:
+            self._hotkey_suppressed = False  # the matching refused key-down
+            return
         audio, rate = self.recorder.stop()
         self._set_state("busy")
         # Hand off immediately: transcribe + inject must stay off the
@@ -205,6 +225,12 @@ class LocalFlowApp:
         """Click-to-dictate (overlay): first call starts recording, second
         stops and transcribes. Runs on the overlay's Tk thread — both paths
         only flip the recorder and enqueue, same contract as the hotkey."""
+        if self.mic_test_active:
+            # recorder.recording is True DURING the mic test - a pill click
+            # must not stop (steal) the test capture.
+            print("[--] mic test in progress - try again in a moment",
+                  flush=True)
+            return
         if self.recorder.recording:
             self.on_hotkey_up()
         else:
@@ -335,8 +361,9 @@ class LocalFlowApp:
             self.warm.wait()
         audio16 = ensure_16k_mono(audio, rate)
         cleanup = self.cleanup if self.cleanup_active else None
-        result = transcribe_audio(audio16, self.engine, cleanup=cleanup,
-                                  vad=self.vad, preprocess=self.preprocess)
+        with self.engine_lock:
+            result = transcribe_audio(audio16, self.engine, cleanup=cleanup,
+                                      vad=self.vad, preprocess=self.preprocess)
         # clean_text is None when cleanup is off or failed — raw always wins
         # over no paste (FR-8: cleanup can never block dictation).
         text = result.clean_text if result.clean_text is not None else result.raw_text
@@ -384,6 +411,57 @@ def apply_cli_overrides(cfg: config.Config, args: argparse.Namespace) -> config.
     if getattr(args, "no_overlay", False):
         cfg.overlay_enabled = False
     return cfg
+
+
+# M8: live-apply plumbing. Keys listed here take effect only on restart;
+# everything else in Config has a live path in apply_settings below (the
+# settings window shows a "takes effect on restart" note for these).
+RESTART_KEYS = frozenset({
+    "device", "fallback_device", "stt_model_dir", "cleanup_model_dir",
+    "cache_dir", "hot_words", "overlay_enabled",
+})
+_PREPROCESS_KEYS = ("denoise_enabled", "normalize_audio", "denoise_strength")
+
+
+def apply_settings(changes: dict, cfg: config.Config, hooks: dict) -> set[str]:
+    """Apply already-validated settings changes to the RUNNING app (M8).
+
+    `hooks` maps action names to callables owned by _run():
+    hotkey, preprocess, restore_delay, inject_mode, input_device,
+    visibility, pill_size, cleanup. Only keys that actually differ from
+    `cfg` are applied; `cfg` is mutated so it stays the source of truth.
+    Returns the subset of keys that need a restart instead."""
+    restart: set[str] = set()
+    preprocess_dirty = False
+    for key, value in changes.items():
+        if getattr(cfg, key, object()) == value:
+            continue
+        setattr(cfg, key, value)
+        if key in RESTART_KEYS:
+            restart.add(key)
+        elif key in _PREPROCESS_KEYS:
+            preprocess_dirty = True     # one rebuild for the whole group
+        elif key == "hotkey":
+            hooks["hotkey"](value)
+        elif key == "restore_delay_ms":
+            hooks["restore_delay"](value / 1000.0)
+        elif key == "inject_mode":
+            hooks["inject_mode"](value)
+        elif key == "input_device":
+            hooks["input_device"](value)
+        elif key == "overlay_visibility":
+            hooks["visibility"](value)
+        elif key == "pill_size":
+            hooks["pill_size"](value)
+        elif key == "cleanup_enabled":
+            hooks["cleanup"](value)
+        elif key == "overlay_position":
+            pass                        # owned by the drag/reset paths
+        else:
+            restart.add(key)            # no live path -> be honest
+    if preprocess_dirty:
+        hooks["preprocess"]()
+    return restart
 
 
 def warmup(engine: SttEngine, vad: VadGate, cleanup=None,
@@ -494,6 +572,13 @@ def _run(args: argparse.Namespace) -> int:
         except Exception:
             log.exception("could not save settings %s", sorted(changes))
 
+    def save_pill_position(pos) -> None:
+        # cfg must track the drag too: a pill_size rebuild (M8) reads
+        # cfg.overlay_position - a file-only save would snap the pill back
+        # to a stale spot on rebuild.
+        cfg.overlay_position = pos
+        persist_settings({"overlay_position": pos})
+
     # The overlay goes up FIRST so launching gives instant feedback ("loading
     # models...") instead of a blank few seconds; it fails soft to no overlay.
     # M7: the overlay thread + Tk root exist in EVERY visibility mode (the
@@ -508,8 +593,7 @@ def _run(args: argparse.Namespace) -> int:
                                   visibility=overlay_visibility,
                                   position=cfg.overlay_position,
                                   pill_size=cfg.pill_size)
-        overlay.on_position_change = (
-            lambda pos: persist_settings({"overlay_position": pos}))
+        overlay.on_position_change = save_pill_position
         overlay.set_state("loading")
     except Exception:
         log.exception("overlay unavailable — continuing without it")
@@ -595,20 +679,22 @@ def _run(args: argparse.Namespace) -> int:
     if mic_open_err:
         raise mic_open_err[0]
 
-    # No pinned mic -> follow the Windows default, live (hot-swaps the
-    # stream when the default capture endpoint changes).
+    # Follow the Windows default mic, live. The watcher now always runs
+    # (M8: the mic can be pinned/unpinned from the settings window without
+    # a restart); check_once() itself no-ops the switch while pinned and
+    # keeps the heal tick either way.
     watcher = None
-    if input_device is None:
-        try:
-            from localflow.desktop.micwatch import DefaultMicWatcher
-            watcher = DefaultMicWatcher(recorder)
-            watcher.start()
-            log.info("following the system default mic (pin one via "
-                     "input_device in localflow.toml to disable)")
-        except Exception:
-            log.exception("default-mic watcher unavailable — the mic is "
-                          "fixed for this session")
-            watcher = None
+    try:
+        from localflow.desktop.micwatch import DefaultMicWatcher
+        watcher = DefaultMicWatcher(recorder)
+        watcher.start()
+        if input_device is None:
+            log.info("following the system default mic (pin one in "
+                     "Settings or localflow.toml to disable)")
+    except Exception:
+        log.exception("default-mic watcher unavailable — the mic is "
+                      "fixed for this session")
+        watcher = None
 
     # vad=None: the VadGate arrives from the warmup thread below; the worker
     # waits on app.warm before its first transcribe (never crashes or drops).
@@ -617,8 +703,10 @@ def _run(args: argparse.Namespace) -> int:
                        restore_delay_s=cfg.restore_delay_ms / 1000.0,
                        preprocess=preprocess)
     app.start_worker()
-    hotkey = PushToTalkListener(cfg.hotkey, app.on_hotkey_down, app.on_hotkey_up)
-    hotkey.start()
+    # Held in a ref so the settings window can rebuild it live (M8).
+    hotkey_ref = {"listener": PushToTalkListener(
+        cfg.hotkey, app.on_hotkey_down, app.on_hotkey_up)}
+    hotkey_ref["listener"].start()
 
     # M7: pill visibility + position controls, live from the tray.
     vis_state = {"mode": overlay_visibility}
@@ -639,6 +727,15 @@ def _run(args: argparse.Namespace) -> int:
         if overlay is not None:
             overlay.reset_position()  # its callback persists the removal
 
+    def open_settings_entry() -> None:
+        # M8: the settings window lives on the overlay's UI thread; the
+        # overlay marshals this through its command queue. No overlay ->
+        # the old escape hatch (open the toml).
+        if overlay is not None:
+            overlay.open_settings()
+        else:
+            config.open_settings_editor(settings_path)
+
     tray = None
     if not args.no_tray:
         try:
@@ -652,7 +749,8 @@ def _run(args: argparse.Namespace) -> int:
                             visibility_set=set_pill_visibility
                             if overlay is not None else None,
                             reset_pill_position=reset_pill_position
-                            if overlay is not None else None)
+                            if overlay is not None else None,
+                            open_settings=open_settings_entry)
         except Exception:
             log.exception("tray unavailable — falling back to console-only mode")
             tray = None
@@ -663,20 +761,216 @@ def _run(args: argparse.Namespace) -> int:
         if overlay is not None:
             overlay.set_state(state)
 
+    quit_event = threading.Event()
+
     def request_quit() -> None:
         # Overlay "Quit": unblock whichever loop owns the main thread.
         log.info("quit requested from the overlay")
+        quit_event.set()
         if tray is not None:
             tray.stop()
-        else:
-            hotkey.stop()
 
-    app.on_state = fan_out_state
-    if overlay is not None:
-        recorder.on_level = overlay.push_level
+    # M8: mic levels fan out to the pill AND the settings window's meter.
+    level_sinks: list = []
+
+    def fan_out_level(rms: float) -> None:
+        for sink in list(level_sinks):
+            try:
+                sink(rms)
+            except Exception:
+                log.debug("level sink failed", exc_info=True)
+
+    recorder.on_level = fan_out_level
+
+    # -- M8: live-apply hooks (each owns ONE settings key's live path) ----
+    def hook_hotkey(combo: str) -> None:
+        old = hotkey_ref["listener"]
+        new = PushToTalkListener(combo, app.on_hotkey_down, app.on_hotkey_up)
+        new.start()
+        hotkey_ref["listener"] = new
+        old.stop()
+        log.info("hotkey rebuilt live -> %s", combo)
+
+    def hook_preprocess() -> None:
+        if cfg.denoise_enabled or cfg.normalize_audio:
+            app.preprocess = AudioPreprocessor(
+                denoise=cfg.denoise_enabled, normalize=cfg.normalize_audio,
+                denoise_strength=cfg.denoise_strength)
+            log.info("audio preprocessing now: %s", app.preprocess.describe())
+        else:
+            app.preprocess = None
+            log.info("audio preprocessing now: off")
+
+    def hook_input_device(value) -> None:
+        dev = value
+        if isinstance(dev, str) and dev.isdigit():
+            dev = int(dev)
+        recorder._configured_device = dev if dev != "" else None
+        recorder.input_device = recorder._configured_device
+        recorder.refresh_default_device()
+        log.info("mic %s", f"pinned to {dev!r}" if dev not in (None, "")
+                 else "following the system default again")
+
+    def hook_pill_size(_value: float) -> None:
+        # The pill's scale is baked into its UI thread at build time; a
+        # live change means tearing that thread down and rebuilding it.
+        # Must NOT run on the overlay's own thread (close() joins it) —
+        # the settings window calls this via its rebuild-worker thread.
+        rebuild_overlay()
+
+    def hook_cleanup(on: bool) -> None:
+        if bool(on) != app.cleanup_active:
+            app.toggle_cleanup()
+
+    def hook_restore_delay(seconds: float) -> None:
+        app.restore_delay_s = seconds
+
+    def hook_inject_mode(mode: str) -> None:
+        app.inject_mode = mode
+
+    live_hooks = {
+        "hotkey": hook_hotkey,
+        "preprocess": hook_preprocess,
+        "restore_delay": hook_restore_delay,
+        "inject_mode": hook_inject_mode,
+        "input_device": hook_input_device,
+        "visibility": set_pill_visibility,
+        "pill_size": hook_pill_size,
+        "cleanup": hook_cleanup,
+    }
+
+    def apply_from_ui(changes: dict) -> set[str]:
+        """Settings window Apply: validate the merged config, persist only
+        the real deltas (comment-preserving), live-apply. Returns the keys
+        that need a restart (the window shows the note)."""
+        config.Config(**{**cfg.model_dump(), **changes})  # validate first
+        delta = {k: v for k, v in changes.items()
+                 if getattr(cfg, k, object()) != v}
+        if not delta:
+            return set()
+        persist_settings(delta)
+        return apply_settings(delta, cfg, live_hooks)
+
+    def list_mics() -> list[tuple[str, object]]:
+        """(label, input_device value). First entry = follow the default."""
+        mics: list[tuple[str, object]] = [
+            ("System default (follow Windows)", None)]
+        try:
+            import sounddevice as sd
+            hostapis = sd.query_hostapis()
+            for idx, dev in enumerate(sd.query_devices()):
+                if (dev["max_input_channels"] >= 1 and
+                        hostapis[dev["hostapi"]]["name"] == "Windows WASAPI"):
+                    mics.append((str(dev["name"]), idx))
+        except Exception:
+            log.exception("mic enumeration failed")
+        return mics
+
+    latest_level = {"rms": 0.0}
+    level_sinks.append(lambda rms: latest_level.__setitem__("rms", rms))
+
+    def test_mic(on_done) -> bool:
+        """Settings 'Test mic': ~3s capture through the real pipeline, no
+        injection. Async (worker thread); False when a dictation is live."""
+        if recorder.recording:
+            return False
+
+        def run() -> None:
+            app.mic_test_active = True     # hotkey presses refuse mid-test
+            try:
+                # No timeout escape: warmup drives the engine without
+                # holding engine_lock, so proceeding early could run the
+                # engine from two threads. warm is set in a finally.
+                app.warm.wait()
+                recorder.start()
+                time.sleep(3.0)
+                audio, rate = recorder.stop()
+                if len(audio) == 0:
+                    on_done("(no audio captured - mic delivered nothing)")
+                    return
+                audio16 = ensure_16k_mono(audio, rate)
+                with app.engine_lock:  # never race a real dictation
+                    result = transcribe_audio(
+                        audio16, app.engine, cleanup=None, vad=app.vad,
+                        preprocess=app.preprocess)
+                on_done(result.raw_text.strip() or "(silence)")
+            except Exception as e:
+                log.exception("mic test failed")
+                try:
+                    on_done(f"(mic test failed: {e})")
+                except Exception:
+                    pass
+            finally:
+                app.mic_test_active = False
+
+        threading.Thread(target=run, daemon=True,
+                         name="localflow-mic-test").start()
+        return True
+
+    def validate_hotkey(combo: str) -> None:
+        """Raises ValueError on an unusable combo (settings capture box)."""
+        keyboard.HotKey.parse(to_pynput_combo(combo))
+
+    def wire_settings_ui(ov) -> None:
+        """Give an overlay the settings-window factory (runs on ITS UI
+        thread via the overlay command queue)."""
+        try:
+            from localflow.desktop import settings_ui
+        except Exception:
+            log.exception("settings window unavailable — the Settings "
+                          "entries fall back to opening the toml")
+            return
+        ctx = settings_ui.SettingsContext(
+            cfg=cfg,
+            apply=apply_from_ui,
+            list_mics=list_mics,
+            mic_name=lambda: recorder.device_name,
+            fallback_active=lambda: recorder.fallback_active,
+            latest_level=lambda: latest_level["rms"],
+            test_mic=test_mic,
+            validate_hotkey=validate_hotkey,
+            reset_pill_position=reset_pill_position,
+            open_config_file=lambda: config.open_settings_editor(settings_path),
+            status_text=f"{engine.model_name} on {engine.device}",
+            cleanup_available=app.cleanup_available,
+            cleanup_active=lambda: app.cleanup_active,
+        )
+        ov.settings_factory = lambda root: settings_ui.open_settings(root, ctx)
+        ov.on_settings = ov.open_settings
+
+    def rebuild_overlay() -> None:
+        """pill_size live-apply: tear down the pill's UI thread and build a
+        fresh one at the new scale. NEVER call from the overlay UI thread
+        (close() joins it) — the settings window uses a worker thread."""
+        nonlocal overlay
+        old = overlay
+        if old is not None:
+            try:
+                level_sinks.remove(old.push_level)
+            except ValueError:
+                pass
+            old.close()
+        from localflow.desktop.overlay import WaveformOverlay
+        overlay = WaveformOverlay(hotkey=cfg.hotkey,
+                                  visibility=vis_state["mode"],
+                                  position=cfg.overlay_position,
+                                  pill_size=cfg.pill_size)
+        overlay.on_position_change = save_pill_position
         overlay.settings_path = settings_path
         overlay.on_toggle = app.toggle_recording
         overlay.on_quit = request_quit
+        wire_settings_ui(overlay)
+        level_sinks.append(overlay.push_level)
+        overlay.set_state("idle")
+        log.info("pill rebuilt at size %.2f", cfg.pill_size)
+
+    app.on_state = fan_out_state
+    if overlay is not None:
+        level_sinks.append(overlay.push_level)
+        overlay.settings_path = settings_path
+        overlay.on_toggle = app.toggle_recording
+        overlay.on_quit = request_quit
+        wire_settings_ui(overlay)
         overlay.set_state("warming")  # dictation works; warmup still running
 
     hotkey_live_s = (_IMPORT_AGE_S or 0.0) + (time.perf_counter() - _T_MODULE)
@@ -730,12 +1024,16 @@ def _run(args: argparse.Namespace) -> int:
         if tray is not None:
             tray.run()  # blocks the MAIN thread (Windows message loop)
         else:
-            hotkey.join()
+            # Not the listener's join(): a live hotkey rebuild (M8) stops
+            # the old listener, which must not look like a quit. The short
+            # wait keeps Ctrl+C responsive on Windows.
+            while not quit_event.wait(0.5):
+                pass
     except KeyboardInterrupt:
         if tray is not None:
             tray.stop()
     finally:
-        hotkey.stop()
+        hotkey_ref["listener"].stop()
         if watcher is not None:
             watcher.stop()
         recorder.close()

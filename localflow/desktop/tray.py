@@ -54,7 +54,7 @@ class TrayIcon:
     def __init__(self, status: str, config_path: Path,
                  cleanup_get=None, cleanup_toggle=None,
                  visibility_get=None, visibility_set=None,
-                 reset_pill_position=None):
+                 reset_pill_position=None, open_settings=None):
         self._config_path = config_path
         self._images = make_state_images()
         if cleanup_get is not None:
@@ -89,6 +89,10 @@ class TrayIcon:
             extra.append(pystray.MenuItem(
                 "Reset pill position",
                 lambda icon, item: reset_pill_position()))
+        if open_settings is not None:
+            # M8: the real settings window (built on the overlay UI thread).
+            extra.append(pystray.MenuItem(
+                "Settings...", lambda icon, item: open_settings()))
         menu = pystray.Menu(
             pystray.MenuItem(status, None, enabled=False),
             cleanup_item,

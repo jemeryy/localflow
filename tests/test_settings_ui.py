@@ -1,0 +1,209 @@
+"""Settings-window helper tests (M8). Headless-safe by design: only the
+pure helpers are exercised - no Tk root is ever created here. pynput key
+OBJECTS are constructed (that needs no display or hook), but no Listener
+ever starts. The window itself is verified live per the M8 checklist.
+"""
+
+from __future__ import annotations
+
+import pytest
+from pynput import keyboard
+
+from localflow.desktop import settings_ui as ui
+
+
+# -- environment presets -------------------------------------------------
+
+def test_presets_set_only_the_two_audio_controls():
+    assert ui.PRESETS["Quiet room"] == (0.3, True)
+    assert ui.PRESETS["Noisy room"] == (0.75, True)
+    assert ui.PRESETS["Headset"] == (0.2, True)
+
+
+def test_preset_name_for_exact_matches():
+    assert ui.preset_name_for(0.3, True) == "Quiet room"
+    assert ui.preset_name_for(0.75, True) == "Noisy room"
+    assert ui.preset_name_for(0.2, True) == "Headset"
+
+
+def test_preset_name_for_tolerance():
+    # slider floats land near, not on, the preset value
+    assert ui.preset_name_for(0.301, True) == "Quiet room"
+    assert ui.preset_name_for(0.291, True) == "Quiet room"
+    assert ui.preset_name_for(0.32, True) == "Custom"
+
+
+def test_preset_name_for_normalize_must_match():
+    assert ui.preset_name_for(0.3, False) == "Custom"
+
+
+def test_preset_name_for_unmatched_is_custom():
+    assert ui.preset_name_for(0.6, True) == "Custom"
+
+
+# -- hotkey capture conversion --------------------------------------------
+
+def test_key_name_of_plain_char():
+    assert ui.key_name_of(keyboard.KeyCode.from_char("d")) == "d"
+    assert ui.key_name_of(keyboard.KeyCode.from_char("D")) == "d"
+    assert ui.key_name_of(keyboard.KeyCode.from_char("`")) == "`"
+
+
+def test_key_name_of_named_keys():
+    assert ui.key_name_of(keyboard.Key.f9) == "f9"
+    assert ui.key_name_of(keyboard.Key.space) == "space"
+
+
+def test_key_name_of_control_char_maps_back_to_letter():
+    # with ctrl held, Windows delivers '\x04' instead of 'd'
+    assert ui.key_name_of(keyboard.KeyCode.from_char("\x04")) == "d"
+
+
+def test_key_name_of_vk_fallback():
+    assert ui.key_name_of(keyboard.KeyCode.from_vk(0x44)) == "d"
+    assert ui.key_name_of(keyboard.KeyCode.from_vk(0x37)) == "7"
+
+
+def test_key_name_of_unusable_key_is_none():
+    assert ui.key_name_of(keyboard.KeyCode.from_vk(0xAD)) is None  # media key
+
+
+def test_modifier_of():
+    assert ui.modifier_of(keyboard.Key.ctrl_l) == "ctrl"
+    assert ui.modifier_of(keyboard.Key.ctrl) == "ctrl"
+    assert ui.modifier_of(keyboard.Key.alt_gr) == "alt"
+    assert ui.modifier_of(keyboard.Key.shift_r) == "shift"
+    assert ui.modifier_of(keyboard.Key.f9) is None
+    assert ui.modifier_of(keyboard.KeyCode.from_char("a")) is None
+
+
+def test_format_captured_orders_modifiers_canonically():
+    assert ui.format_captured(["shift", "ctrl"], "d") == "ctrl+shift+d"
+    assert ui.format_captured(["alt"], "`") == "alt+`"
+    assert ui.format_captured([], "f9") == "f9"
+
+
+def test_format_captured_round_trips_through_app_parser():
+    """The captured combo must be exactly what to_pynput_combo expects."""
+    from localflow.desktop.app import to_pynput_combo
+    combo = ui.format_captured(["ctrl", "shift"], "d")
+    assert keyboard.HotKey.parse(to_pynput_combo(combo))
+
+
+# -- mic combobox preselection ---------------------------------------------
+
+_MICS = [
+    ("System default (follow Windows)", None),
+    ("Mic Array (Realtek)", 3),
+    ("Samsung USB Headset", 7),
+]
+
+
+def test_mic_selection_default_follows_windows():
+    rows, idx = ui.mic_selection(_MICS, None)
+    assert idx == 0 and rows == _MICS
+
+
+def test_mic_selection_matches_int_index():
+    rows, idx = ui.mic_selection(_MICS, 7)
+    assert idx == 2 and rows == _MICS
+
+
+def test_mic_selection_digit_string_counts_as_index():
+    _rows, idx = ui.mic_selection(_MICS, "3")
+    assert idx == 1
+
+
+def test_mic_selection_name_substring_skips_default_row():
+    # 'default' must never match the row-0 "System default" label
+    rows, idx = ui.mic_selection(_MICS, "default")
+    assert idx == len(rows) - 1
+    assert rows[idx] == ("(pinned: default)", "default")
+
+
+def test_mic_selection_name_substring_case_insensitive():
+    _rows, idx = ui.mic_selection(_MICS, "samsung")
+    assert idx == 2
+
+
+def test_mic_selection_unknown_pin_gets_explicit_row():
+    rows, idx = ui.mic_selection(_MICS, 42)
+    assert rows[idx] == ("(pinned: 42)", 42)
+    assert idx == len(rows) - 1
+
+
+# -- dirty collection and type coercion --------------------------------------
+
+def test_collect_changes_empty_when_untouched():
+    initial = {"hotkey": "alt+`", "pill_size": 1.0, "denoise_enabled": True}
+    assert ui.collect_changes(initial, {"hotkey": "alt+`", "pill_size": 1.0}) == {}
+
+
+def test_collect_changes_only_dirty_keys():
+    initial = {"hotkey": "alt+`", "pill_size": 1.0}
+    current = {"hotkey": "f9", "pill_size": 1.0}
+    assert ui.collect_changes(initial, current) == {"hotkey": "f9"}
+
+
+def test_collect_changes_derives_denoise_off_at_zero_strength():
+    initial = {"denoise_strength": 0.6, "denoise_enabled": True}
+    changes = ui.collect_changes(initial, {"denoise_strength": 0.0})
+    assert changes == {"denoise_strength": 0.0, "denoise_enabled": False}
+
+
+def test_collect_changes_derives_denoise_on_from_slider():
+    initial = {"denoise_strength": 0.0, "denoise_enabled": False}
+    changes = ui.collect_changes(initial, {"denoise_strength": 0.4})
+    assert changes == {"denoise_strength": 0.4, "denoise_enabled": True}
+
+
+def test_collect_changes_no_denoise_flag_when_state_unchanged():
+    initial = {"denoise_strength": 0.6, "denoise_enabled": True}
+    changes = ui.collect_changes(initial, {"denoise_strength": 0.4})
+    assert changes == {"denoise_strength": 0.4}
+
+
+def test_collect_changes_untouched_slider_never_flips_denoise():
+    # cfg can say denoise_enabled=false with a nonzero strength on disk;
+    # an Apply that never moved the slider must not rewrite either key
+    initial = {"denoise_strength": 0.6, "denoise_enabled": False}
+    assert ui.collect_changes(initial, {"denoise_strength": 0.6}) == {}
+
+
+def test_coerce_changes_pins_types():
+    out = ui.coerce_changes({
+        "restore_delay_ms": "650",
+        "denoise_strength": "0.4",
+        "pill_size": 1,
+        "cleanup_enabled": 1,
+        "normalize_audio": 0,
+        "hotkey": "f9",
+    })
+    assert out["restore_delay_ms"] == 650 and isinstance(out["restore_delay_ms"], int)
+    assert out["denoise_strength"] == pytest.approx(0.4)
+    assert isinstance(out["denoise_strength"], float)
+    assert isinstance(out["pill_size"], float)
+    assert out["cleanup_enabled"] is True
+    assert out["normalize_audio"] is False
+    assert out["hotkey"] == "f9"
+
+
+def test_coerce_changes_passes_input_device_through():
+    assert ui.coerce_changes({"input_device": None}) == {"input_device": None}
+    assert ui.coerce_changes({"input_device": 7}) == {"input_device": 7}
+    assert ui.coerce_changes({"input_device": "Samsung"}) == {"input_device": "Samsung"}
+
+
+# -- context construction (must match app.wire_settings_ui exactly) ----------
+
+def test_settings_context_accepts_the_app_contract():
+    ctx = ui.SettingsContext(
+        cfg=object(), apply=lambda c: set(), list_mics=lambda: [],
+        mic_name=lambda: "m", fallback_active=lambda: False,
+        latest_level=lambda: 0.0, test_mic=lambda cb: True,
+        validate_hotkey=lambda c: None, reset_pill_position=lambda: None,
+        open_config_file=lambda: None, status_text="whisper on GPU",
+        cleanup_available=True, cleanup_active=lambda: False)
+    assert ctx.status_text == "whisper on GPU"
+    assert ctx.cleanup_available is True
+    assert ctx.cleanup_active() is False

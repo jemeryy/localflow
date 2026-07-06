@@ -51,6 +51,13 @@ class DefaultMicWatcher:
     def check_once(self) -> bool:
         """One poll step (factored out for tests). Returns True if the
         recorder was switched to a new device."""
+        if getattr(self._recorder, "_configured_device", None) is not None:
+            # Pinned live from the settings window (M8): never switch, but
+            # keep the heal tick so a wedged pinned mic still recovers.
+            # (_configured_device, not input_device: the fallback hunt
+            # overrides input_device temporarily and must stay recoverable.)
+            self._recorder.heal_if_stale()
+            return False
         current = self._get_id()
         if self._last is None:      # first sighting is the baseline
             self._last = current

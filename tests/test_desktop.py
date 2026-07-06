@@ -752,3 +752,95 @@ def test_tray_menu_builds_with_m7_callbacks():
     items = {str(i.text) for i in tray._icon.menu.items}
     assert "Show pill" in items
     assert "Reset pill position" in items
+
+
+# -- M8: live-apply settings plumbing ----------------------------------------
+
+
+def test_apply_settings_dispatches_live_and_returns_restart():
+    from localflow.desktop import config as config_mod
+    from localflow.desktop.app import apply_settings
+
+    cfg = config_mod.Config()
+    calls = {}
+    hooks = {
+        "hotkey": lambda v: calls.setdefault("hotkey", v),
+        "preprocess": lambda: calls.setdefault("preprocess", True),
+        "restore_delay": lambda v: calls.setdefault("restore_delay", v),
+        "inject_mode": lambda v: calls.setdefault("inject_mode", v),
+        "input_device": lambda v: calls.setdefault("input_device", v),
+        "visibility": lambda v: calls.setdefault("visibility", v),
+        "pill_size": lambda v: calls.setdefault("pill_size", v),
+        "cleanup": lambda v: calls.setdefault("cleanup", v),
+    }
+    restart = apply_settings({
+        "hotkey": "f9",
+        "denoise_strength": 0.3,
+        "restore_delay_ms": 700,
+        "inject_mode": "type",
+        "input_device": "Samsung",
+        "overlay_visibility": "dictating",
+        "pill_size": 1.5,
+        "cleanup_enabled": True,
+        "device": "NPU",              # restart-only
+        "hot_words": ["Codex"],       # restart-only
+    }, cfg, hooks)
+    assert restart == {"device", "hot_words"}
+    assert calls["hotkey"] == "f9"
+    assert calls["preprocess"] is True
+    assert calls["restore_delay"] == 0.7
+    assert calls["inject_mode"] == "type"
+    assert calls["input_device"] == "Samsung"
+    assert calls["visibility"] == "dictating"
+    assert calls["pill_size"] == 1.5
+    assert calls["cleanup"] is True
+    # cfg mutated so it stays the single source of truth
+    assert cfg.hotkey == "f9" and cfg.device == "NPU"
+
+
+def test_apply_settings_skips_unchanged_values():
+    from localflow.desktop import config as config_mod
+    from localflow.desktop.app import apply_settings
+
+    cfg = config_mod.Config()
+    hooks = {"hotkey": lambda v: pytest.fail("unchanged key dispatched")}
+    assert apply_settings({"hotkey": cfg.hotkey}, cfg, hooks) == set()
+
+
+def test_apply_settings_rebuilds_preprocess_once_for_the_group():
+    from localflow.desktop import config as config_mod
+    from localflow.desktop.app import apply_settings
+
+    cfg = config_mod.Config()
+    counter = {"n": 0}
+    hooks = {"preprocess": lambda: counter.__setitem__("n", counter["n"] + 1)}
+    apply_settings({"denoise_enabled": False, "normalize_audio": False,
+                    "denoise_strength": 0.2}, cfg, hooks)
+    assert counter["n"] == 1
+
+
+def test_mic_test_suppresses_hotkey_down_and_its_release(recorder):
+    """M8: while the settings mic test owns the recorder, a hotkey press is
+    refused AND its release must not fire on_hotkey_up (the listener still
+    tracks the combo as active - an unpaired release would stop and steal
+    the test capture as a dictation)."""
+    states: list[str] = []
+    app = _bare_app(recorder=recorder, on_state=states.append)
+    recorder.open()
+    app.mic_test_active = True
+    recorder.start()                          # the test owns this capture
+    app.on_hotkey_down()                      # user presses the combo
+    assert states == []                       # refused: no rec state
+    app.on_hotkey_up()                        # user releases the combo
+    assert app._work.qsize() == 0             # nothing stolen or enqueued
+    assert recorder.recording                 # test capture still running
+    app.toggle_recording()                    # pill click also refused
+    assert recorder.recording
+    app.mic_test_active = False
+    app._hotkey_suppressed = False
+    recorder.stop()
+    # normal dictation works again afterwards
+    app.on_hotkey_down()
+    app.on_hotkey_up()
+    assert app._work.qsize() == 1
+    assert states == ["rec", "busy"]
