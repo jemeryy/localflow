@@ -11,6 +11,7 @@ requires-python = ">=3.11"
 # nncf) is installed separately for the one-time model export (PRD §5).
 dependencies = [
     "numpy",
+    "scipy",
     "openvino",
     "openvino-genai",
     "soundfile",
@@ -20,10 +21,19 @@ dependencies = [
     "sounddevice",
     "pynput",
     "pyperclip",
+    "pydantic",
+    "pystray",
+    "pillow",
+    "pycaw",
 ]
 
 [project.scripts]
 localflow = "localflow.desktop.app:main"
+
+[project.gui-scripts]
+# Windowless launcher (no console) for shortcuts/startup — same app;
+# logs go to %LOCALAPPDATA%/LocalFlow/localflow.log instead of a console.
+localflow-tray = "localflow.desktop.app:main"
 
 [project.optional-dependencies]
 dev = ["pytest"]

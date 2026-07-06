@@ -1,0 +1,33 @@
+# LocalFlow settings (FR-13). Device/model changes take effect on restart.
+# Relative paths resolve against this file's directory.
+
+hotkey = "alt+`"          # hold-to-talk combo, e.g. "alt+`", "ctrl+space", "f9"
+stt_model_dir = "models/whisper-turbo-ov"
+device = "GPU"            # GPU | NPU | CPU
+fallback_device = "CPU"
+cache_dir = "models/ov_cache"
+inject_mode = "paste"     # paste (clipboard+Ctrl+V) | type (keystrokes, slower)
+restore_delay_ms = 500    # clipboard restore delay; raise it if a slow app
+                          # ever pastes your OLD clipboard instead of speech
+overlay_enabled = true    # Wispr-style waveform pill while recording (FR-2)
+cleanup_enabled = false   # LLM cleanup: removes filler, fixes punctuation.
+                          # false = NOT loaded at startup (saves ~2-3GB memory
+                          # + seconds of load time); the tray toggle loads it
+                          # on demand. true = always loaded and on.
+cleanup_model_dir = "models/qwen2.5-3b-ov"
+
+# Audio cleanup BEFORE transcription (helps the quiet/noisy built-in mic most).
+denoise_enabled = true    # high-pass + gentle spectral noise reduction
+normalize_audio = true    # boost quiet mics toward a consistent loudness
+denoise_strength = 0.6    # 0 = off, ~0.6 gentle, ~0.9 aggressive (can eat
+                          # quiet speech — dial DOWN if accuracy regresses)
+
+# Mic: sounddevice index or name substring; omit to follow the system
+# default (LocalFlow auto-switches when the Windows default mic changes).
+# input_device = "Samsung"
+
+# Jargon Whisper mishears — biases transcription toward these spellings.
+# Takes effect on restart. NOTE (3 Jul): a populated list degraded general
+# accuracy (split/missing words) — leave empty unless a specific word is
+# reliably wrong, and keep the list to 1-3 entries if so.
+hot_words = []

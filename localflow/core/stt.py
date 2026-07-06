@@ -28,12 +28,17 @@ class SttEngine:
         cache_dir: str | None = None,
         model_name: str | None = None,
         language: str = "<|en|>",
+        initial_prompt: str | None = None,
     ):
         self.model_dir = str(model_dir)
         self.requested_device = device
         self.fallback_device = fallback_device
         self.model_name = model_name or Path(model_dir).name
         self.language = language
+        # Vocabulary biasing: Whisper conditions on this text, so domain
+        # words listed here ("Codex", "OpenVINO", ...) are far more likely
+        # to be transcribed as themselves instead of near-homophones.
+        self.initial_prompt = initial_prompt
         self._props: dict[str, str] = {}
         if cache_dir is not None:
             # Compile cache: free load-time win on every device, and the NPU
@@ -73,6 +78,13 @@ class SttEngine:
         config = self._pipe.get_generation_config()
         config.language = self.language
         config.task = "transcribe"
+        if self.initial_prompt:
+            if hasattr(config, "initial_prompt"):
+                config.initial_prompt = self.initial_prompt
+                log.info("hot words active: %s", self.initial_prompt)
+            else:  # older openvino_genai without prompt biasing
+                log.warning("this openvino_genai has no initial_prompt — "
+                            "hot_words are ignored")
         return config
 
     def transcribe(self, audio_16k_mono: np.ndarray) -> tuple[str, dict]:
