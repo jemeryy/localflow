@@ -114,7 +114,21 @@ class StreamRecorder:
         self._heal_streak = 0
         self.max_seconds = max_seconds
         self.preroll_s = preroll_s
-        self._resolve_device()
+        # A pinned device can be invalid at startup: a USB headset that
+        # reconnected on a different index, or whose input endpoint vanished so
+        # the index now points at its OUTPUT (sd raises "Not an input device").
+        # Fall back to the system default so the app always starts - the user
+        # can re-pick the mic in Settings. Only a machine with no usable input
+        # device at all (default resolve also fails) is fatal.
+        try:
+            self._resolve_device()
+        except Exception as e:
+            log.warning("configured mic %r is not a usable input device (%s) - "
+                        "following the system default instead; re-pick it in "
+                        "Settings", self.input_device, e)
+            self.input_device = None
+            self._fallback_active = True
+            self._resolve_device()
         self._lock = threading.Lock()
         self._reopen_lock = threading.Lock()  # refresh vs start() races
         self._chunks: list[np.ndarray] = []
@@ -191,6 +205,52 @@ class StreamRecorder:
         self._last_frame = time.monotonic()  # fresh stream is not yet stale
         log.info("mic stream open (%r @ %dHz, %.1fs pre-roll)",
                  self.device_name, self.rate, self._preroll_frames / self.rate)
+
+    def open_or_fallback(self) -> BaseException | None:
+        """Startup open that never kills the app. Try the configured/default
+        device; if it won't OPEN (a wedged USB headset raises a PortAudio host
+        error, not silence), hunt for any input device that delivers audio and
+        record from that with fallback_active set, so the user can still reach
+        Settings to fix the pin. Returns the original error only when NOTHING
+        on the machine opens (truly no mic) - that stays fatal.
+
+        Unlike heal_if_stale, this DOES fall back even for a pinned device: a
+        dead app the user can't fix without hand-editing the toml is worse than
+        a loud fallback they can see in the pill and Settings.
+        """
+        try:
+            self.open()
+            return None
+        except BaseException as first:
+            log.warning("configured mic %r failed to open (%s) - hunting for a "
+                        "working input device", self.device_name, first)
+            try:
+                self.close()
+            except Exception:
+                pass
+            # PortAudio snapshots the device list at init; a device that went
+            # bad after init needs a reinit before the probe sees reality.
+            try:
+                sd._terminate()
+                sd._initialize()
+            except Exception:
+                log.debug("portaudio reinit failed", exc_info=True)
+            found = _find_live_input(exclude_name=self.device_name)
+            if found is None:
+                return first    # no working mic anywhere - let startup fail
+            idx, name = found
+            self.input_device = idx
+            self._fallback_active = True
+            self._resolve_device()
+            try:
+                self.open()
+            except BaseException as second:
+                return second
+            log.warning(
+                "FALLBACK MIC at startup: the configured mic is unavailable - "
+                "recording from %r instead. Replug it or pick a mic in "
+                "Settings to switch back.", name)
+            return None
 
     def close(self) -> None:
         if self._stream is not None:

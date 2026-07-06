@@ -68,6 +68,28 @@ def estimate_noise_floor(audio: np.ndarray, sample_rate: int = TARGET_RATE,
     return np.median(np.abs(Z), axis=1, keepdims=True).astype(np.float32)
 
 
+def recommend_tuning(noise_rms: float) -> tuple[float, float]:
+    """Map a measured room-noise level to recommended audio-tuning slider
+    values (M9): (denoise_strength, vad_threshold/sensitivity).
+
+    ``noise_rms`` is the broadband RMS (linear, ~0-1) of a quiet, speech-free
+    calibration clip AFTER the same high-pass the denoiser sees. Louder room
+    -> stronger denoise + a higher speech gate (so background noise doesn't
+    trigger); quieter room -> lighter denoise + a lower gate (accept quiet
+    speech). Pure and unit-tested; breakpoints are first-pass and meant to be
+    tuned live. Returns values already clamped to their slider ranges:
+    denoise in [0, 1], sensitivity in [0.3, 0.7]."""
+    import math
+
+    db = 20.0 * math.log10(max(float(noise_rms), 1e-7))     # dBFS, negative
+    # -55 dBFS ~ a quiet room; -35 dBFS ~ a noticeably noisy one (fan/keyboard).
+    quiet_db, loud_db = -55.0, -35.0
+    t = min(1.0, max(0.0, (db - quiet_db) / (loud_db - quiet_db)))
+    denoise = round(min(1.0, max(0.0, 0.25 + t * (0.75 - 0.25))), 2)
+    sensitivity = round(min(0.7, max(0.3, 0.42 + t * (0.62 - 0.42))), 2)
+    return denoise, sensitivity
+
+
 def reduce_noise(audio: np.ndarray, sample_rate: int = TARGET_RATE,
                  n_fft: int = 512, hop: int = 128, noise_percentile: float = 30.0,
                  gate_factor: float = 1.5, denoise_strength: float = 0.6,

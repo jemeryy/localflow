@@ -290,3 +290,76 @@ def test_settings_context_m10_fields_default_to_none():
     assert ctx.save_correction is None
     assert ctx.clear_history is None
     assert ctx.suggestions is None
+
+
+# -- open_settings singleton, stale-window recovery ----------------------
+
+class _FakeTop:
+    """Stands in for a Toplevel whose Tk root was torn down. winfo_exists
+    raises the exception open_settings must survive (no real Tk needed)."""
+
+    def __init__(self, exc):
+        self._exc = exc
+
+    def winfo_exists(self):
+        raise self._exc
+
+
+class _FakeWin:
+    def __init__(self, exc):
+        self.top = _FakeTop(exc)
+
+
+@pytest.fixture(autouse=True)
+def _reset_holder():
+    ui._holder["win"] = None
+    yield
+    ui._holder["win"] = None
+
+
+@pytest.mark.parametrize("exc", [
+    RuntimeError("main thread is not in main loop"),  # the pill-rebuild crash
+    ui.tk.TclError("application has been destroyed"),
+])
+def test_open_settings_rebuilds_after_root_torn_down(monkeypatch, exc):
+    # A pill_size Apply destroys the overlay root under the old window; the
+    # next open must drop the stale singleton and build a fresh window
+    # instead of letting the winfo_exists error escape (regression: only
+    # TclError was caught, so RuntimeError crashed every reopen).
+    ui._holder["win"] = _FakeWin(exc)
+    built = []
+    monkeypatch.setattr(ui, "_SettingsWindow",
+                        lambda root, ctx: built.append((root, ctx)) or "fresh")
+
+    ui.open_settings("new_root", "ctx")
+
+    assert built == [("new_root", "ctx")]
+    assert ui._holder["win"] == "fresh"
+
+
+def test_open_settings_refocuses_a_live_window(monkeypatch):
+    # A still-alive window is deiconified/lifted, NOT rebuilt.
+    calls = []
+
+    class LiveTop:
+        def winfo_exists(self):
+            return True
+
+        def deiconify(self):
+            calls.append("deiconify")
+
+        def lift(self):
+            calls.append("lift")
+
+        def focus_force(self):
+            calls.append("focus")
+
+    live = type("W", (), {"top": LiveTop()})()
+    ui._holder["win"] = live
+    monkeypatch.setattr(ui, "_SettingsWindow",
+                        lambda root, ctx: pytest.fail("should not rebuild"))
+
+    ui.open_settings("root", "ctx")
+
+    assert calls == ["deiconify", "lift", "focus"]
+    assert ui._holder["win"] is live

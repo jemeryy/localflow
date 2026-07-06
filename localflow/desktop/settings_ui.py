@@ -5,9 +5,11 @@ calls open_settings() with the overlay's (hidden, overrideredirect) root via
 the overlay command queue, and every widget touch stays on that thread.
 Worker threads (ctx.apply, the mic test, the pynput hotkey capture) never
 call widget methods directly; they marshal back with widget.after(). ctx.apply
-runs on a worker thread on purpose: a pill_size change tears down and rebuilds
-the overlay's whole Tk root, which destroys THIS window mid-apply. Completion
-callbacks therefore treat a dead widget (TclError) as normal, not an error.
+runs on a worker thread on purpose: some settings (mic pin refresh, cleanup
+load) take seconds, and the Tk thread must stay responsive. A pill_size change
+is now a live rescale on the overlay thread (it does NOT tear this window
+down), but completion callbacks still treat a dead widget (TclError /
+RuntimeError) as normal - the overlay root can still go away on quit.
 
 The pure helpers up top (PRESETS, preset_name_for, key_name_of, modifier_of,
 format_captured, mic_selection, collect_changes, coerce_changes,
@@ -259,8 +261,9 @@ class SettingsContext:
 # -- the window (overlay UI thread only) ----------------------------------
 
 # Singleton holder. The referenced window can die two ways: the user closes
-# it, or a pill_size rebuild tears down the whole Tk root under it - so the
-# holder is only ever trusted after a winfo_exists check under TclError.
+# it, or the overlay root is torn down (app quit) under it - so the holder is
+# only ever trusted after a winfo_exists check guarded by TclError AND
+# RuntimeError (a dead interpreter raises "main thread is not in main loop").
 _holder: dict = {"win": None}
 
 
@@ -275,8 +278,12 @@ def open_settings(root, ctx) -> None:
                 win.top.lift()
                 win.top.focus_force()
                 return
-        except tk.TclError:
-            pass    # its root was torn down (pill rebuild) - build fresh
+        except (tk.TclError, RuntimeError):
+            # Its root was torn down (a pill_size Apply rebuilds the whole
+            # overlay root). A dead interpreter raises TclError, but a call
+            # into an interpreter whose mainloop is gone raises RuntimeError
+            # ("main thread is not in main loop") - both mean "stale, rebuild".
+            pass
         _holder["win"] = None
     try:
         _holder["win"] = _SettingsWindow(root, ctx)
@@ -894,10 +901,12 @@ class _SettingsWindow:
         self.cal_status.config(text="Recording 2s - stay QUIET...",
                                foreground=_WARN)
 
-        def done(message: str) -> None:
+        def done(message: str, tuning: dict | None = None) -> None:
             # arrives on the calibration worker thread - marshal to Tk;
-            # the window may be gone (pill rebuild), which is fine
+            # the window may be gone (root torn down), which is fine
             def show() -> None:
+                if tuning:
+                    self._apply_calibrated_tuning(tuning)
                 self.cal_status.config(
                     text=f"{message}  |  {self._calibration_text()}",
                     foreground=_DIM)
@@ -913,6 +922,35 @@ class _SettingsWindow:
                 text="A dictation is running - try again in a moment",
                 foreground=_WARN)
             self.calibrate_btn.state(["!disabled"])
+
+    def _apply_calibrated_tuning(self, tuning: dict) -> None:
+        """Calibration sets the audio-tuning sliders from the measured room
+        noise (M9, Jeremy's request): move the controls, flip the preset to
+        Custom, and persist + live-apply just these keys. Runs on the Tk
+        thread; the apply itself goes on a worker (it writes the toml)."""
+        denoise = round(float(tuning["denoise_strength"]), 2)
+        sensitivity = round(float(tuning["vad_threshold"]), 2)
+        self.denoise_var.set(denoise)
+        self.sens_var.set(sensitivity)
+        self.denoise_val.config(text=f"{denoise:.2f}")
+        self.sens_val.config(text=f"{sensitivity:.2f}")
+        self.preset_var.set("Custom")
+        changes: dict = {"denoise_strength": denoise,
+                         "vad_threshold": sensitivity}
+        if denoise > 0 and not bool(self.ctx.cfg.denoise_enabled):
+            changes["denoise_enabled"] = True
+        # Calibration IS the new baseline, so a later manual Apply won't
+        # re-send these (the initial snapshot the diff runs against).
+        self._initial.update(changes)
+
+        def work() -> None:
+            try:
+                self.ctx.apply(changes)
+            except Exception:
+                log.exception("applying calibrated tuning failed")
+
+        threading.Thread(target=work, daemon=True,
+                         name="localflow-cal-tuning").start()
 
     def _on_clear_calibration(self) -> None:
         if self.ctx.clear_calibration is None:

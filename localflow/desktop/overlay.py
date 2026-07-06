@@ -225,6 +225,12 @@ class WaveformOverlay:
         """Back to default bottom-center; reports None to on_position_change."""
         self._cmd.put(("reset_pos", None))
 
+    def set_pill_size(self, size: float) -> None:
+        """Live pill_size change (0.5-2.0). Rescales and re-lays-out on the
+        UI thread — never tears the root down, so it is safe to call while a
+        settings window is open over the pill."""
+        self._cmd.put(("rescale", size))
+
     def open_settings(self) -> None:
         """Open the settings window on the UI thread (tray + pill menu)."""
         self._cmd.put(("open_settings", None))
@@ -273,11 +279,13 @@ class WaveformOverlay:
         hover = {"on": False}
 
         # UI element sizes scale with DPI x pill_size; SCREEN coordinates
-        # (the saved anchor) scale with DPI only.
-        U = S * self._pill_size
+        # (the saved anchor) scale with DPI only. Held in a mutable cell so a
+        # live pill_size change (the ("rescale", size) command) can update it
+        # and re-layout on THIS thread — no root teardown, no worker-thread Tk.
+        scale = {"U": S * self._pill_size}
 
         def px(v: float) -> int:
-            return int(round(v * U))
+            return int(round(v * scale["U"]))
 
         def fnt(pt: int) -> tuple[str, int]:
             return ("Segoe UI", max(8, int(round(pt * self._pill_size))))
@@ -661,6 +669,17 @@ class WaveformOverlay:
                         if op == "visibility":
                             self._visibility = arg
                             sync_visibility()
+                        elif op == "rescale":
+                            # Live pill_size change (M8), on the overlay's own
+                            # thread: update the scale cell and re-layout the
+                            # current state. Replaces the old tear-down-the-
+                            # whole-root rebuild, which crashed natively when a
+                            # settings window was open over it.
+                            self._pill_size = max(0.5, min(2.0, float(arg)))
+                            scale["U"] = S * self._pill_size
+                            arbiter.slop = px(_DRAG_SLOP_LOG)
+                            size["w"] = size["h"] = 0   # force geometry resize
+                            apply(self._state)
                         elif op == "reset_pos":
                             self._pos = None
                             apply(self._state)     # snap to bottom-center

@@ -524,6 +524,92 @@ def test_fallback_with_no_working_mic_reopens_default(recorder, monkeypatch):
     # so recovery-by-replug (endpoint change -> refresh) still works
 
 
+def test_open_or_fallback_uses_configured_mic_when_it_opens(recorder):
+    # Happy path: the configured mic opens, no hunt, no fallback flag.
+    assert recorder.open_or_fallback() is None
+    assert recorder.fallback_active is False
+    assert recorder._stream is not None
+
+
+def test_open_or_fallback_hunts_when_configured_mic_wont_open(recorder, monkeypatch):
+    """A wedged/unplugged configured mic raises on stream.start at startup;
+    open_or_fallback must hunt for a working device instead of propagating
+    (regression: a pinned wedged headset killed the whole app on launch)."""
+    from localflow.desktop import capture
+
+    monkeypatch.setattr(capture.sd, "_terminate", lambda: None)
+    monkeypatch.setattr(capture.sd, "_initialize", lambda: None)
+    monkeypatch.setattr(capture, "_find_live_input",
+                        lambda exclude_name, listen_s=1.5: (7, "working-mic"))
+
+    class WedgedStart(_FakeStream):
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self._device = kwargs.get("device")
+
+        def start(self):
+            if self._device != 7:      # only the working fallback opens
+                raise capture.sd.PortAudioError("Unanticipated host error")
+            self.active = True
+
+    monkeypatch.setattr(capture.sd, "InputStream", WedgedStart)
+
+    assert recorder.open_or_fallback() is None
+    assert recorder.fallback_active is True
+    assert recorder.input_device == 7
+
+
+def test_recorder_falls_back_to_default_when_pin_is_not_an_input(monkeypatch):
+    """A pinned index that now points at an OUTPUT endpoint (Samsung headset
+    reconnected differently) must NOT crash construction - fall back to the
+    system default so the app still starts and Settings stays reachable."""
+    from localflow.desktop import capture
+
+    def q(device, kind):
+        if device == 14:
+            raise ValueError("Not an input device: 'Headset Earphone'")
+        return {"name": "default-mic", "default_samplerate": 16_000.0}
+
+    monkeypatch.setattr(capture.sd, "query_devices", q)
+    monkeypatch.setattr(capture.sd, "InputStream", _FakeStream)
+
+    rec = capture.StreamRecorder(input_device=14)
+    assert rec.input_device is None            # fell back to the system default
+    assert rec.fallback_active is True
+    assert rec.device_name == "default-mic"
+
+
+def test_recorder_construction_is_fatal_only_with_no_input_device(monkeypatch):
+    from localflow.desktop import capture
+
+    def q(device, kind):
+        raise ValueError("no input device on this machine")
+
+    monkeypatch.setattr(capture.sd, "query_devices", q)
+    with pytest.raises(ValueError):            # nothing to fall back to
+        capture.StreamRecorder(input_device=14)
+
+
+def test_open_or_fallback_returns_error_when_no_mic_opens(recorder, monkeypatch):
+    # No input device anywhere delivers audio -> startup stays fatal.
+    from localflow.desktop import capture
+
+    monkeypatch.setattr(capture.sd, "_terminate", lambda: None)
+    monkeypatch.setattr(capture.sd, "_initialize", lambda: None)
+    monkeypatch.setattr(capture, "_find_live_input",
+                        lambda exclude_name, listen_s=1.5: None)
+
+    class AlwaysWedged(_FakeStream):
+        def start(self):
+            raise capture.sd.PortAudioError("host error")
+
+    monkeypatch.setattr(capture.sd, "InputStream", AlwaysWedged)
+
+    err = recorder.open_or_fallback()
+    assert isinstance(err, capture.sd.PortAudioError)
+    assert recorder.fallback_active is False
+
+
 def test_default_change_ends_fallback(recorder, monkeypatch):
     """Replugging the wedged mic fires a default-endpoint change; the swap
     must drop the fallback and follow the default again."""
@@ -668,6 +754,21 @@ def _arbiter(slop=6.0):
     from localflow.desktop.overlay import PressArbiter
 
     return PressArbiter(slop_px=slop)
+
+
+def test_set_pill_size_enqueues_a_rescale_command():
+    """Live pill_size change goes through the command queue (applied on the
+    overlay's own UI thread) instead of the old tear-down-the-root rebuild
+    that crashed natively with a settings window open over it. Headless-safe:
+    no Tk root is created (__init__ bypassed)."""
+    import queue
+
+    from localflow.desktop.overlay import WaveformOverlay
+
+    ov = WaveformOverlay.__new__(WaveformOverlay)
+    ov._cmd = queue.Queue()
+    ov.set_pill_size(1.5)
+    assert ov._cmd.get_nowait() == ("rescale", 1.5)
 
 
 def test_press_quick_release_is_a_click():

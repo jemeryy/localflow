@@ -19,7 +19,7 @@ cleanup_model_dir = "models/qwen2.5-3b-ov"
 # Audio cleanup BEFORE transcription (helps the quiet/noisy built-in mic most).
 denoise_enabled = true    # high-pass + gentle spectral noise reduction
 normalize_audio = true    # boost quiet mics toward a consistent loudness
-denoise_strength = 0.6    # 0 = off, ~0.6 gentle, ~0.9 aggressive (can eat
+denoise_strength = 0.25    # 0 = off, ~0.6 gentle, ~0.9 aggressive (can eat
                           # quiet speech — dial DOWN if accuracy regresses)
 
 # Mic: sounddevice index or name substring; omit to follow the system
@@ -32,4 +32,7 @@ denoise_strength = 0.6    # 0 = off, ~0.6 gentle, ~0.9 aggressive (can eat
 # reliably wrong, and keep the list to 1-3 entries if so.
 hot_words = []
 overlay_visibility = "always"
-overlay_position = [790, 854]
+pill_size = 1.01
+vad_threshold = 0.42
+
+[replacements]

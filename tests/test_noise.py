@@ -6,7 +6,11 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from localflow.core.preprocess import estimate_noise_floor, reduce_noise
+from localflow.core.preprocess import (
+    estimate_noise_floor,
+    recommend_tuning,
+    reduce_noise,
+)
 
 
 def _noise(n: int, amp: float, seed: int = 7) -> np.ndarray:
@@ -70,6 +74,37 @@ def test_wrong_shape_profile_falls_back_to_per_clip():
     out_bad = reduce_noise(clip, denoise_strength=0.6, noise_floor=bad_floor)
     out_none = reduce_noise(clip, denoise_strength=0.6)
     assert np.allclose(out_bad, out_none)             # same fallback path
+
+
+# -- recommend_tuning (calibrate -> audio-tuning sliders) --------------------
+
+def test_recommend_tuning_quiet_room_is_gentle():
+    # -60 dBFS ~ very quiet: light denoise, low gate (accept quiet speech)
+    denoise, sens = recommend_tuning(10 ** (-60 / 20))
+    assert denoise == 0.25
+    assert sens == 0.42
+
+
+def test_recommend_tuning_noisy_room_is_aggressive():
+    # -30 dBFS ~ noisy: strong denoise, high gate (reject background)
+    denoise, sens = recommend_tuning(10 ** (-30 / 20))
+    assert denoise == 0.75
+    assert sens == 0.62
+
+
+def test_recommend_tuning_is_monotonic_and_in_range():
+    prev_d, prev_s = -1.0, -1.0
+    for db in range(-70, -20, 5):
+        denoise, sens = recommend_tuning(10 ** (db / 20))
+        assert 0.0 <= denoise <= 1.0
+        assert 0.3 <= sens <= 0.7            # matches the slider range
+        assert denoise >= prev_d and sens >= prev_s   # louder -> never gentler
+        prev_d, prev_s = denoise, sens
+
+
+def test_recommend_tuning_handles_silence_without_math_error():
+    denoise, sens = recommend_tuning(0.0)    # log10(0) guarded
+    assert denoise == 0.25 and sens == 0.42
 
 
 # -- profile store (desktop layer) -------------------------------------------

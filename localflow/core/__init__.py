@@ -9,7 +9,12 @@ exact same transcription code.
 from .audio import TARGET_RATE, ensure_16k_mono
 from .cleanup import CleanupEngine
 from .pipeline import TranscriptResult, transcribe_audio
-from .preprocess import AudioPreprocessor, estimate_noise_floor, high_pass
+from .preprocess import (
+    AudioPreprocessor,
+    estimate_noise_floor,
+    high_pass,
+    recommend_tuning,
+)
 from .stt import SttEngine
 from .vad import VadGate
 
@@ -23,5 +28,6 @@ __all__ = [
     "ensure_16k_mono",
     "estimate_noise_floor",
     "high_pass",
+    "recommend_tuning",
     "transcribe_audio",
 ]

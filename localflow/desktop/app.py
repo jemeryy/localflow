@@ -34,6 +34,7 @@ from localflow.core import (
     ensure_16k_mono,
     estimate_noise_floor,
     high_pass,
+    recommend_tuning,
     transcribe_audio,
 )
 from localflow.core.dictionary import apply_replacements, mine_substitutions
@@ -662,10 +663,12 @@ def _run(args: argparse.Namespace) -> int:
     mic_open_err: list[BaseException] = []
 
     def open_recorder() -> None:
-        try:
-            recorder.open()
-        except BaseException as e:      # re-raised on the main thread below
-            mic_open_err.append(e)
+        # open_or_fallback returns an error ONLY when no mic on the machine
+        # opens; a wedged/unplugged configured mic falls back to a working one
+        # instead of killing startup (locked out of Settings otherwise).
+        err = recorder.open_or_fallback()
+        if err is not None:
+            mic_open_err.append(err)
 
     mic_open = threading.Thread(target=open_recorder, daemon=True,
                                 name="localflow-mic-open")
@@ -862,12 +865,13 @@ def _run(args: argparse.Namespace) -> int:
         log.info("mic %s", f"pinned to {dev!r}" if dev not in (None, "")
                  else "following the system default again")
 
-    def hook_pill_size(_value: float) -> None:
-        # The pill's scale is baked into its UI thread at build time; a
-        # live change means tearing that thread down and rebuilding it.
-        # Must NOT run on the overlay's own thread (close() joins it) —
-        # the settings window calls this via its rebuild-worker thread.
-        rebuild_overlay()
+    def hook_pill_size(value: float) -> None:
+        # Live pill_size change WITHOUT tearing the overlay thread/root down
+        # (the old rebuild crashed natively when a settings window was open
+        # over the pill - it enqueues a rescale the overlay applies on its
+        # own thread). Safe from any thread: it only puts on the command queue.
+        if overlay is not None:
+            overlay.set_pill_size(value)
 
     def hook_cleanup(on: bool) -> None:
         if bool(on) != app.cleanup_active:
@@ -1011,7 +1015,7 @@ def _run(args: argparse.Namespace) -> int:
                 time.sleep(2.0)
                 audio, rate = recorder.stop()
                 if len(audio) == 0:
-                    on_done("(no audio captured - mic delivered nothing)")
+                    on_done("(no audio captured - mic delivered nothing)", None)
                     return
                 audio16 = ensure_16k_mono(audio, rate)
                 if app.vad is not None:
@@ -1019,19 +1023,29 @@ def _run(args: argparse.Namespace) -> int:
                         speech = app.vad.trim(audio16)
                     if speech is not None:
                         on_done("(speech detected - stay quiet during "
-                                "calibration and try again)")
+                                "calibration and try again)", None)
                         return
-                # Same high-pass as the live chain: the floor must describe
-                # what reduce_noise actually sees.
-                floor = estimate_noise_floor(high_pass(audio16))
+                # Same high-pass as the live chain: the floor and the measured
+                # level must both describe what reduce_noise actually sees.
+                hp = high_pass(audio16)
+                floor = estimate_noise_floor(hp)
+                noise_rms = float(np.sqrt(np.mean(np.square(
+                    hp.astype(np.float64)))))
+                denoise, sensitivity = recommend_tuning(noise_rms)
                 from localflow.desktop import noiseprofile
                 noiseprofile.save_profile(floor, recorder.device_name)
-                app.preprocess = build_preprocessor()  # attach immediately
-                on_done(f"Calibrated for {recorder.device_name}")
+                app.preprocess = build_preprocessor()  # attach the floor now
+                import math
+                db = 20.0 * math.log10(max(noise_rms, 1e-7))
+                on_done(
+                    f"Calibrated for {recorder.device_name} - room noise "
+                    f"{db:.0f} dBFS, set denoise {denoise:.2f} / "
+                    f"sensitivity {sensitivity:.2f}",
+                    {"denoise_strength": denoise, "vad_threshold": sensitivity})
             except Exception as e:
                 log.exception("noise calibration failed")
                 try:
-                    on_done(f"(calibration failed: {e})")
+                    on_done(f"(calibration failed: {e})", None)
                 except Exception:
                     pass
             finally:
@@ -1110,32 +1124,6 @@ def _run(args: argparse.Namespace) -> int:
         )
         ov.settings_factory = lambda root: settings_ui.open_settings(root, ctx)
         ov.on_settings = ov.open_settings
-
-    def rebuild_overlay() -> None:
-        """pill_size live-apply: tear down the pill's UI thread and build a
-        fresh one at the new scale. NEVER call from the overlay UI thread
-        (close() joins it) — the settings window uses a worker thread."""
-        nonlocal overlay
-        old = overlay
-        if old is not None:
-            try:
-                level_sinks.remove(old.push_level)
-            except ValueError:
-                pass
-            old.close()
-        from localflow.desktop.overlay import WaveformOverlay
-        overlay = WaveformOverlay(hotkey=cfg.hotkey,
-                                  visibility=vis_state["mode"],
-                                  position=cfg.overlay_position,
-                                  pill_size=cfg.pill_size)
-        overlay.on_position_change = save_pill_position
-        overlay.settings_path = settings_path
-        overlay.on_toggle = app.toggle_recording
-        overlay.on_quit = request_quit
-        wire_settings_ui(overlay)
-        level_sinks.append(overlay.push_level)
-        overlay.set_state("idle")
-        log.info("pill rebuilt at size %.2f", cfg.pill_size)
 
     app.on_state = fan_out_state
     if overlay is not None:
