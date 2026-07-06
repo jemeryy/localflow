@@ -659,3 +659,96 @@ def test_preload_cleanup_never_overrides_a_user_toggle():
     assert _wait(lambda: not app._cleanup_loading)
     assert app.cleanup is None               # user's OFF was respected
     assert app.cleanup_active is False
+
+
+# -- M7: pill v2 - click vs hold-to-drag, position clamping ------------------
+
+
+def _arbiter(slop=6.0):
+    from localflow.desktop.overlay import PressArbiter
+
+    return PressArbiter(slop_px=slop)
+
+
+def test_press_quick_release_is_a_click():
+    a = _arbiter()
+    a.press(100, 100)
+    assert a.release(102, 101) == "click"        # within slop, before hold
+    assert a.state == a.IDLE
+
+
+def test_press_move_beyond_slop_cancels_everything():
+    a = _arbiter()
+    a.press(100, 100)
+    assert a.motion(120, 100) is False           # beyond slop -> cancelled
+    assert a.state == a.CANCELLED
+    assert a.release(120, 100) == "none"         # release does nothing
+
+
+def test_locked_press_never_drags():
+    """Revised spec (6 Jul): no hold-to-drag. A locked press can only be a
+    click or nothing, no matter how far the cursor travels."""
+    a = _arbiter()
+    a.press(100, 100)
+    assert a.motion(500, 500) is False
+    assert a.release(500, 500) == "none"
+    assert a.state == a.IDLE
+
+
+def test_unlocked_press_drags_immediately_then_release_ends_it():
+    a = _arbiter()
+    a.press(100, 100, unlocked=True)
+    assert a.state == a.DRAGGING                 # no 1s hold needed
+    assert a.motion(300, 400) is True            # dragging: move the window
+    assert a.release(300, 400) == "drag_end"
+    assert a.state == a.IDLE
+
+
+def test_unlocked_click_without_moving_still_ends_the_drag():
+    # One-shot unlock: even a zero-distance press-release saves + relocks.
+    a = _arbiter()
+    a.press(100, 100, unlocked=True)
+    assert a.release(100, 100) == "drag_end"
+
+
+def test_release_beyond_slop_while_pending_is_not_a_click():
+    # A release that jumped past the slop without a motion event in between
+    # must not count as a click.
+    a = _arbiter()
+    a.press(100, 100)
+    assert a.release(150, 100) == "none"
+
+
+def test_clamp_position_keeps_pill_on_the_virtual_screen():
+    from localflow.desktop.overlay import clamp_position
+
+    bounds = (0, 0, 1920, 1080)
+    assert clamp_position(500, 500, 200, 50, bounds) == (500, 500)   # inside
+    assert clamp_position(1900, 1070, 200, 50, bounds) == (1720, 1030)
+    assert clamp_position(-50, -50, 200, 50, bounds) == (0, 0)
+    # Second monitor left of primary: negative origin is legal space.
+    neg = (-1920, 0, 3840, 1080)
+    assert clamp_position(-1800, 100, 200, 50, neg) == (-1800, 100)
+    assert clamp_position(-5000, 100, 200, 50, neg) == (-1920, 100)
+    # Window wider than the screen: pin to the origin, never negative range.
+    tiny = (0, 0, 100, 100)
+    assert clamp_position(50, 50, 300, 300, tiny) == (0, 0)
+
+
+def test_tray_menu_builds_with_m7_callbacks():
+    """pystray validates action signatures at MenuItem construction - a bad
+    callback shape crashes the tray at startup (found live 6 Jul). Building
+    the full M7 menu must not raise."""
+    from localflow.desktop.tray import TrayIcon
+
+    state = {"mode": "always"}
+    tray = TrayIcon(
+        "model on GPU", None,
+        cleanup_get=lambda: False, cleanup_toggle=lambda: True,
+        visibility_get=lambda: state["mode"],
+        visibility_set=lambda m: state.update(mode=m),
+        reset_pill_position=lambda: None,
+    )
+    items = {str(i.text) for i in tray._icon.menu.items}
+    assert "Show pill" in items
+    assert "Reset pill position" in items

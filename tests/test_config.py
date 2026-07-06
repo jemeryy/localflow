@@ -141,3 +141,66 @@ def test_no_overlay_flag_disables_overlay():
     assert config.Config().overlay_enabled is True  # on by default
     out = apply_cli_overrides(config.Config(), _args(no_overlay=True))
     assert out.overlay_enabled is False
+
+
+# -- M7: save_config (comment-preserving round trip) + new pill keys ---------
+
+
+def test_save_config_preserves_comments_and_updates_value(tmp_path):
+    p = tmp_path / "localflow.toml"
+    p.write_text(
+        "# top-of-file comment that MUST survive\n"
+        'hotkey = "alt+`"          # inline comment survives too\n'
+        "restore_delay_ms = 500\n",
+        encoding="utf-8",
+    )
+    config.save_config(p, {"hotkey": "f9"})
+    text = p.read_text(encoding="utf-8")
+    assert "# top-of-file comment that MUST survive" in text
+    assert "# inline comment survives too" in text
+    assert config.load_config(p).hotkey == "f9"
+    assert config.load_config(p).restore_delay_ms == 500
+
+
+def test_save_config_none_removes_key(tmp_path):
+    p = tmp_path / "localflow.toml"
+    p.write_text("overlay_position = [100, 200]\n", encoding="utf-8")
+    config.save_config(p, {"overlay_position": None})
+    assert "overlay_position" not in p.read_text(encoding="utf-8")
+    assert config.load_config(p).overlay_position is None
+
+
+def test_save_config_rejects_unknown_keys(tmp_path):
+    p = tmp_path / "localflow.toml"
+    p.write_text('hotkey = "f9"\n', encoding="utf-8")
+    with pytest.raises(ValueError, match="unknown config keys"):
+        config.save_config(p, {"hotkye": "f10"})     # typo must not land
+    assert config.load_config(p).hotkey == "f9"      # file untouched
+
+
+def test_save_config_creates_default_file_first(tmp_path):
+    p = tmp_path / "localflow.toml"
+    config.save_config(p, {"overlay_visibility": "dictating"})
+    cfg = config.load_config(p)
+    assert cfg.overlay_visibility == "dictating"
+    # the commented default skeleton was written, not a bare one-key file
+    assert "hold-to-talk combo" in p.read_text(encoding="utf-8")
+
+
+def test_overlay_visibility_and_position_validation(tmp_path):
+    p = tmp_path / "localflow.toml"
+    p.write_text(
+        'overlay_visibility = "dictating"\noverlay_position = [960, 1000]\n',
+        encoding="utf-8",
+    )
+    cfg = config.load_config(p)
+    assert cfg.overlay_visibility == "dictating"
+    assert cfg.overlay_position == [960, 1000]
+
+    p.write_text('overlay_visibility = "sometimes"\n', encoding="utf-8")
+    with pytest.raises(ValueError):
+        config.load_config(p)
+
+    p.write_text("overlay_position = [1, 2, 3]\n", encoding="utf-8")
+    with pytest.raises(ValueError):
+        config.load_config(p)

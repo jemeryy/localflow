@@ -30,14 +30,19 @@ import threading
 
 log = logging.getLogger("localflow.desktop.overlay")
 
-# Logical (96-dpi) sizes; scaled by the system DPI at draw time.
-_EXP_W, _EXP_H = 280, 56      # expanded capsule
-_CHIP_W, _CHIP_H = 116, 26    # idle chip
+# Logical (96-dpi) sizes; scaled by system DPI x pill_size at draw time.
+# Base sizes bumped ~20% on 6 Jul (Jeremy: bigger pill, easier to read);
+# the `pill_size` config key scales further on top.
+_EXP_W, _EXP_H = 340, 64      # expanded capsule
+_CHIP_W, _CHIP_H = 150, 34    # idle chip
 _BOTTOM_MARGIN = 90           # gap above the screen bottom
 _BARS = 36                    # waveform bars
 _TICK_MS = 33                 # ~30fps
 _READY_FLASH_MS = 2500
-_MENU_TIMEOUT_MS = 6000
+_DRAG_SLOP_LOG = 6            # logical px of wiggle still counted as a click
+_MENU_W = 190                 # right-click menu panel width (logical)
+_MENU_ROW_H = 32              # logical height of one right-click menu row
+_MENU_GAP = 8                 # gap between the menu panel and the pill
 
 _BG = "#1c1c22"
 _BG_HOVER = "#2a2a33"
@@ -49,6 +54,8 @@ _TEXT = "#e6e6ea"
 _TEXT_DIM = "#9a9aa4"
 _MENU_BTN = "#33333d"         # right-click menu button background
 _MENU_BTN_HOVER = "#45454f"   # ...highlighted under the cursor
+_DRAG_ARM = "#2e6b4c"         # capsule tint while position is unlocked
+                              # (distinct from the chip dot green on purpose)
 _COLORKEY = "#ff00fe"         # unlikely-onscreen color -> transparent corners
 
 
@@ -88,18 +95,109 @@ def system_scale() -> float:
         return 1.0
 
 
+class PressArbiter:
+    """Click vs drag decision logic (M7, revised 6 Jul). Pure — no Tk — so
+    the paths get unit tests. Jeremy's spec: the pill is LOCKED by default
+    and never drags; "Unlock position" in the right-click menu makes the
+    NEXT press a drag (release saves the spot and relocks).
+
+    - locked press:   release within the slop -> "click"; moving beyond the
+                      slop cancels (the release does nothing).
+    - unlocked press: dragging immediately; motion moves the window;
+                      release -> "drag_end".
+    """
+
+    IDLE, PENDING, CANCELLED, DRAGGING = "idle", "pending", "cancelled", "dragging"
+
+    def __init__(self, slop_px: float = 6.0):
+        self.slop = float(slop_px)
+        self.state = self.IDLE
+        self._origin = (0.0, 0.0)
+
+    def _within_slop(self, x: float, y: float) -> bool:
+        return (abs(x - self._origin[0]) <= self.slop
+                and abs(y - self._origin[1]) <= self.slop)
+
+    def press(self, x: float, y: float, unlocked: bool = False) -> None:
+        self.state = self.DRAGGING if unlocked else self.PENDING
+        self._origin = (x, y)
+
+    def motion(self, x: float, y: float) -> bool:
+        """Feed drag motion; returns True while dragging (move the window)."""
+        if self.state == self.PENDING and not self._within_slop(x, y):
+            self.state = self.CANCELLED
+        return self.state == self.DRAGGING
+
+    def release(self, x: float, y: float) -> str:
+        """-> 'click' | 'drag_end' | 'none'."""
+        state, self.state = self.state, self.IDLE
+        if state == self.PENDING and self._within_slop(x, y):
+            return "click"
+        if state == self.DRAGGING:
+            return "drag_end"
+        return "none"
+
+
+def clamp_position(x: int, y: int, w: int, h: int,
+                   bounds: tuple[int, int, int, int]) -> tuple[int, int]:
+    """Keep the pill window fully inside the virtual screen (all monitors).
+    A saved position from an unplugged monitor must never strand it."""
+    vx, vy, vw, vh = bounds
+    x = max(vx, min(x, vx + max(0, vw - w)))
+    y = max(vy, min(y, vy + max(0, vh - h)))
+    return x, y
+
+
+def virtual_screen() -> tuple[int, int, int, int]:
+    """(x, y, w, h) of the Windows virtual screen spanning every monitor."""
+    import ctypes
+    try:
+        m = ctypes.windll.user32.GetSystemMetrics
+        return m(76), m(77), m(78), m(79)  # SM_[XY]VIRTUALSCREEN, SM_C[XY]...
+    except Exception:
+        return 0, 0, 10_000, 10_000        # fail open: clamp becomes a no-op
+
+
 class WaveformOverlay:
     """States: loading | warming | ready (flash) | rec | busy | menu | idle
     (chip). `warming` (M6): models are live but the background warmup pass
-    is still running — dictation already works, just a touch slower."""
+    is still running — dictation already works, just a touch slower.
+
+    Visibility modes (M7, revised): "always" keeps the idle chip on
+    screen; "dictating" withdraws the window the moment it goes idle (no
+    linger — Jeremy: no brief re-show after the paste). "never" exists
+    only for overlay_enabled=false / --no-overlay compat; no UI offers it.
+    The Tk root and this thread exist in EVERY mode — only the window
+    hides — so mode switches are instant and the settings window (M8)
+    always has a UI thread to live on.
+
+    Position (M7, revised): the pill is locked; right-click menu ->
+    "Unlock position" makes the next left-drag move it (green tint while
+    unlocked), release saves the anchor (center-x, bottom-y, logical px)
+    through on_position_change and relocks. Clamped to the virtual screen
+    at draw time.
+
+    The right-click menu (revised round 2) is four items only — Unlock
+    position, Reset position, Settings, Quit — drawn ABOVE the pill so it
+    never covers it. Everything else lives in the tray menu and, from M8,
+    the settings window. `pill_size` scales the whole pill (M8 exposes it
+    in settings)."""
 
     def __init__(self, hotkey: str = "alt+`", settings_path=None,
-                 on_toggle=None, on_quit=None):
+                 on_toggle=None, on_quit=None, visibility: str = "always",
+                 position: list[int] | tuple[int, int] | None = None,
+                 pill_size: float = 1.0):
         self._hotkey = hotkey
         # Set (or reset) these any time before the user clicks:
         self.settings_path = settings_path
         self.on_toggle = on_toggle    # click: start/stop dictation
         self.on_quit = on_quit        # menu Quit: ask the app to shut down
+        self.on_position_change = None  # called with [x, y] on drag, None on reset
+        self.on_settings = None       # menu Settings row; None -> open the toml
+        self._pill_size = min(2.0, max(0.5, float(pill_size)))
+        self._visibility = visibility if visibility in (
+            "always", "dictating", "never") else "always"
+        self._pos = tuple(position) if position else None  # (cx, by) logical
         self._cmd: queue.Queue = queue.Queue()
         self._levels: collections.deque = collections.deque(maxlen=_BARS)
         self._state = "idle"
@@ -114,6 +212,15 @@ class WaveformOverlay:
 
     def set_state(self, state: str) -> None:
         self._cmd.put(state)
+
+    def set_visibility(self, mode: str) -> None:
+        """'always' | 'dictating' | 'never' — takes effect immediately."""
+        if mode in ("always", "dictating", "never"):
+            self._cmd.put(("visibility", mode))
+
+    def reset_position(self) -> None:
+        """Back to default bottom-center; reports None to on_position_change."""
+        self._cmd.put(("reset_pos", None))
 
     def close(self) -> None:
         self._cmd.put("quit")
@@ -158,83 +265,156 @@ class WaveformOverlay:
         frame = {"n": 0}
         hover = {"on": False}
 
+        # UI element sizes scale with DPI x pill_size; SCREEN coordinates
+        # (the saved anchor) scale with DPI only.
+        U = S * self._pill_size
+
         def px(v: float) -> int:
-            return int(round(v * S))
+            return int(round(v * U))
+
+        def fnt(pt: int) -> tuple[str, int]:
+            return ("Segoe UI", max(8, int(round(pt * self._pill_size))))
+
+        def place_xy(w: int, h: int) -> tuple[int, int]:
+            """Window top-left for the current anchor. Custom anchor is
+            (center-x, bottom-y) in logical px so the chip and the expanded
+            capsule stay visually planted on the same spot; always clamped
+            to the virtual screen (monitor changes can't strand the pill)."""
+            if self._pos is not None:
+                x = int(round(self._pos[0] * S)) - w // 2
+                y = int(round(self._pos[1] * S)) - h
+            else:
+                x = (screen_w - w) // 2
+                y = screen_h - int(round(_BOTTOM_MARGIN * S)) - h
+            return clamp_position(x, y, w, h, virtual_screen())
 
         def layout(w_log: float, h_log: float) -> None:
             w, h = px(w_log), px(h_log)
-            if (size["w"], size["h"]) != (w, h):
-                size["w"], size["h"] = w, h
-                x = (screen_w - w) // 2
-                y = screen_h - px(_BOTTOM_MARGIN) - h
+            resized = (size["w"], size["h"]) != (w, h)
+            size["w"], size["h"] = w, h
+            if arbiter.state != PressArbiter.DRAGGING:
+                x, y = place_xy(w, h)
                 root.geometry(f"{w}x{h}+{x}+{y}")
+            if resized:
                 canvas.configure(width=w, height=h)
             canvas.delete("all")
             draw_capsule()
 
+        def rounded_rect(x0: int, y0: int, x1: int, y1: int, fill: str,
+                         tags: str) -> None:
+            hh = y1 - y0
+            r = hh // 2
+            canvas.create_oval(x0, y0, x0 + hh, y1, fill=fill, outline=fill,
+                               tags=tags)
+            canvas.create_oval(x1 - hh, y0, x1, y1, fill=fill, outline=fill,
+                               tags=tags)
+            canvas.create_rectangle(x0 + r, y0, x1 - r, y1, fill=fill,
+                                    outline=fill, tags=tags)
+
         def draw_capsule() -> None:
             w, h = size["w"], size["h"]
-            fill = _BG_HOVER if hover["on"] else _BG
-            r = h // 2
-            canvas.create_oval(0, 0, h, h, fill=fill, outline=fill, tags="capsule")
-            canvas.create_oval(w - h, 0, w, h, fill=fill, outline=fill, tags="capsule")
-            canvas.create_rectangle(r, 0, w - r, h, fill=fill, outline=fill,
-                                    tags="capsule")
+            # Green tint = position unlocked, the next drag moves the pill.
+            fill = (_DRAG_ARM if drag_ui["unlocked"]
+                    else _BG_HOVER if hover["on"] else _BG)
+            rounded_rect(0, 0, w, h, fill, "capsule")
 
         def show() -> None:
             root.deiconify()
             root.lift()
             root.attributes("-topmost", True)
 
+        def sync_visibility() -> None:
+            """Show or hide the WINDOW for the current mode + state (M7,
+            revised: idle in "dictating" mode hides IMMEDIATELY — no
+            linger). The Tk root and thread stay alive in every mode. An
+            unlocked pill is always shown (it must be draggable)."""
+            if drag_ui["unlocked"]:
+                show()
+                return
+            mode = self._visibility
+            if mode == "never":
+                root.withdraw()
+                return
+            if mode == "dictating" and self._state == "idle":
+                root.withdraw()
+                return
+            show()
+
         def center_text(message: str, fill: str = _TEXT) -> None:
             canvas.create_text(size["w"] // 2, size["h"] // 2, text=message,
-                               fill=fill, font=("Segoe UI", 10), tags="text")
+                               fill=fill, font=fnt(11), tags="text")
+
+        def draw_chip_at(x0: int, y0: int, h: int) -> None:
+            r = px(5)
+            cy = y0 + h // 2
+            dot_x = x0 + px(18)
+            canvas.create_oval(dot_x - r, cy - r, dot_x + r, cy + r,
+                               fill=_DOT_RUN, outline=_DOT_RUN, tags="text")
+            canvas.create_text(x0 + px(32), cy, anchor="w", text="LocalFlow",
+                               fill=_TEXT_DIM, font=fnt(10), tags="text")
 
         def draw_chip() -> None:
-            h = size["h"]
-            r = px(4)
-            cx = px(15)
-            canvas.create_oval(cx - r, h // 2 - r, cx + r, h // 2 + r,
-                               fill=_DOT_RUN, outline=_DOT_RUN, tags="text")
-            canvas.create_text(px(26), h // 2, anchor="w", text="LocalFlow",
-                               fill=_TEXT_DIM, font=("Segoe UI", 9), tags="text")
+            draw_chip_at(0, 0, size["h"])
 
-        menu_keys = (("settings", "Settings"), ("quit", "Quit"))
+        # Right-click menu (revised round 2): four items, drawn ABOVE the
+        # pill in the same window so the pill itself is never covered.
+        # "unlock" toggles: while unlocked the pill drags freely (multiple
+        # drags) until "Lock position" is picked (Jeremy, round 3).
+        def menu_items() -> tuple[tuple[str, str], ...]:
+            return (("unlock", "Lock position" if drag_ui["unlocked"]
+                     else "Unlock position"),
+                    ("reset", "Reset position"),
+                    ("settings", "Settings"),
+                    ("quit", "Quit"))
 
-        def menu_boxes() -> dict:
-            """Left half = Settings, right half = Quit. Full-height boxes so
-            the click target is the whole half of the pill, not just the glyphs
-            (a near-miss used to fall through and close the menu)."""
-            w, h = size["w"], size["h"]
-            pad, gap = px(8), px(6)
-            top, bot = px(7), h - px(7)
-            mid = w // 2
-            return {
-                "settings": (pad, top, mid - gap // 2, bot),
-                "quit": (mid + gap // 2, top, w - pad, bot),
-            }
+        menu_geo: dict[str, tuple[int, int, int, int]] = {}
 
         def highlight_menu(hot: str | None) -> None:
-            for key, _label in menu_keys:
+            for key, (_x0, _y0, _x1, _y1) in menu_geo.items():
                 color = _MENU_BTN_HOVER if key == hot else _MENU_BTN
                 canvas.itemconfig(f"rect_{key}", fill=color, outline=color)
 
-        def draw_menu() -> None:
-            canvas.delete("menu")
-            boxes = menu_boxes()
-            for key, label in menu_keys:
-                x0, y0, x1, y1 = boxes[key]
-                canvas.create_rectangle(
-                    x0, y0, x1, y1, fill=_MENU_BTN, outline=_MENU_BTN,
-                    tags=("menu", f"hit_{key}", f"rect_{key}"))
-                canvas.create_text(
-                    (x0 + x1) // 2, (y0 + y1) // 2, text=label, fill=_TEXT,
-                    font=("Segoe UI", 10), tags=("menu", f"hit_{key}"))
-            # Auto-dismiss fallback. The menu deliberately does NOT close on
-            # mouse-leave any more — the pill is tiny and the cursor routinely
-            # skims off it on the way to a button, which used to snap it shut.
-            root.after(_MENU_TIMEOUT_MS,
-                       lambda: apply("idle") if self._state == "menu" else None)
+        def layout_menu() -> None:
+            """Menu panel on top, the idle chip at the bottom of the same
+            window — the window stays bottom-anchored, so the chip sits
+            exactly where the pill was."""
+            items = menu_items()
+            pad, rh = px(6), px(_MENU_ROW_H)
+            menu_h = 2 * pad + len(items) * rh
+            gap = px(_MENU_GAP)
+            chip_w, chip_h = px(_CHIP_W), px(_CHIP_H)
+            w = max(px(_MENU_W), chip_w)
+            h = menu_h + gap + chip_h
+            resized = (size["w"], size["h"]) != (w, h)
+            size["w"], size["h"] = w, h
+            if arbiter.state != PressArbiter.DRAGGING:
+                x, y = place_xy(w, h)
+                root.geometry(f"{w}x{h}+{x}+{y}")
+            if resized:
+                canvas.configure(width=w, height=h)
+            canvas.delete("all")
+            canvas.create_rectangle(0, 0, w, menu_h, fill=_BG, outline=_BG,
+                                    tags="menu")
+            menu_geo.clear()
+            y0 = pad
+            for key, label in items:
+                box = (pad, y0, w - pad, y0 + rh - px(4))
+                menu_geo[key] = box
+                canvas.create_rectangle(*box, fill=_MENU_BTN, outline=_MENU_BTN,
+                                        tags=("menu", f"rect_{key}"))
+                canvas.create_text(box[0] + px(10), (box[1] + box[3]) // 2,
+                                   anchor="w", text=label, fill=_TEXT,
+                                   font=fnt(10), tags="menu")
+                y0 += rh
+            cx0 = (w - chip_w) // 2
+            rounded_rect(cx0, h - chip_h, cx0 + chip_w, h,
+                         _BG_HOVER if hover["on"] else _BG, "capsule")
+            draw_chip_at(cx0, h - chip_h, chip_h)
+            # No auto-dismiss timer (stale timers from a previous open were
+            # closing a REOPENED menu - found live 6 Jul). The menu closes
+            # on: a row action, clicking the chip below, right-clicking the
+            # pill again, or any mouse press outside the window (polled in
+            # tick(), since a NOACTIVATE window gets no outside events).
 
         def draw_wave() -> None:
             canvas.delete("wave")
@@ -274,14 +454,13 @@ class WaveformOverlay:
             self._state = state
             if state == "loading":
                 layout(_EXP_W, _EXP_H)
-                center_text("LocalFlow - loading models...")
+                center_text("LocalFlow - loading...")
             elif state == "warming":
                 layout(_EXP_W, _EXP_H)
-                center_text(f"Warming up... ({self._hotkey} already works)",
-                            _TEXT_DIM)
+                center_text(f"Warming up - {self._hotkey} works", _TEXT_DIM)
             elif state == "ready":
                 layout(_EXP_W, _EXP_H)
-                center_text(f"Ready - hold {self._hotkey} or click to dictate")
+                center_text(f"Ready - {self._hotkey} or click")
                 root.after(_READY_FLASH_MS,
                            lambda: apply("idle") if self._state == "ready" else None)
             elif state == "rec":
@@ -292,12 +471,11 @@ class WaveformOverlay:
                 layout(_EXP_W, _EXP_H)
                 draw_wave()
             elif state == "menu":
-                layout(_EXP_W, _EXP_H)
-                draw_menu()
+                layout_menu()
             else:                            # idle -> persistent chip
                 layout(_CHIP_W, _CHIP_H)
                 draw_chip()
-            show()
+            sync_visibility()
 
         def call_safely(cb, what: str) -> None:
             if cb is None:
@@ -318,24 +496,84 @@ class WaveformOverlay:
                 log.exception("could not open settings file %s", path)
 
         def menu_hit(x: int, y: int) -> str | None:
-            """Which menu button (if any) the pixel is on. Pure geometry —
+            """Which menu row (if any) the pixel is on. Pure geometry —
             Tk's 'current' item tag proved unreliable on this NOACTIVATE
             window (found live 3 Jul: Settings clicks silently did nothing)."""
-            for key, (x0, y0, x1, y1) in menu_boxes().items():
+            for key, (x0, y0, x1, y1) in menu_geo.items():
                 if x0 <= x <= x1 and y0 <= y <= y1:
                     return key
             return None
+
+        # -- click vs unlocked-drag (M7, revised) ------------------------
+        arbiter = PressArbiter(slop_px=px(_DRAG_SLOP_LOG))
+        drag_ui = {"unlocked": False, "win": (0, 0), "cur": (0, 0)}
+
+        def on_press(event) -> None:
+            # Menu presses are always clicks - otherwise an unlocked pill
+            # would start dragging when the user tries to hit
+            # "Lock position" in the menu itself.
+            arbiter.press(event.x_root, event.y_root,
+                          unlocked=drag_ui["unlocked"]
+                          and self._state != "menu")
+            drag_ui["cur"] = (event.x_root, event.y_root)
+            drag_ui["win"] = (root.winfo_x(), root.winfo_y())
+
+        def on_b1motion(event) -> None:
+            if arbiter.motion(event.x_root, event.y_root):
+                dx = event.x_root - drag_ui["cur"][0]
+                dy = event.y_root - drag_ui["cur"][1]
+                root.geometry(f"+{drag_ui['win'][0] + dx}"
+                              f"+{drag_ui['win'][1] + dy}")
+
+        def notify_position(pos) -> None:
+            if self.on_position_change is None:
+                return
+            try:
+                self.on_position_change(pos)
+            except Exception:
+                log.exception("overlay position callback failed")
+
+        def on_release(event) -> None:
+            outcome = arbiter.release(event.x_root, event.y_root)
+            if outcome == "click":
+                on_click(event)
+                return
+            if outcome == "drag_end":
+                # Persist the anchor (window center-bottom, logical px).
+                # The pill STAYS unlocked - Jeremy: relock explicitly via
+                # right-click "Lock position", so it can be nudged again.
+                w, h = size["w"], size["h"]
+                x, y = clamp_position(root.winfo_x(), root.winfo_y(), w, h,
+                                      virtual_screen())
+                self._pos = (int(round((x + w / 2) / S)),
+                             int(round((y + h) / S)))
+                apply(self._state)           # re-layout at the final spot
+                notify_position(list(self._pos))
 
         def on_click(event) -> None:
             st = self._state
             if st == "menu":
                 hit = menu_hit(event.x, event.y)
-                if hit == "settings":
+                if hit == "unlock":
+                    # Toggle: unlock -> drag freely (green tint) until
+                    # "Lock position" is picked here again.
+                    drag_ui["unlocked"] = not drag_ui["unlocked"]
                     apply("idle")
-                    open_settings()
+                elif hit == "reset":
+                    self._pos = None
+                    apply("idle")
+                    notify_position(None)
+                elif hit == "settings":
+                    apply("idle")
+                    # M8 wires on_settings to the real settings window;
+                    # until then fall back to opening the toml.
+                    if self.on_settings is not None:
+                        call_safely(self.on_settings, "settings")
+                    else:
+                        open_settings()
                 elif hit == "quit":
                     call_safely(self.on_quit, "quit")
-                else:                        # clicked off a button -> dismiss
+                else:                        # off any row -> dismiss
                     apply("idle")
             elif st in ("idle", "ready", "warming", "rec"):
                 # toggle dictation; focus stays on the paste target thanks
@@ -344,7 +582,9 @@ class WaveformOverlay:
             # loading/busy: ignore clicks
 
         def on_rclick(_event) -> None:
-            if self._state in ("idle", "ready", "warming", "busy"):
+            if self._state == "menu":        # right-click again = close
+                apply("idle")
+            elif self._state in ("idle", "ready", "warming", "busy"):
                 apply("menu")
 
         def on_motion(event) -> None:
@@ -354,6 +594,8 @@ class WaveformOverlay:
 
         def set_hover(on: bool) -> None:
             hover["on"] = on
+            if drag_ui["unlocked"]:
+                return                       # never repaint over the cue
             fill = _BG_HOVER if on else _BG
             canvas.itemconfig("capsule", fill=fill, outline=fill)
 
@@ -362,24 +604,68 @@ class WaveformOverlay:
             if self._state == "menu":
                 highlight_menu(None)   # keep the menu open; just drop the hover
 
-        canvas.bind("<Button-1>", on_click)
+        # Button-1 now arbitrates click vs hold-to-drag; the click action
+        # fires on RELEASE (within slop, under 1s) instead of on press.
+        # <B1-Motion> is more specific than <Motion>, so Tk routes held-
+        # button movement to the drag handler only.
+        canvas.bind("<Button-1>", on_press)
+        canvas.bind("<B1-Motion>", on_b1motion)
+        canvas.bind("<ButtonRelease-1>", on_release)
         canvas.bind("<Button-3>", on_rclick)
         canvas.bind("<Motion>", on_motion)
         canvas.bind("<Enter>", lambda e: set_hover(True))
         canvas.bind("<Leave>", on_leave)
 
+        menu_out = {"pressed": False}
+
+        def poll_outside_click() -> None:
+            """Close the open menu on any mouse press OUTSIDE the window.
+            The window is WS_EX_NOACTIVATE, so outside presses never reach
+            Tk - poll the global button state on the UI tick instead."""
+            try:
+                from ctypes import windll, wintypes, byref
+                u32 = windll.user32
+                down = ((u32.GetAsyncKeyState(0x01) | u32.GetAsyncKeyState(0x02))
+                        & 0x8000)
+                if not down:
+                    menu_out["pressed"] = False
+                    return
+                if menu_out["pressed"]:
+                    return                   # same press, already assessed
+                menu_out["pressed"] = True
+                pt = wintypes.POINT()
+                u32.GetCursorPos(byref(pt))
+                x0, y0 = root.winfo_rootx(), root.winfo_rooty()
+                if not (x0 <= pt.x < x0 + size["w"]
+                        and y0 <= pt.y < y0 + size["h"]):
+                    apply("idle")
+            except Exception:
+                log.exception("outside-click poll failed")
+
         def tick() -> None:
             try:
                 while True:
-                    state = self._cmd.get_nowait()
-                    if state == "quit":
+                    cmd = self._cmd.get_nowait()
+                    if cmd == "quit":
                         root.destroy()
                         return
-                    apply(state)
+                    if isinstance(cmd, tuple):     # M7 ops, not states
+                        op, arg = cmd
+                        if op == "visibility":
+                            self._visibility = arg
+                            sync_visibility()
+                        elif op == "reset_pos":
+                            self._pos = None
+                            apply(self._state)     # snap to bottom-center
+                            notify_position(None)
+                        continue
+                    apply(cmd)
             except queue.Empty:
                 pass
             if self._state == "rec":
                 draw_wave()
+            elif self._state == "menu":
+                poll_outside_click()
             root.after(_TICK_MS, tick)
 
         apply("idle")                        # visible from the first moment

@@ -484,17 +484,35 @@ def _run(args: argparse.Namespace) -> int:
 
     cfg_path = config.find_config(args.config)
     cfg = apply_cli_overrides(config.load_config(cfg_path), args)
+    settings_path = cfg_path or Path.cwd() / config.CONFIG_FILENAME
+
+    def persist_settings(changes: dict) -> None:
+        # Comment-preserving write-back (M7). Never lets a settings write
+        # take dictation down.
+        try:
+            config.save_config(settings_path, changes)
+        except Exception:
+            log.exception("could not save settings %s", sorted(changes))
 
     # The overlay goes up FIRST so launching gives instant feedback ("loading
     # models...") instead of a blank few seconds; it fails soft to no overlay.
+    # M7: the overlay thread + Tk root exist in EVERY visibility mode (the
+    # settings window needs a UI thread regardless); overlay_enabled=false
+    # and --no-overlay map to the "never" mode (window withdrawn, tray menu
+    # is the way back).
     overlay = None
-    if cfg.overlay_enabled:
-        try:
-            from localflow.desktop.overlay import WaveformOverlay
-            overlay = WaveformOverlay(hotkey=cfg.hotkey)
-            overlay.set_state("loading")
-        except Exception:
-            log.exception("overlay unavailable — continuing without it")
+    overlay_visibility = cfg.overlay_visibility if cfg.overlay_enabled else "never"
+    try:
+        from localflow.desktop.overlay import WaveformOverlay
+        overlay = WaveformOverlay(hotkey=cfg.hotkey,
+                                  visibility=overlay_visibility,
+                                  position=cfg.overlay_position,
+                                  pill_size=cfg.pill_size)
+        overlay.on_position_change = (
+            lambda pos: persist_settings({"overlay_position": pos}))
+        overlay.set_state("loading")
+    except Exception:
+        log.exception("overlay unavailable — continuing without it")
 
     input_device: int | str | None = cfg.input_device
     if isinstance(input_device, str) and input_device.isdigit():
@@ -602,7 +620,25 @@ def _run(args: argparse.Namespace) -> int:
     hotkey = PushToTalkListener(cfg.hotkey, app.on_hotkey_down, app.on_hotkey_up)
     hotkey.start()
 
-    settings_path = cfg_path or Path.cwd() / config.CONFIG_FILENAME
+    # M7: pill visibility + position controls, live from the tray.
+    vis_state = {"mode": overlay_visibility}
+
+    def set_pill_visibility(mode: str) -> None:
+        vis_state["mode"] = mode
+        if overlay is not None:
+            overlay.set_visibility(mode)
+        changes: dict = {"overlay_visibility": mode}
+        if mode != "never" and not cfg.overlay_enabled:
+            # Choosing a visible mode from the tray must survive a restart
+            # even when the pill was disabled outright in the config.
+            changes["overlay_enabled"] = True
+            cfg.overlay_enabled = True
+        persist_settings(changes)
+
+    def reset_pill_position() -> None:
+        if overlay is not None:
+            overlay.reset_position()  # its callback persists the removal
+
     tray = None
     if not args.no_tray:
         try:
@@ -610,7 +646,13 @@ def _run(args: argparse.Namespace) -> int:
             tray = TrayIcon(f"{engine.model_name} on {engine.device}", settings_path,
                             cleanup_get=(lambda: app.cleanup_active)
                             if app.cleanup_available else None,
-                            cleanup_toggle=app.toggle_cleanup)
+                            cleanup_toggle=app.toggle_cleanup,
+                            visibility_get=(lambda: vis_state["mode"])
+                            if overlay is not None else None,
+                            visibility_set=set_pill_visibility
+                            if overlay is not None else None,
+                            reset_pill_position=reset_pill_position
+                            if overlay is not None else None)
         except Exception:
             log.exception("tray unavailable — falling back to console-only mode")
             tray = None

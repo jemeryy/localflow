@@ -41,12 +41,20 @@ def make_state_images() -> dict[str, Image.Image]:
 
 
 class TrayIcon:
-    """Menu: status line, cleanup toggle (greyed until M5), open settings,
-    quit. Quit stops the icon loop; the caller tears the rest down after
-    run() returns."""
+    """Menu: status line, cleanup toggle, pill visibility (M7), reset pill
+    position (M7), open settings, quit. Quit stops the icon loop; the
+    caller tears the rest down after run() returns."""
+
+    # Jeremy (6 Jul): no "hidden" option anywhere — the pill is either
+    # always there or appears while dictating. (Config "never" still
+    # exists for --no-overlay compat but no menu offers it.)
+    _VISIBILITY_LABELS = (("always", "Always"),
+                          ("dictating", "While dictating"))
 
     def __init__(self, status: str, config_path: Path,
-                 cleanup_get=None, cleanup_toggle=None):
+                 cleanup_get=None, cleanup_toggle=None,
+                 visibility_get=None, visibility_set=None,
+                 reset_pill_position=None):
         self._config_path = config_path
         self._images = make_state_images()
         if cleanup_get is not None:
@@ -59,9 +67,32 @@ class TrayIcon:
         else:
             cleanup_item = pystray.MenuItem(
                 "Cleanup unavailable (no model on disk)", None, enabled=False)
+        extra: list[pystray.MenuItem] = []
+        if visibility_get is not None and visibility_set is not None:
+            # M7: radio submenu; the checked mark follows the live mode and
+            # the choice is persisted to localflow.toml by the callback.
+            # pystray's _assert_action rejects callables with extra params
+            # (even defaulted ones - found live 6 Jul), so bind the mode
+            # with plain closures, never `m=mode` lambda defaults.
+            def _vis_item(mode: str, label: str) -> pystray.MenuItem:
+                def select(icon, item):
+                    visibility_set(mode)
+
+                def is_checked(item):
+                    return visibility_get() == mode
+
+                return pystray.MenuItem(label, select, checked=is_checked,
+                                        radio=True)
+            extra.append(pystray.MenuItem("Show pill", pystray.Menu(
+                *(_vis_item(m, lbl) for m, lbl in self._VISIBILITY_LABELS))))
+        if reset_pill_position is not None:
+            extra.append(pystray.MenuItem(
+                "Reset pill position",
+                lambda icon, item: reset_pill_position()))
         menu = pystray.Menu(
             pystray.MenuItem(status, None, enabled=False),
             cleanup_item,
+            *extra,
             pystray.MenuItem("Open settings file", self._open_settings),
             pystray.MenuItem("Quit LocalFlow", self._quit),
         )

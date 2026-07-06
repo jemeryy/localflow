@@ -15,7 +15,9 @@ import tomllib
 from pathlib import Path
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, ValidationError
+import threading
+
+from pydantic import BaseModel, ConfigDict, ValidationError, field_validator
 
 log = logging.getLogger("localflow.desktop.config")
 
@@ -36,6 +38,10 @@ inject_mode = "paste"     # paste (clipboard+Ctrl+V) | type (keystrokes, slower)
 restore_delay_ms = 500    # clipboard restore delay; raise it if a slow app
                           # ever pastes your OLD clipboard instead of speech
 overlay_enabled = true    # Wispr-style waveform pill while recording (FR-2)
+overlay_visibility = "always"  # always | dictating (show only while dictating)
+pill_size = 1.0           # pill scale: 0.5 small ... 2.0 huge
+# overlay_position = [960, 1000]  # pill anchor (center-x, bottom-y in logical
+                                  # px); set by dragging, removed by reset
 cleanup_enabled = false   # LLM cleanup: removes filler, fixes punctuation.
                           # false = not loaded at startup (saves ~2-3GB memory);
                           # the tray toggle loads it on demand. true = always on.
@@ -76,6 +82,32 @@ class Config(BaseModel):
     # your OLD clipboard instead of your words. Raise if that ever recurs.
     restore_delay_ms: int = 500
     overlay_enabled: bool = True
+    # Pill visibility (M7): "always" keeps the idle chip on screen,
+    # "dictating" shows the pill only around a dictation, "never" hides it
+    # (tray menu is the way back). overlay_enabled=false maps to "never" at
+    # startup but keeps the UI thread alive for the settings window.
+    overlay_visibility: Literal["always", "dictating", "never"] = "always"
+    # Pill anchor as [center-x, bottom-y] in logical (96-dpi) px, saved by
+    # hold-to-drag; None = default bottom-center. Clamped to the virtual
+    # screen at draw time so a monitor change can't strand it off-screen.
+    overlay_position: list[int] | None = None
+    # Pill scale factor (M7): 1.0 = the default (already enlarged) pill;
+    # exposed as a slider in the M8 settings window.
+    pill_size: float = 1.0
+
+    @field_validator("pill_size")
+    @classmethod
+    def _pill_size_sane(cls, v: float) -> float:
+        if not 0.5 <= v <= 2.0:
+            raise ValueError("pill_size must be between 0.5 and 2.0")
+        return v
+
+    @field_validator("overlay_position")
+    @classmethod
+    def _position_is_xy(cls, v):
+        if v is not None and len(v) != 2:
+            raise ValueError("overlay_position must be [x, y]")
+        return v
     cleanup_enabled: bool = False
     cleanup_model_dir: str = "models/qwen2.5-3b-ov"
     # Audio cleanup before STT. denoise = high-pass + gentle spectral gating;
@@ -133,11 +165,42 @@ def load_config(path: Path | None) -> Config:
 
 def write_default_config(path: Path) -> None:
     """Create a commented default config (never overwrites an existing one)."""
-    if path.exists():
-        return
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(DEFAULT_CONFIG_TOML, encoding="utf-8")
+    with _SAVE_LOCK:
+        if path.exists():
+            return
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(DEFAULT_CONFIG_TOML, encoding="utf-8")
     log.info("wrote default config to %s", path)
+
+
+# RLock: save_config holds it while calling write_default_config, and
+# write_default_config also takes it when called directly (tray/overlay
+# "Open settings" racing a drag/visibility save must not clobber the file).
+_SAVE_LOCK = threading.RLock()
+
+
+def save_config(path: Path, changes: dict) -> None:
+    """Comment-preserving update of localflow.toml (M7/M8, via tomlkit).
+
+    Only known Config fields may be written (same typo protection as load).
+    A value of None REMOVES the key (back to the built-in default). Creates
+    the default commented file first if none exists. Serialized by a lock:
+    the tray thread and the overlay UI thread both save settings."""
+    import tomlkit
+
+    unknown = set(changes) - set(Config.model_fields)
+    if unknown:
+        raise ValueError(f"unknown config keys: {sorted(unknown)}")
+    with _SAVE_LOCK:
+        write_default_config(path)     # no-op when the file already exists
+        doc = tomlkit.parse(path.read_text(encoding="utf-8"))
+        for key, value in changes.items():
+            if value is None:
+                doc.pop(key, None)
+            else:
+                doc[key] = value
+        path.write_text(tomlkit.dumps(doc), encoding="utf-8")
+    log.info("saved settings %s to %s", sorted(changes), path)
 
 
 def open_settings_editor(path: Path) -> None:

@@ -25,6 +25,7 @@ dependencies = [
     "pystray",
     "pillow",
     "pycaw",
+    "tomlkit",
 ]
 
 [project.scripts]
