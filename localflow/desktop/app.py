@@ -36,6 +36,7 @@ from localflow.core import (
     high_pass,
     transcribe_audio,
 )
+from localflow.core.dictionary import apply_replacements, mine_substitutions
 from localflow.desktop import config
 from localflow.desktop.capture import StreamRecorder
 from localflow.desktop.inject import inject_text
@@ -193,6 +194,10 @@ class LocalFlowApp:
         # tracks the combo as active regardless, and an unpaired
         # on_hotkey_up would stop (steal) the mic test's recording.
         self._hotkey_suppressed = False
+        # M10: personal dictionary (applied after cleanup, before inject)
+        # and the optional history store (None = history off, write nothing).
+        self.replacements: dict[str, str] = {}
+        self.history = None
         self._work: queue.Queue = queue.Queue()
         self._worker = threading.Thread(target=self._drain, daemon=True)
 
@@ -385,11 +390,23 @@ class LocalFlowApp:
         # clean_text is None when cleanup is off or failed — raw always wins
         # over no paste (FR-8: cleanup can never block dictation).
         text = result.clean_text if result.clean_text is not None else result.raw_text
+        if self.replacements:
+            try:  # M10 dictionary; a bad rule must never block the paste
+                text = apply_replacements(text, self.replacements)
+            except Exception:
+                log.exception("dictionary failed — pasting unmodified text")
         injected = inject_text(text, mode=self.inject_mode,
                                restore_delay_s=self.restore_delay_s)
         total_ms = int((time.perf_counter() - t_release) * 1000)
         if injected:
             self.latencies_ms.append(total_ms)
+            history = self.history      # snapshot: the settings toggle can
+            if history is not None:     # null this attr mid-utterance
+                history.append(
+                    raw_text=result.raw_text, clean_text=result.clean_text,
+                    final_text=text,
+                    device=getattr(self.recorder, "device_name", "?"),
+                    stt_ms=result.stt_ms)
             cleanup_note = (f", cleanup {result.cleanup_ms}ms"
                             if result.cleanup_ms is not None else "")
             # FR-7 per-utterance log + release-to-paste total (feeds AT-4).
@@ -477,6 +494,10 @@ def apply_settings(changes: dict, cfg: config.Config, hooks: dict) -> set[str]:
             hooks["cleanup"](value)
         elif key == "overlay_position":
             pass                        # owned by the drag/reset paths
+        elif key == "history_enabled":
+            hooks["history"](value)
+        elif key == "replacements":
+            hooks["replacements"](value)
         else:
             restart.add(key)            # no live path -> be honest
     if preprocess_dirty:
@@ -724,6 +745,11 @@ def _run(args: argparse.Namespace) -> int:
                        cleanup=cleanup, cleanup_loader=cleanup_loader,
                        restore_delay_s=cfg.restore_delay_ms / 1000.0,
                        preprocess=preprocess)
+    # M10: dictionary + history from config (both live-appliable).
+    app.replacements = dict(cfg.replacements)
+    if cfg.history_enabled:
+        from localflow.desktop.history import HistoryStore
+        app.history = HistoryStore()
     app.start_worker()
     # Held in a ref so the settings window can rebuild it live (M8).
     hotkey_ref = {"listener": PushToTalkListener(
@@ -850,6 +876,18 @@ def _run(args: argparse.Namespace) -> int:
     def hook_restore_delay(seconds: float) -> None:
         app.restore_delay_s = seconds
 
+    def hook_history(enabled: bool) -> None:
+        if enabled and app.history is None:
+            from localflow.desktop.history import HistoryStore
+            app.history = HistoryStore()
+        elif not enabled:
+            app.history = None          # stop writing; file stays until
+            log.info("history recording off")  # "Clear history" removes it
+
+    def hook_replacements(rules: dict) -> None:
+        app.replacements = dict(rules or {})
+        log.info("dictionary now has %d rule(s)", len(app.replacements))
+
     def hook_inject_mode(mode: str) -> None:
         app.inject_mode = mode
 
@@ -881,6 +919,8 @@ def _run(args: argparse.Namespace) -> int:
         "visibility": set_pill_visibility,
         "pill_size": hook_pill_size,
         "cleanup": hook_cleanup,
+        "history": hook_history,
+        "replacements": hook_replacements,
     }
 
     def apply_from_ui(changes: dict) -> set[str]:
@@ -1016,6 +1056,27 @@ def _run(args: argparse.Namespace) -> int:
         when = time.strftime("%d %b %H:%M", time.localtime(saved_at))
         return f"Calibrated for {device} ({when})"
 
+    # -- M10: history + dictionary plumbing for the settings window -------
+    def history_entries() -> list:
+        """Newest first; [] when history is off."""
+        return list(reversed(app.history.load())) if app.history else []
+
+    def save_correction(ts: float, text: str) -> bool:
+        return (app.history.set_correction(ts, text)
+                if app.history is not None else False)
+
+    def clear_history() -> None:
+        from localflow.desktop.history import HistoryStore
+        (app.history or HistoryStore()).clear()  # remove the file even if off
+
+    def dictionary_suggestions() -> list[tuple[str, str, int]]:
+        """Mined substitution rules not already in the dictionary."""
+        if app.history is None:
+            return []
+        mined = mine_substitutions(app.history.corrections())
+        existing = {k.lower() for k in cfg.replacements}
+        return [(s, t, n) for s, t, n in mined if s.lower() not in existing]
+
     def wire_settings_ui(ov) -> None:
         """Give an overlay the settings-window factory (runs on ITS UI
         thread via the overlay command queue)."""
@@ -1037,6 +1098,10 @@ def _run(args: argparse.Namespace) -> int:
             calibrate=calibrate_noise,
             clear_calibration=clear_noise_calibration,
             calibration_status=calibration_status,
+            history_entries=history_entries,
+            save_correction=save_correction,
+            clear_history=clear_history,
+            suggestions=dictionary_suggestions,
             reset_pill_position=reset_pill_position,
             open_config_file=lambda: config.open_settings_editor(settings_path),
             status_text=f"{engine.model_name} on {engine.device}",

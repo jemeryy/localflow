@@ -10,14 +10,16 @@ the overlay's whole Tk root, which destroys THIS window mid-apply. Completion
 callbacks therefore treat a dead widget (TclError) as normal, not an error.
 
 The pure helpers up top (PRESETS, preset_name_for, key_name_of, modifier_of,
-format_captured, mic_selection, collect_changes, coerce_changes) carry the
-logic that gets unit-tested; nothing in them touches Tk or pynput listeners.
+format_captured, mic_selection, collect_changes, coerce_changes,
+history_row_label, rule_rows, suggestion_rows) carry the logic that gets
+unit-tested; nothing in them touches Tk or pynput listeners.
 """
 
 from __future__ import annotations
 
 import logging
 import threading
+import time
 import tkinter as tk
 from tkinter import ttk
 
@@ -182,6 +184,40 @@ def coerce_changes(changes: dict) -> dict:
     return out
 
 
+# M10 history/dictionary list formatting. The cap keeps a row on one
+# Listbox line at the window's fixed width; 50 rows is plenty to find a
+# recent dictation without making the refresh rebuild feel slow.
+_HIST_TEXT_MAX = 60
+_HIST_MAX_ROWS = 50
+
+
+def history_row_label(entry: dict) -> str:
+    """One history Listbox row: 'HH:MM  text'. Shows the ORIGINAL final
+    text even when a correction exists - the leading '*' is what says
+    'edited', and the correction itself appears in the edit box on
+    selection. Newlines are flattened so a row can never wrap."""
+    when = time.strftime("%H:%M", time.localtime(float(entry.get("ts") or 0.0)))
+    text = " ".join(str(entry.get("final_text") or "").split())
+    if len(text) > _HIST_TEXT_MAX:
+        text = text[:_HIST_TEXT_MAX - 3] + "..."
+    mark = "* " if entry.get("corrected_text") else ""
+    return f"{when}  {mark}{text}"
+
+
+def rule_rows(rules: dict) -> list[str]:
+    """Dictionary Listbox lines, sorted by source so row order is stable
+    across rebuilds regardless of dict insertion order (selection indexes
+    map back through the same sort)."""
+    return [f"{source}  ->  {rules[source]}" for source in sorted(rules)]
+
+
+def suggestion_rows(suggestions) -> list[str]:
+    """Suggestion Listbox lines from mine_substitutions-shaped
+    (source, target, count) tuples."""
+    return [f"{source} -> {target}  (seen {count}x)"
+            for source, target, count in suggestions]
+
+
 # -- context handed over from app._run() ---------------------------------
 
 class SettingsContext:
@@ -193,7 +229,8 @@ class SettingsContext:
                  latest_level, test_mic, validate_hotkey, reset_pill_position,
                  open_config_file, status_text, cleanup_available,
                  cleanup_active, calibrate=None, clear_calibration=None,
-                 calibration_status=None):
+                 calibration_status=None, history_entries=None,
+                 save_correction=None, clear_history=None, suggestions=None):
         self.cfg = cfg
         self.apply = apply
         self.list_mics = list_mics
@@ -212,6 +249,11 @@ class SettingsContext:
         self.calibrate = calibrate
         self.clear_calibration = clear_calibration
         self.calibration_status = calibration_status
+        # M10: history panel + dictionary miner (None -> sections hidden).
+        self.history_entries = history_entries
+        self.save_correction = save_correction
+        self.clear_history = clear_history
+        self.suggestions = suggestions
 
 
 # -- the window (overlay UI thread only) ----------------------------------
@@ -326,6 +368,8 @@ class _SettingsWindow:
         self._build_hotkey(main)
         self._build_behaviour(main)
         self._build_cleanup(main)
+        self._build_history(main)
+        self._build_dictionary(main)
         self._build_advanced(main)
         self._build_bottom(bottombar)
 
@@ -537,6 +581,128 @@ class _SettingsWindow:
                         variable=self.cleanup_var).pack(anchor="w")
         ttk.Label(box, text="loads ~2-3GB into GPU memory while on",
                   foreground=_DIM).pack(anchor="w")
+
+    def _build_history(self, parent) -> None:
+        # M10: skipped entirely on pre-M10 wiring (the ctx fields are None),
+        # same gate as ctx.calibrate for the M9 buttons. All four M10 fields
+        # arrive together from app.wire_settings_ui.
+        if self.ctx.history_entries is None:
+            return
+        box = ttk.LabelFrame(parent, text="History", padding=8)
+        box.pack(fill="x", pady=(0, 6))
+
+        self.history_var = tk.BooleanVar(
+            value=bool(self.ctx.cfg.history_enabled))
+        self.history_check = ttk.Checkbutton(
+            box, text="Keep dictation history", variable=self.history_var,
+            command=self._safe(self._on_history_toggled))
+        self.history_check.pack(anchor="w")
+        # Sits ABOVE the list: the list may still show leftovers from before
+        # the toggle went off, and that is fine until Clear history.
+        self.history_off_note = ttk.Label(box, text="", foreground=_DIM)
+        self.history_off_note.pack(anchor="w")
+
+        lb_row = ttk.Frame(box)
+        lb_row.pack(fill="x", pady=(4, 0))
+        self.history_list = tk.Listbox(lb_row, height=6, exportselection=False)
+        hsb = ttk.Scrollbar(lb_row, orient="vertical",
+                            command=self.history_list.yview)
+        self.history_list.configure(yscrollcommand=hsb.set)
+        self.history_list.pack(side="left", fill="x", expand=True)
+        hsb.pack(side="right", fill="y")
+        self.history_list.bind("<<ListboxSelect>>",
+                               self._safe(self._on_history_selected))
+
+        row = ttk.Frame(box)
+        row.pack(fill="x", pady=(4, 0))
+        ttk.Button(row, text="Refresh",
+                   command=self._safe(self._refresh_history)).pack(side="left")
+        ttk.Button(row, text="Clear history",
+                   command=self._safe(self._on_clear_history)
+                   ).pack(side="left", padx=(6, 0))
+
+        ttk.Label(box, text="Select a row, fix the text, save - repeated "
+                            "fixes become dictionary suggestions",
+                  foreground=_DIM, wraplength=_WRAP).pack(anchor="w",
+                                                          pady=(4, 0))
+        row = ttk.Frame(box)
+        row.pack(fill="x")
+        self.correction_var = tk.StringVar()
+        ttk.Entry(row, textvariable=self.correction_var).pack(
+            side="left", fill="x", expand=True)
+        ttk.Button(row, text="Save correction",
+                   command=self._safe(self._on_save_correction)
+                   ).pack(side="left", padx=(6, 0))
+        self.hist_status = ttk.Label(box, text="", foreground=_DIM,
+                                     wraplength=_WRAP)
+        self.hist_status.pack(anchor="w", pady=(2, 0))
+
+        self._hist_entries: list[dict] = []
+        self._selected_ts: float | None = None
+        self._update_history_note()
+        self._refresh_history()
+
+    def _build_dictionary(self, parent) -> None:
+        if self.ctx.suggestions is None:
+            return
+        box = ttk.LabelFrame(parent, text="Dictionary", padding=8)
+        box.pack(fill="x", pady=(0, 6))
+        # Working copy: Add/Remove/Accept edit this dict and persist the
+        # WHOLE thing through ctx.apply, so the window never diffs
+        # rule-by-rule against what is on disk.
+        self._rules: dict[str, str] = dict(self.ctx.cfg.replacements or {})
+        self._rule_sources: list[str] = []
+
+        lb_row = ttk.Frame(box)
+        lb_row.pack(fill="x")
+        self.rules_list = tk.Listbox(lb_row, height=5, exportselection=False)
+        rsb = ttk.Scrollbar(lb_row, orient="vertical",
+                            command=self.rules_list.yview)
+        self.rules_list.configure(yscrollcommand=rsb.set)
+        self.rules_list.pack(side="left", fill="x", expand=True)
+        rsb.pack(side="right", fill="y")
+
+        row = ttk.Frame(box)
+        row.pack(fill="x", pady=(6, 0))
+        self.heard_var = tk.StringVar()
+        self.replace_var = tk.StringVar()
+        ttk.Label(row, text="heard").pack(side="left")
+        ttk.Entry(row, textvariable=self.heard_var,
+                  width=16).pack(side="left", padx=(4, 8))
+        ttk.Label(row, text="replace with").pack(side="left")
+        ttk.Entry(row, textvariable=self.replace_var,
+                  width=16).pack(side="left", padx=(4, 8))
+        self.add_rule_btn = ttk.Button(row, text="Add",
+                                       command=self._safe(self._on_add_rule))
+        self.add_rule_btn.pack(side="left")
+        self.remove_rule_btn = ttk.Button(
+            box, text="Remove selected",
+            command=self._safe(self._on_remove_rule))
+        self.remove_rule_btn.pack(anchor="w", pady=(4, 0))
+        self.dict_status = ttk.Label(box, text="", foreground=_DIM,
+                                     wraplength=_WRAP)
+        self.dict_status.pack(anchor="w", pady=(2, 0))
+
+        # Suggestions sub-block, packed LAST in the box so hide/re-show via
+        # pack_forget/pack can never land it out of order.
+        self.sugg_note = ttk.Label(box, text="Suggested from your corrections:",
+                                   foreground=_DIM)
+        self.sugg_note.pack(anchor="w", pady=(6, 0))
+        self.sugg_row = ttk.Frame(box)
+        self.sugg_list = tk.Listbox(self.sugg_row, height=3,
+                                    exportselection=False)
+        ssb = ttk.Scrollbar(self.sugg_row, orient="vertical",
+                            command=self.sugg_list.yview)
+        self.sugg_list.configure(yscrollcommand=ssb.set)
+        self.sugg_list.pack(side="left", fill="x", expand=True)
+        ssb.pack(side="right", fill="y")
+        self.accept_sugg_btn = ttk.Button(
+            box, text="Accept selected",
+            command=self._safe(self._on_accept_suggestion))
+        self._sugg_items: list[tuple[str, str, int]] = []
+
+        self._refresh_rules()
+        self._refresh_suggestions()
 
     def _build_advanced(self, parent) -> None:
         box = ttk.LabelFrame(parent, text="Advanced", padding=8)
@@ -758,6 +924,195 @@ class _SettingsWindow:
             note = "(clear failed - see the log)"
         self.cal_status.config(text=f"{note}  |  {self._calibration_text()}",
                                foreground=_DIM)
+
+    # -- history panel (M10) -------------------------------------------------
+
+    def _update_history_note(self) -> None:
+        self.history_off_note.config(
+            text="" if self.history_var.get()
+            else "History is off - nothing is stored")
+
+    def _on_history_toggled(self) -> None:
+        enabled = bool(self.history_var.get())
+        # ctx.apply can take seconds (it also persists the toml) - keep it
+        # off the Tk thread, same shape as _on_calibrate.
+        self.history_check.state(["disabled"])
+        self.hist_status.config(text="Saving...", foreground=_DIM)
+
+        def work() -> None:
+            try:
+                self.ctx.apply({"history_enabled": enabled})
+            except Exception as e:
+                log.exception("history toggle failed")
+                self._post(self._history_toggle_done,
+                           " ".join(str(e).split())[:200], True)
+                return
+            self._post(self._history_toggle_done,
+                       "History on." if enabled else "History off.", False)
+
+        threading.Thread(target=work, daemon=True,
+                         name="localflow-history-toggle").start()
+
+    def _history_toggle_done(self, message: str, error: bool) -> None:
+        self.history_check.state(["!disabled"])
+        self.hist_status.config(text=message,
+                                foreground=_RED if error else _DIM)
+        if error:
+            # The checkbox was disabled for the whole apply, so its var
+            # still holds the attempted value - flip it back to reality.
+            self.history_var.set(not self.history_var.get())
+        self._update_history_note()
+
+    def _refresh_history(self) -> None:
+        try:
+            entries = list(self.ctx.history_entries())[:_HIST_MAX_ROWS]
+        except Exception:
+            log.exception("history load failed")
+            entries = []
+        self._hist_entries = entries
+        self._selected_ts = None
+        self.correction_var.set("")
+        self.history_list.delete(0, "end")
+        for entry in entries:
+            self.history_list.insert("end", history_row_label(entry))
+
+    def _on_history_selected(self) -> None:
+        sel = self.history_list.curselection()
+        if not sel:
+            return
+        entry = self._hist_entries[sel[0]]
+        self._selected_ts = float(entry.get("ts") or 0.0)
+        self.correction_var.set(entry.get("corrected_text")
+                                or entry.get("final_text") or "")
+
+    def _on_save_correction(self) -> None:
+        # Deliberately ON the Tk thread: set_correction is a small local
+        # file rewrite, nothing like the seconds-long ctx.apply.
+        if self._selected_ts is None:
+            self.hist_status.config(text="Select an entry first.",
+                                    foreground=_DIM)
+            return
+        text = self.correction_var.get().strip()
+        if not text:
+            return
+        try:
+            ok = bool(self.ctx.save_correction(self._selected_ts, text))
+        except Exception:
+            log.exception("save correction failed")
+            ok = False
+        if not ok:
+            self.hist_status.config(
+                text="Could not save (history off or the entry is gone).",
+                foreground=_RED)
+            return
+        self.hist_status.config(text="Correction saved.", foreground=_DIM)
+        self._refresh_history()
+        # A new correction can push a substitution over the miner's
+        # threshold - the suggestions list must reflect that immediately.
+        if hasattr(self, "sugg_list"):
+            self._refresh_suggestions()
+
+    def _on_clear_history(self) -> None:
+        try:
+            self.ctx.clear_history()
+        except Exception:
+            log.exception("clear history failed")
+            self.hist_status.config(text="(clear failed - see the log)",
+                                    foreground=_RED)
+            return
+        self.hist_status.config(text="History cleared.", foreground=_DIM)
+        self._refresh_history()
+
+    # -- dictionary (M10) ------------------------------------------------------
+
+    def _refresh_rules(self) -> None:
+        self._rule_sources = sorted(self._rules)
+        self.rules_list.delete(0, "end")
+        for line in rule_rows(self._rules):
+            self.rules_list.insert("end", line)
+
+    def _refresh_suggestions(self) -> None:
+        try:
+            items = list(self.ctx.suggestions())
+        except Exception:
+            log.exception("suggestions failed")
+            items = []
+        # ctx.suggestions filters against the PERSISTED dictionary, which
+        # lags while a rules apply is still on its worker thread - filter
+        # against the working copy too so an accepted rule vanishes at once.
+        covered = {source.lower() for source in self._rules}
+        items = [(s, t, n) for s, t, n in items if s.lower() not in covered]
+        self._sugg_items = items
+        self.sugg_list.delete(0, "end")
+        for line in suggestion_rows(items):
+            self.sugg_list.insert("end", line)
+        if items:
+            self.sugg_note.config(text="Suggested from your corrections:")
+            self.sugg_row.pack(fill="x", pady=(2, 0))
+            self.accept_sugg_btn.pack(anchor="w", pady=(4, 0))
+        else:
+            self.sugg_note.config(
+                text="Suggested from your corrections: none yet")
+            self.sugg_row.pack_forget()
+            self.accept_sugg_btn.pack_forget()
+
+    def _on_add_rule(self) -> None:
+        source = self.heard_var.get().strip()
+        target = self.replace_var.get().strip()
+        if not source or not target:
+            return
+        self._rules[source] = target        # overwrite is the update path
+        self.heard_var.set("")
+        self.replace_var.set("")
+        self._refresh_rules()
+        self._refresh_suggestions()         # a manual add may cover one
+        self._persist_rules()
+
+    def _on_remove_rule(self) -> None:
+        sel = self.rules_list.curselection()
+        if not sel:
+            return
+        self._rules.pop(self._rule_sources[sel[0]], None)
+        self._refresh_rules()
+        self._refresh_suggestions()
+        self._persist_rules()
+
+    def _on_accept_suggestion(self) -> None:
+        sel = self.sugg_list.curselection()
+        if not sel:
+            return
+        source, target, _count = self._sugg_items[sel[0]]
+        self._rules[source] = target
+        self._refresh_rules()
+        self._refresh_suggestions()
+        self._persist_rules()
+
+    def _persist_rules(self) -> None:
+        rules = dict(self._rules)           # snapshot before the thread runs
+        for btn in (self.add_rule_btn, self.remove_rule_btn,
+                    self.accept_sugg_btn):
+            btn.state(["disabled"])
+        self.dict_status.config(text="Saving...", foreground=_DIM)
+
+        def work() -> None:
+            try:
+                self.ctx.apply({"replacements": rules})
+            except Exception as e:
+                log.exception("dictionary save failed")
+                self._post(self._rules_saved,
+                           " ".join(str(e).split())[:200], True)
+                return
+            self._post(self._rules_saved, "Saved.", False)
+
+        threading.Thread(target=work, daemon=True,
+                         name="localflow-dict-save").start()
+
+    def _rules_saved(self, message: str, error: bool) -> None:
+        self.dict_status.config(text=message,
+                                foreground=_RED if error else _DIM)
+        for btn in (self.add_rule_btn, self.remove_rule_btn,
+                    self.accept_sugg_btn):
+            btn.state(["!disabled"])
 
     # -- hotkey capture --------------------------------------------------------
 

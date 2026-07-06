@@ -6,6 +6,8 @@ ever starts. The window itself is verified live per the M8 checklist.
 
 from __future__ import annotations
 
+import time
+
 import pytest
 from pynput import keyboard
 
@@ -197,6 +199,69 @@ def test_coerce_changes_passes_input_device_through():
     assert ui.coerce_changes({"input_device": "Samsung"}) == {"input_device": "Samsung"}
 
 
+# -- history row labels (M10) ------------------------------------------------
+
+def _entry(ts=0.0, final="hello world", corrected=None):
+    """A history entry shaped like app.history_entries() rows."""
+    return {"ts": ts, "raw_text": final, "clean_text": final,
+            "final_text": final, "corrected_text": corrected,
+            "device": "GPU", "stt_ms": 500}
+
+
+def _at(hour, minute):
+    """A ts whose local time is hour:minute today - the label formats
+    with time.localtime, so the test must build the ts the same way."""
+    return time.mktime((2026, 7, 6, hour, minute, 0, 0, 0, -1))
+
+
+def test_history_row_label_time_prefix_and_text():
+    assert ui.history_row_label(_entry(ts=_at(14, 32))) == "14:32  hello world"
+
+
+def test_history_row_label_marks_corrected_rows():
+    # shows the ORIGINAL final text; the '*' is what says 'edited'
+    label = ui.history_row_label(_entry(ts=_at(9, 5), corrected="Hello."))
+    assert label == "09:05  * hello world"
+
+
+def test_history_row_label_truncation_boundary():
+    at_limit = "x" * 60
+    assert ui.history_row_label(_entry(final=at_limit)).endswith(at_limit)
+    over = ui.history_row_label(_entry(final="x" * 61))
+    assert over.endswith("x" * 57 + "...")
+    assert len(over.split("  ", 1)[1]) == 60   # cap holds after truncation
+
+
+def test_history_row_label_flattens_newlines():
+    assert ui.history_row_label(_entry(final="one\ntwo  three")).endswith(
+        "one two three")
+
+
+def test_history_row_label_empty_text_is_just_the_time():
+    when = time.strftime("%H:%M", time.localtime(0.0))
+    assert ui.history_row_label(_entry(ts=0.0, final="")) == f"{when}  "
+
+
+# -- dictionary rows (M10) -----------------------------------------------------
+
+def test_rule_rows_sorted_by_source():
+    rows = ui.rule_rows({"zeta": "z", "alpha": "A", "mid": "m"})
+    assert rows == ["alpha  ->  A", "mid  ->  m", "zeta  ->  z"]
+
+
+def test_rule_rows_empty():
+    assert ui.rule_rows({}) == []
+
+
+def test_suggestion_rows_format():
+    rows = ui.suggestion_rows([("cloud ex", "Codex", 3), ("jim", "Gem", 2)])
+    assert rows == ["cloud ex -> Codex  (seen 3x)", "jim -> Gem  (seen 2x)"]
+
+
+def test_suggestion_rows_empty():
+    assert ui.suggestion_rows([]) == []
+
+
 # -- context construction (must match app.wire_settings_ui exactly) ----------
 
 def test_settings_context_accepts_the_app_contract():
@@ -210,3 +275,18 @@ def test_settings_context_accepts_the_app_contract():
     assert ctx.status_text == "whisper on GPU"
     assert ctx.cleanup_available is True
     assert ctx.cleanup_active() is False
+
+
+def test_settings_context_m10_fields_default_to_none():
+    # pre-M10 wiring omits them; the window skips both sections on None
+    ctx = ui.SettingsContext(
+        cfg=object(), apply=lambda c: set(), list_mics=lambda: [],
+        mic_name=lambda: "m", fallback_active=lambda: False,
+        latest_level=lambda: 0.0, test_mic=lambda cb: True,
+        validate_hotkey=lambda c: None, reset_pill_position=lambda: None,
+        open_config_file=lambda: None, status_text="s",
+        cleanup_available=False, cleanup_active=lambda: False)
+    assert ctx.history_entries is None
+    assert ctx.save_correction is None
+    assert ctx.clear_history is None
+    assert ctx.suggestions is None

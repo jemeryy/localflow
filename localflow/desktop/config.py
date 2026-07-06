@@ -62,6 +62,14 @@ vad_threshold = 0.5       # speech sensitivity: lower = quiet speech accepted,
 # Jargon Whisper mishears — biases transcription toward these spellings
 # (capitalization is kept). Takes effect on restart.
 hot_words = []
+history_enabled = true    # keep the last 200 dictations for the History
+                          # panel in Settings (fully local); false = never
+                          # write anything to disk
+
+# Personal dictionary: deterministic fixes applied AFTER transcription
+# (safe, unlike hot_words). Edit in Settings, or add rows here like:
+#   "code x" = "Codex"
+[replacements]
 """
 
 _PATH_FIELDS = ("stt_model_dir", "cache_dir", "cleanup_model_dir")
@@ -133,6 +141,12 @@ class Config(BaseModel):
     # Jargon Whisper mishears — biases transcription toward these spellings.
     # Takes effect on restart.
     hot_words: list[str] = []
+    # M10: keep the last 200 dictations for the settings History panel
+    # (fully local); false = nothing is ever written to disk.
+    history_enabled: bool = True
+    # M10: personal dictionary, applied AFTER STT and cleanup by
+    # core/dictionary.py — zero STT-accuracy risk, unlike hot_words.
+    replacements: dict[str, str] = {}
 
 
 def find_config(explicit: str | None = None) -> Path | None:
