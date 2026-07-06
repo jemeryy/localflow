@@ -20,8 +20,12 @@ log = logging.getLogger("localflow.desktop.inject")
 _MODIFIER_VKS = (0x10, 0x11, 0x12, 0x5B, 0x5C)
 
 # FR-10(d): the target app reads the clipboard asynchronously after Ctrl+V
-# arrives — restoring sooner than ~120ms races the paste and corrupts it.
-PASTE_SETTLE_S = 0.12
+# arrives — restoring too soon races the paste and the OLD clipboard content
+# gets pasted instead of the transcript (observed live at 120ms: a busy app
+# pasted a stale shell command). There is NO OS signal for "paste consumed",
+# so the delay is the only lever: 500ms default, tunable via
+# restore_delay_ms in localflow.toml.
+PASTE_SETTLE_S = 0.5
 # Small beat between setting the clipboard and sending Ctrl+V so slow apps
 # never see the pre-transcript clipboard.
 CLIPBOARD_SET_S = 0.03
@@ -29,7 +33,8 @@ CLIPBOARD_SET_S = 0.03
 _keyboard = Controller()
 
 
-def inject_text(text: str, mode: str = "paste") -> bool:
+def inject_text(text: str, mode: str = "paste",
+                restore_delay_s: float = PASTE_SETTLE_S) -> bool:
     """Insert `text` into whatever app has focus. Returns True if anything was sent.
 
     Empty text means the silence gate fired: inject NOTHING (FR-4 / AT-3).
@@ -43,7 +48,7 @@ def inject_text(text: str, mode: str = "paste") -> bool:
         return False
     _wait_modifiers_released()
     if mode == "paste":
-        _paste(text)
+        _paste(text, restore_delay_s)
     else:
         _keyboard.type(text)
     return True
@@ -65,15 +70,26 @@ def _wait_modifiers_released(timeout_s: float = 1.5) -> None:
     log.warning("modifier still held after %.1fs — injecting anyway", timeout_s)
 
 
-def _paste(text: str) -> None:
+def _send_ctrl_v() -> None:
+    with _keyboard.pressed(Key.ctrl):
+        _keyboard.press("v")
+        _keyboard.release("v")
+
+
+def _paste(text: str, restore_delay_s: float) -> None:
     # FR-10: save clipboard text -> set transcript -> Ctrl+V -> wait -> restore.
     # Only text survives the round-trip: pyperclip reads images/files as "",
     # so non-text clipboard content is lost. Accepted for v1 (G5 says text).
     saved = pyperclip.paste()
     pyperclip.copy(text)
     time.sleep(CLIPBOARD_SET_S)
-    with _keyboard.pressed(Key.ctrl):
-        _keyboard.press("v")
-        _keyboard.release("v")
-    time.sleep(PASTE_SETTLE_S)
-    pyperclip.copy(saved)
+    _send_ctrl_v()
+    time.sleep(restore_delay_s)
+    # If the user copied something new during the settle window, restoring
+    # would clobber it — leave their copy alone (the transcript case: the
+    # clipboard still holds our text, so restore is safe *if* the app has
+    # had time to paste; that's what restore_delay_s buys).
+    if pyperclip.paste() == text:
+        pyperclip.copy(saved)
+    else:
+        log.info("clipboard changed during paste settle — leaving it as-is")

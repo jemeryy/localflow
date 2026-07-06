@@ -91,6 +91,41 @@ def test_inject_empty_text_touches_nothing(monkeypatch):
     assert inject.inject_text("", mode="type") is False
 
 
+def test_paste_restores_saved_clipboard_after_settle(monkeypatch):
+    from localflow.desktop import inject
+
+    clip = {"value": "SAVED_BEFORE"}
+    monkeypatch.setattr(inject.pyperclip, "paste", lambda: clip["value"])
+    monkeypatch.setattr(inject.pyperclip, "copy",
+                        lambda s: clip.update(value=s))
+    monkeypatch.setattr(inject, "_wait_modifiers_released", lambda: None)
+    monkeypatch.setattr(inject, "_send_ctrl_v", lambda: None)
+    monkeypatch.setattr(inject.time, "sleep", lambda s: None)
+
+    assert inject.inject_text("spoken words", mode="paste") is True
+    assert clip["value"] == "SAVED_BEFORE"       # AT-2: clipboard restored
+
+
+def test_paste_never_clobbers_a_copy_made_mid_settle(monkeypatch):
+    """If the user copies something new while the transcript is settling,
+    the restore must NOT overwrite it."""
+    from localflow.desktop import inject
+
+    clip = {"value": "SAVED_BEFORE"}
+    monkeypatch.setattr(inject.pyperclip, "paste", lambda: clip["value"])
+    monkeypatch.setattr(inject.pyperclip, "copy",
+                        lambda s: clip.update(value=s))
+    monkeypatch.setattr(inject, "_wait_modifiers_released", lambda: None)
+    monkeypatch.setattr(inject, "_send_ctrl_v", lambda: None)
+    # the settle sleep is where a user copy would land
+    monkeypatch.setattr(
+        inject.time, "sleep",
+        lambda s: clip.update(value="USER_COPIED_THIS") if s >= 0.1 else None)
+
+    inject.inject_text("spoken words", mode="paste", restore_delay_s=0.5)
+    assert clip["value"] == "USER_COPIED_THIS"   # left alone, not "restored"
+
+
 def test_inject_rejects_unknown_mode():
     from localflow.desktop.inject import inject_text
 
@@ -139,3 +174,418 @@ def test_push_to_talk_fires_on_hold_and_release():
     assert events == ["start", "stop"]       # any combo key up ends the hold
     ptt._handle_release(keyboard.Key.alt_l)
     assert events == ["start", "stop"]       # no double-stop
+
+
+# ---- M4 ----------------------------------------------------------------
+
+
+def _bare_app(recorder=None, on_state=None):
+    from localflow.desktop.app import LocalFlowApp
+
+    # engine/vad are only touched inside _process, which these tests avoid
+    return LocalFlowApp(engine=None, vad=None, recorder=recorder,
+                        on_state=on_state)
+
+
+def test_latency_summary_percentiles():
+    app = _bare_app()
+    assert app.latency_summary() is None     # nothing pasted yet
+    app.latencies_ms = [400, 450, 500, 550, 600, 650, 700, 750, 800, 1250]
+    summary = app.latency_summary()
+    assert "10 dictations" in summary
+    assert "p50 625ms" in summary            # np.percentile linear interp
+    assert "p95" in summary
+
+
+def test_state_callbacks_fire_on_hotkey_and_survive_errors(recorder):
+    states: list[str] = []
+    app = _bare_app(recorder=recorder, on_state=states.append)
+    app.on_hotkey_down()
+    app.on_hotkey_up()
+    assert states == ["rec", "busy"]         # FR-2: red then amber
+
+    # A broken state callback (e.g. tray died) must never reach the
+    # pynput/worker threads.
+    def boom(state):
+        raise RuntimeError("tray gone")
+
+    app.on_state = boom
+    app._set_state("idle")                   # must not raise
+
+
+def test_bar_heights_pads_scales_and_clamps():
+    from localflow.desktop.overlay import bar_heights
+
+    # empty -> all floor-height bars
+    assert bar_heights([], 4, max_h=20.0) == [2.0, 2.0, 2.0, 2.0]
+    # newest level lands rightmost, older/missing pad left
+    bars = bar_heights([0.0, 0.05], 4, max_h=20.0)
+    assert bars[0] == 2.0 and bars[1] == 2.0          # left padding at floor
+    assert bars[3] > bars[2]                           # louder newest is taller
+    # loud input clamps to max_h, never overshoots the capsule
+    assert bar_heights([9.9], 1, max_h=20.0) == [20.0]
+    # more levels than bars -> keeps only the newest n
+    assert len(bar_heights([0.01] * 100, 44, max_h=20.0)) == 44
+
+
+def test_recorder_reports_levels_only_while_recording(recorder):
+    levels: list[float] = []
+    recorder.on_level = levels.append
+
+    recorder.open()
+    recorder._on_chunk(_chunk(0.5), 1600, None, None)  # idle: preroll only
+    assert levels == []
+    recorder.start()
+    recorder._on_chunk(_chunk(0.5), 1600, None, None)
+    assert len(levels) == 1
+    assert levels[0] == pytest.approx(0.5)             # RMS of a constant
+    recorder.stop()
+
+    # a broken UI callback must never disturb the audio path
+    def boom(rms):
+        raise RuntimeError("overlay gone")
+
+    recorder.on_level = boom
+    recorder.start()
+    recorder._on_chunk(_chunk(0.5), 1600, None, None)  # must not raise
+    audio, _ = recorder.stop()
+    assert len(audio) > 0                              # audio still captured
+
+
+def test_smooth_blends_neighbors_and_keeps_shape():
+    from localflow.desktop.overlay import smooth
+
+    out = smooth([0.0, 10.0, 0.0])
+    assert len(out) == 3
+    assert out[0] == 0.0 and out[2] == 0.0       # endpoints pass through
+    assert 4.0 < out[1] < 10.0                    # peak softened, not erased
+    assert smooth([5.0]) == [5.0]                 # short input untouched
+
+
+def test_toggle_cleanup_states():
+    app = _bare_app()
+    assert app.cleanup is None and app.cleanup_active is False
+    assert app.cleanup_available is False
+    assert app.toggle_cleanup() is False    # no model, no loader -> stays off
+
+    app.cleanup = object()                  # engine present
+    app.cleanup_active = True               # (as after startup with config on)
+    assert app.toggle_cleanup() is False    # click: off
+    assert app.toggle_cleanup() is True     # click: back on
+
+
+def _wait(predicate, timeout_s: float = 3.0) -> bool:
+    import time
+
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.01)
+    return False
+
+
+def test_toggle_cleanup_lazy_loads_in_background():
+    """First enable must NOT block (the tray click returns immediately) and
+    must attach the engine once the loader finishes."""
+    from localflow.desktop.app import LocalFlowApp
+
+    fake_engine = object()
+    app = LocalFlowApp(engine=None, vad=None, recorder=None,
+                       cleanup_loader=lambda: fake_engine)
+    assert app.cleanup_available is True
+    assert app.cleanup is None and app.cleanup_active is False
+
+    assert app.toggle_cleanup() is True          # intent ON, load kicked off
+    assert _wait(lambda: app.cleanup is fake_engine)
+    assert app.cleanup_active is True
+    assert app.toggle_cleanup() is False         # OFF unloads the engine
+    assert app.toggle_cleanup() is True          # ON reloads via the loader
+    assert _wait(lambda: app.cleanup is fake_engine)
+
+
+def test_toggle_cleanup_load_failure_stays_off():
+    from localflow.desktop.app import LocalFlowApp
+
+    def broken_loader():
+        raise RuntimeError("model dir corrupted")
+
+    app = LocalFlowApp(engine=None, vad=None, recorder=None,
+                       cleanup_loader=broken_loader)
+    assert app.toggle_cleanup() is True          # optimistic ON while loading
+    assert _wait(lambda: not app._cleanup_loading)
+    assert app.cleanup is None
+    assert app.cleanup_active is False           # failure flips it back off
+
+
+class _CloseableEngine:
+    """Stands in for CleanupEngine; records close() (the memory release)."""
+
+    def __init__(self):
+        self.closed = False
+
+    def close(self):
+        self.closed = True
+
+
+def test_toggle_cleanup_off_unloads_the_model():
+    """Jeremy 3 Jul: 'the LLM cleanup shouldn't hold RAM — only when I use
+    it'. Toggling OFF must release the engine, not just flip a flag; the
+    loader re-arms the next ON."""
+    from localflow.desktop.app import LocalFlowApp
+
+    engines: list[_CloseableEngine] = []
+
+    def loader():
+        engines.append(_CloseableEngine())
+        return engines[-1]
+
+    app = LocalFlowApp(engine=None, vad=None, recorder=None,
+                       cleanup_loader=loader)
+    assert app.toggle_cleanup() is True
+    assert _wait(lambda: app.cleanup is not None)
+
+    assert app.toggle_cleanup() is False         # OFF -> unload
+    assert app.cleanup is None
+    assert engines[0].closed is True             # memory actually released
+
+    assert app.toggle_cleanup() is True          # ON -> fresh load
+    assert _wait(lambda: app.cleanup is not None)
+    assert len(engines) == 2 and app.cleanup is engines[1]
+
+
+def test_cleanup_toggled_off_mid_load_is_discarded():
+    """Changing your mind while the model is still loading must not leave
+    2-3GB attached in the background."""
+    import threading
+
+    from localflow.desktop.app import LocalFlowApp
+
+    release = threading.Event()
+    engine = _CloseableEngine()
+
+    def slow_loader():
+        release.wait(3.0)
+        return engine
+
+    app = LocalFlowApp(engine=None, vad=None, recorder=None,
+                       cleanup_loader=slow_loader)
+    assert app.toggle_cleanup() is True          # load kicked off
+    assert app.toggle_cleanup() is False         # changed mind mid-load
+    release.set()
+    assert _wait(lambda: not app._cleanup_loading)
+    assert app.cleanup is None                   # never attached...
+    assert engine.closed is True                 # ...and freed on arrival
+
+
+def test_toggle_recording_click_path(recorder):
+    states: list[str] = []
+    app = _bare_app(recorder=recorder, on_state=states.append)
+    app.toggle_recording()                        # click 1: start
+    assert recorder.recording
+    app.toggle_recording()                        # click 2: stop + enqueue
+    assert not recorder.recording
+    assert app._work.qsize() == 1                 # utterance handed to worker
+    assert states == ["rec", "busy"]
+
+
+def test_mic_watcher_switch_flow(recorder, monkeypatch):
+    from localflow.desktop import capture
+    from localflow.desktop.micwatch import DefaultMicWatcher
+
+    # PortAudio reinit is a no-op here; the fixture already fakes streams
+    monkeypatch.setattr(capture.sd, "_terminate", lambda: None)
+    monkeypatch.setattr(capture.sd, "_initialize", lambda: None)
+
+    current = {"id": "mic-A"}
+    watcher = DefaultMicWatcher(recorder, get_id=lambda: current["id"])
+
+    assert watcher.check_once() is False   # first sighting = baseline
+    assert watcher.check_once() is False   # unchanged -> no swap
+    current["id"] = "mic-B"
+    recorder.start()
+    assert watcher.check_once() is False   # deferred while recording
+    recorder.stop()
+    assert watcher.check_once() is True    # swap once idle
+    assert recorder._stream is not None    # stream reopened
+    assert watcher.check_once() is False   # stable on the new device
+
+
+def test_heal_if_stale_reopens_silent_stream(recorder, monkeypatch):
+    """A stream that is open but delivering no frames (wedged WASAPI
+    endpoint) must be detected and reopened — found live 3 Jul as repeated
+    'recording stopped: 0.00s captured'."""
+    from localflow.desktop import capture
+
+    monkeypatch.setattr(capture.sd, "_terminate", lambda: None)
+    monkeypatch.setattr(capture.sd, "_initialize", lambda: None)
+    monkeypatch.setattr(capture, "_find_live_input",
+                        lambda exclude_name, listen_s=1.5: (7, "working-mic"))
+
+    assert recorder.heal_if_stale() is False       # no stream yet -> nothing to heal
+    recorder.open()
+    assert recorder.heal_if_stale() is False       # fresh stream isn't stale
+
+    recorder._last_frame -= 10.0                   # simulate 10s of silence
+    old_stream = recorder._stream
+    assert recorder.stale() is True
+    assert recorder.heal_if_stale() is True
+    assert recorder._stream is not old_stream      # reopened
+
+    recorder._last_frame -= 10.0                   # still silent (OS-level wedge)
+    assert recorder.heal_if_stale() is False       # rate-limited: no reinit storm
+    recorder._last_heal -= 60.0                    # backoff window elapsed
+    assert recorder.heal_if_stale() is True        # heal 2 -> the fallback hunt
+
+    recorder._on_chunk(_chunk(0.1), 1600, None, None)  # frames flowing again
+    assert recorder.stale() is False
+
+    recorder.start()                               # mid-recording is never stale
+    recorder._last_frame -= 10.0
+    assert recorder.stale() is False
+    recorder.stop()
+
+
+def test_mic_watcher_heals_silent_stream_on_unchanged_device(recorder, monkeypatch):
+    from localflow.desktop import capture
+    from localflow.desktop.micwatch import DefaultMicWatcher
+
+    monkeypatch.setattr(capture.sd, "_terminate", lambda: None)
+    monkeypatch.setattr(capture.sd, "_initialize", lambda: None)
+
+    watcher = DefaultMicWatcher(recorder, get_id=lambda: "mic-A")
+    watcher.check_once()                           # baseline
+    recorder.open()
+    recorder._last_frame -= 10.0                   # wedged: open but silent
+    old_stream = recorder._stream
+    assert watcher.check_once() is False           # no device change...
+    assert recorder._stream is not old_stream      # ...but the stream was healed
+
+
+def test_refresh_default_device_refuses_mid_recording(recorder, monkeypatch):
+    from localflow.desktop import capture
+
+    monkeypatch.setattr(capture.sd, "_terminate", lambda: None)
+    monkeypatch.setattr(capture.sd, "_initialize", lambda: None)
+    recorder.start()
+    assert recorder.refresh_default_device() is False  # never mid-utterance
+    recorder.stop()
+    assert recorder.refresh_default_device() is True
+
+
+def test_heal_escalates_to_fallback_after_repeated_silence(recorder, monkeypatch):
+    """Two failed heals on a silent default -> hunt for any device that
+    delivers audio and record from it instead (found live 3 Jul: Samsung USB
+    wedged at the OS level while the Intel array worked fine)."""
+    from localflow.desktop import capture
+
+    monkeypatch.setattr(capture.sd, "_terminate", lambda: None)
+    monkeypatch.setattr(capture.sd, "_initialize", lambda: None)
+    probed: list[str] = []
+    monkeypatch.setattr(
+        capture, "_find_live_input",
+        lambda exclude_name, listen_s=1.5:
+            (probed.append(exclude_name), (7, "working-mic"))[1])
+
+    recorder.open()
+    recorder._last_frame -= 10.0                   # wedged: open but silent
+    assert recorder.heal_if_stale() is True        # heal 1: plain reopen
+    assert probed == [] and recorder.fallback_active is False
+
+    recorder._last_frame -= 10.0                   # STILL silent after reopen
+    recorder._last_heal -= 60.0                    # backoff window elapsed
+    assert recorder.heal_if_stale() is True        # heal 2: fallback hunt
+    assert probed == ["fake-mic"]                  # wedged device excluded
+    assert recorder.fallback_active is True
+    assert recorder.input_device == 7
+
+    # frames flowing on the fallback -> healthy again, streak forgotten
+    recorder._on_chunk(_chunk(0.1), 1600, None, None)
+    assert recorder.heal_if_stale() is False
+    assert recorder._heal_streak == 0
+
+
+def test_fallback_with_no_working_mic_reopens_default(recorder, monkeypatch):
+    from localflow.desktop import capture
+
+    monkeypatch.setattr(capture.sd, "_terminate", lambda: None)
+    monkeypatch.setattr(capture.sd, "_initialize", lambda: None)
+    monkeypatch.setattr(capture, "_find_live_input",
+                        lambda exclude_name, listen_s=1.5: None)
+
+    recorder.open()
+    for _ in range(2):                             # escalate to the hunt
+        recorder._last_frame -= 10.0
+        recorder._last_heal -= 60.0
+        recorder.heal_if_stale()
+    assert recorder.fallback_active is False       # nothing usable found...
+    assert recorder.input_device is None           # ...still on the default
+    assert recorder._stream is not None            # ...and it was reopened
+    # so recovery-by-replug (endpoint change -> refresh) still works
+
+
+def test_default_change_ends_fallback(recorder, monkeypatch):
+    """Replugging the wedged mic fires a default-endpoint change; the swap
+    must drop the fallback and follow the default again."""
+    from localflow.desktop import capture
+    from localflow.desktop.micwatch import DefaultMicWatcher
+
+    monkeypatch.setattr(capture.sd, "_terminate", lambda: None)
+    monkeypatch.setattr(capture.sd, "_initialize", lambda: None)
+    monkeypatch.setattr(capture, "_find_live_input",
+                        lambda exclude_name, listen_s=1.5: (7, "working-mic"))
+
+    current = {"id": "mic-A"}
+    watcher = DefaultMicWatcher(recorder, get_id=lambda: current["id"])
+    watcher.check_once()                           # baseline
+    recorder.open()
+    for _ in range(2):                             # wedge -> heal -> fallback
+        recorder._last_frame -= 10.0
+        recorder._last_heal -= 60.0
+        watcher.check_once()
+    assert recorder.fallback_active is True
+
+    current["id"] = "mic-B"                        # replug / default changed
+    assert watcher.check_once() is True
+    assert recorder.fallback_active is False
+    assert recorder.input_device is None           # following the default
+
+
+def test_pinned_device_never_falls_back(monkeypatch):
+    from localflow.desktop import capture
+
+    monkeypatch.setattr(capture.sd, "query_devices", _fake_query_devices)
+    monkeypatch.setattr(capture.sd, "InputStream", _FakeStream)
+    monkeypatch.setattr(capture.sd, "_terminate", lambda: None)
+    monkeypatch.setattr(capture.sd, "_initialize", lambda: None)
+    monkeypatch.setattr(
+        capture, "_find_live_input",
+        lambda *a, **k: pytest.fail("a pinned mic must never probe others"))
+
+    rec = capture.StreamRecorder(input_device=3, max_seconds=1.0)
+    rec.open()
+    for _ in range(3):                             # silent forever: heal only
+        rec._last_frame -= 10.0
+        rec._last_heal -= 60.0
+        rec.heal_if_stale()
+    assert rec.fallback_active is False
+    assert rec.input_device == 3
+
+
+def test_single_instance_mutex_detects_second_holder():
+    from localflow.desktop.app import _already_running
+
+    # First call creates the session-local mutex (this test process now
+    # holds it); any later attempt — here, in-process — sees it exists.
+    _already_running()
+    assert _already_running() is True
+
+
+def test_tray_state_images_are_distinct():
+    from localflow.desktop.tray import make_state_images
+
+    images = make_state_images()
+    assert set(images) == {"idle", "rec", "busy"}
+    centers = {s: img.getpixel((32, 32)) for s, img in images.items()}
+    assert len(set(centers.values())) == 3   # three visually distinct dots
+    assert all(c[3] == 255 for c in centers.values())  # opaque dot centers
