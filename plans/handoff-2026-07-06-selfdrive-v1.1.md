@@ -18,10 +18,18 @@ every milestone so a fresh session can resume with nothing lost.
 - Gate 0: CLEARED — Jeremy signed off AT-4/AT-6 live at session start (6 Jul).
 - M6 faster startup: **DONE**, commit c20cf24. Hotkey live 6.5-7.2s, warm ~9s.
   Jeremy live-verified the warmup-window dictation pastes.
-- Next step: **M7** (pill v2: visibility modes, hold-1s-to-drag, reset position).
-  Files: overlay.py, tray.py, config.py. Drag state machine must be a pure
-  testable class. Then M8 settings window, M9 noise, M10 learning.
-- Round count: 0 fails on M6 (review fixes applied pre-commit, all green).
+- M7 pill v2: **DONE**, commit 699dfce (three Jeremy feedback rounds; final
+  spec in the plan's REVISED blocks; self-tested with real mouse input via
+  scripts/m7_pill_check.py - 21/21; unit suite 74 pass).
+- Current step: **M8 - real settings window** (`localflow/desktop/settings_ui.py`,
+  Toplevel on the overlay UI thread, tomlkit save_config already exists
+  from M7). Jeremy's M7-round-2 direction for M8: cleanup toggle + pill
+  visibility CONTROLS MOVE INTO the settings window (pill menu stays 4
+  items), and settings needs a PILL SIZE control (pill_size key, 0.5-2.0).
+  The pill menu "Settings" row calls overlay.on_settings when set - M8
+  wires it to open the settings window (falls back to opening the toml).
+- Then M9 noise, M10 learning.
+- Round count: M6 0 fails; M7 3 design-feedback rounds (not bugs), all closed.
 
 ## State that matters
 - LocalFlow tray app is RUNNING with the M6 build (launched 11:21 by this loop,
