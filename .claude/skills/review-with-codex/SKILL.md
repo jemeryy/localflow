@@ -7,6 +7,8 @@ description: Use when Jeremy asks to review a code change / diff with Claude and
 
 Claude and Codex review the diff in the background, reconcile their findings, fix correctness issues inline, and Jeremy sees ONE final message. Same two principles as plan-with-codex: silent debate, single final output.
 
+**Fresh unbiased reviewers (the point of this skill).** Both reviews are run by agents that did NOT author the diff, so neither is defending its own work. The Claude review runs in a fresh subagent (clean context, not the session that wrote the code). The Codex review runs in its own fresh Codex thread, NOT a resume of the plan-debate session, so it never helped shape the plan it's now attacking. Both are still *informed*: each reads the plan file and the diff, so they can catch "the diff doesn't match the plan." Fresh means non-author, not blind. The main Claude session becomes the orchestrator here: it hands the diff + plan to the two fresh reviewers, then reconciles and applies fixes. On the disputed bucket it leans toward the reviewers, since it (or its executor) is the author.
+
 This skill runs in two modes:
 
 - **Standalone** — Jeremy asks to review a change directly ("review this with codex"). There may be no plan file.
@@ -27,14 +29,23 @@ This skill runs in two modes:
 
 Either way, the messy middle never goes to chat.
 
-## Codex session hygiene (applies to every Codex call in this skill)
+## How to call Codex (the invocation contract)
 
-**One Codex session per Claude session. Never resume across Claude sessions.**
+Every Codex call in this skill goes through the hardened wrapper `tools/codex_exec.py`. Do NOT use the `/codex:*` slash commands: they are user-only (marked `disable-model-invocation`), so the model cannot run them, and calling them silently fails.
 
-- The FIRST Codex invocation in a given Claude session always uses `--fresh`. If plan-with-codex already ran Codex earlier in THIS same Claude session (plan critique or execute), then this review's Codex call is a follow-up and uses `--resume-last`.
-- If you're unsure whether a prior Codex thread belongs to this Claude session, treat it as foreign — use `--fresh`.
+```
+python tools/codex_exec.py --prompt-file <f> [--resume-last] --effort high [--write]
+```
 
-**Every `--fresh` Codex call must include a context preamble.** Codex starts with zero knowledge of the project, the change, or what this session did. Lead the prompt with:
+- Availability preflight: `python tools/codex_exec.py --pong` (prints PONG).
+- Write the prompt to a file under `.tmp/` and pass `--prompt-file` (no argv-length limit; the wrapper pipes it via stdin).
+- Review calls are read-only: never pass `--write` for a review.
+- Run every round SYNCHRONOUSLY (foreground Bash, 10-min timeout). Background rounds fire a task-notification at Jeremy, which breaks the silent-loop contract.
+- Exit codes: 0 ok, 3 usage-limit, 4 timeout, 5 auth, 6 codex CLI not found, 1 other failure (the wrapper already retried once if transient). Branch on the exit code, not on stderr keywords.
+
+**Independence (the whole point).** This review ALWAYS opens its own fresh Codex thread for the adversarial review: omit `--resume-last` and include the project preamble below, EVEN IF plan-with-codex already ran Codex earlier in this session. A reviewer that helped write the plan is not a fresh reviewer. So: plan debate = Codex thread A; this review = a new Codex thread B. The review's OWN later rounds (rebuttal Step 3a, fix-verify Step 3b, the full re-scan) use `--resume-last` to resume thread B, so the reviewer keeps its own context across the review, just not the plan-debate context.
+
+**The context preamble (mandatory on the fresh review call).** Codex starts with zero knowledge of the project. Lead the fresh prompt with:
 
 ```
 Context — project and session:
@@ -58,8 +69,6 @@ Now the actual task:
 <review task prompt>
 ```
 
-On `--resume-last` the preamble isn't needed (Codex has the thread context), but always reference the plan file path (or name the changed files) so Codex re-reads current state.
-
 ## TWO HARD RULES (these govern everything below)
 
 ### Rule 1 — Reconcile internally, never dump both opinions
@@ -77,19 +86,21 @@ During the review the ONLY chat output is the final message. Forbidden mid-revie
 
 ## The review (silent)
 
-### Step 1 — Claude reviews the diff (silent)
+### Step 1 — Fresh Claude subagent reviews the diff (silent)
 
-Read the working-tree diff against `main` (`git diff main`). If a plan file exists, cross-check every plan step against the diff: file-path mistakes, missed steps, UX issues, regressions, broken imports. If standalone, review for correctness, edge cases, regressions, and anything that contradicts the change's stated intent.
+Spawn a fresh reviewer via the Agent tool (strong model — Opus/Fable-class for code review). This subagent did NOT author the diff, so it has no stake in defending it. Do NOT review inline in the orchestrating session; that session is (or ran) the author.
 
-Capture findings into `## Pre-merge review — Claude` (plan file or `.tmp/review-<slug>.md`).
+Give the subagent, in its prompt, everything it needs but nothing about how the code was written:
+- The task: adversarial pre-merge review of the working-tree diff against `main`. Return findings only, do not edit files.
+- The diff: `git diff main` (paste it, or tell it to run that read-only command).
+- The plan file path (if one exists) so it can cross-check every plan step against the diff: file-path mistakes, missed steps, UX issues, regressions, broken imports. If standalone, review for correctness, edge cases, regressions, and anything that contradicts the change's stated intent.
+- Ask it to return structured findings (BLOCKING / RISKS / MISSING, with file:line refs) as its final message.
 
-### Step 2 — Codex adversarial review (silent)
+The orchestrating session captures the subagent's returned findings verbatim into `## Pre-merge review — Claude` (plan file or `.tmp/review-<slug>.md`). The subagent is the reviewer; the orchestrator only records and later reconciles.
 
-```
-/codex:adversarial-review --base main
-```
+### Step 2 — Fresh Codex adversarial review (silent)
 
-(Or invoke the `codex-rescue` subagent with an equivalent adversarial-review prompt if the slash command isn't appropriate for the context. `--effort high`, plan/review-only — no `--write`.)
+Invoke `tools/codex_exec.py` on a FRESH thread (omit `--resume-last`, include the project preamble — see "Independence" above; `--effort high`, review-only — no `--write`) with an adversarial-review prompt over the diff against main: attack correctness, edge cases, failure modes, and anything the change's stated intent contradicts; return BLOCKING / RISKS / MISSING findings with file:line references. Reference the plan file (or the changed-file list).
 
 Capture into `## Pre-merge review — Codex`.
 
@@ -137,7 +148,7 @@ After fixing, verify in two layers:
    Does this fully resolve the finding? RESOLVED or NOT-RESOLVED (one-line why / what's still wrong).
    ```
    If NOT-RESOLVED, re-fix and re-verify.
-2. **Full re-scan** — once all targeted fixes verify, re-run Codex adversarial-review once to catch anything the fixes newly broke. If new blocking issues appear, fix and re-run.
+2. **Full re-scan** — once all targeted fixes verify, re-run the Codex adversarial-review once (on thread B, `--resume-last`) to catch anything the fixes newly broke. If new blocking issues appear, fix and re-run.
 
 Up to 2 silent fix rounds total across both layers. If still blocking after that, escalate to Jeremy.
 
@@ -196,50 +207,41 @@ ready to merge.
 
 ## Failure handling (Codex unavailable, quota exhausted, timeout)
 
-The review must never hang or wait silently. Every Codex call has a 10-min Bash timeout (`--effort high` plus a large diff can take 4-6 min). If a Bash call times out, treat it as a Codex failure.
+`codex_exec.py` detects, classifies, and retries transient failures once. Branch on its exit code: 0 ok, 3 usage-limit (do NOT retry; surface), 4 timeout (already retried; surface), 5 auth (surface with `/codex:setup`), 6 codex CLI not found (surface install hint), 1 other (already retried; surface). The one self-handled case is malformed-but-exit-0 output (missing the BLOCKING/RISKS structure): retry ONCE with `--effort medium`, then surface.
 
-**Failure signals** (any one = failure): non-zero exit code; stderr contains `rate_limit`/`quota`/`429`/`401`/`403`/`authentication`/`unauthorized`/`out of credits`/`insufficient_quota`; "command timed out"; empty stdout; output missing the adversarial-review structure.
-
-**Classify and act:**
-- **Transient (timeout, network blip, malformed output):** retry ONCE with `--effort medium`. If it succeeds, continue and note `review: retried after transient failure` in the audit file.
-- **Quota / rate limit:** do NOT retry. Surface to Jeremy.
-- **Auth (`401`/`authentication`/`unauthorized`):** do NOT retry. Surface with the fix command (`/codex:setup`).
-
-**Surface message:**
+**Surface message (the only chat message on failure):**
 
 ```
 Codex unavailable during adversarial review.
 
-Reason: <quota exhausted | auth expired | timeout x2>
-<one line of detail from the error>
+Reason: <usage limit | auth expired | timeout | not found | error>
+<one line of detail>
 
 Options:
-1. Continue Claude-only — I'll finish the review using just Claude.
+1. Continue Claude-only — I'll finish the review using just the fresh Claude reviewer.
    Single-perspective, so reduced confidence on edge cases.
 2. Pause here — fix the Codex issue first.
-   <If quota: "Wait until your OpenAI quota resets, or upgrade plan.">
-   <If auth:  "Run `/codex:setup` to re-authenticate.">
+   <If auth: "Run /codex:setup to re-authenticate.">
+   <If usage limit: "Wait for the reset, or upgrade.">
 
 Reply "claude only" to continue solo, or fix and reply "retry codex".
 
-Preserved so far:
-- Claude review findings: <plan file | .tmp/review-<slug>.md>
+Preserved so far: <plan/audit file path + what completed>
 ```
 
-**On "claude only":** Claude does the review solo. The final chat message flags it clearly: `Review complete (Claude-only — Codex was unavailable). Reduced confidence in correctness/edge cases.`
+**On "claude only":** the fresh Claude reviewer's findings carry the review; the final chat message flags it: `Review complete (Claude-only — Codex was unavailable). Reduced confidence in correctness/edge cases.`
 
 **On "retry codex":** re-run the same Codex call. If it fails again, surface again.
 
 ### What Jeremy can check manually
 
 - `/codex:setup` — auth status, whether Codex CLI is reachable.
-- `/codex:status` — active/recent Codex jobs.
-- `/codex:result <jobId>` / `/codex:cancel <jobId>` — fetch output / kill a stuck job.
+- `/codex:status` / `/codex:result <jobId>` / `/codex:cancel <jobId>` — job status / output / kill.
 
 ## After the review
 
 - Append any meaningful decisions Jeremy made on the judgment calls to `decisions/log.md`.
-- Merge happens on Jeremy's say-so (his usual `git push` / PR flow). Never push or merge without an explicit green light — see [[feedback_no_deploy_without_greenlight]].
+- Merge happens on Jeremy's say-so (his usual `git push` / PR flow). Never push or merge without an explicit green light.
 
 ## Reference: where each model's review strength helps
 
@@ -249,5 +251,5 @@ Preserved so far:
 The silent reconcile forces both models' review strengths onto the diff without leaking the messy middle to Jeremy.
 
 ## Changelog
-- 2026-06-01: created — split out of plan-with-codex so the review is a standalone skill, invokable on any diff (not just plan-with-codex output). plan-with-codex's execute phase now delegates its review phase here.
-- 2026-06-01: added Step 3a disputed-findings rebuttal (one round, only on findings the two models disagree on — stops one model silently dropping a real bug the other flagged) and Step 3b targeted fix-verification (the model that raised a finding confirms the specific fix resolves it, before the full re-scan).
+- 2026-07-18: de-drifted to the canonical generic review-with-codex + fresh non-author reviewers. Codex is now invoked via the hardened `tools/codex_exec.py` wrapper (the old `/codex:adversarial-review` slash-command path could not be run by the model at all). The Claude review runs in a fresh subagent and the Codex review opens its own fresh thread (independence). Both stay informed (they read the plan + diff); fresh means non-author, not blind.
+- 2026-06-01: created — split out of plan-with-codex so the review is a standalone skill, invokable on any diff. Step 3a disputed-findings rebuttal + Step 3b targeted fix-verification.
