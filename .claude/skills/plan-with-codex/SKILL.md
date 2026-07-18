@@ -50,6 +50,21 @@ Now the actual task:
 
 The preamble is mandatory on `--fresh`. On `--resume-last` it's not needed (Codex already has the thread context), but ALWAYS reference the plan file path so Codex re-reads if anything changed.
 
+## How to call Codex (the invocation contract)
+
+Every Codex call in this skill goes through the hardened wrapper `tools/codex_exec.py`. Do NOT use the `/codex:*` slash commands (they are user-only, marked disable-model-invocation, so the model cannot run them) and do NOT route these calls through the codex-rescue subagent.
+
+```
+python tools/codex_exec.py --prompt-file <f> [--resume-last] --effort high [--write]
+```
+
+- Preflight availability: `python tools/codex_exec.py --pong` (prints PONG).
+- Write the prompt to a file under `.tmp/` and pass `--prompt-file` (piped via stdin, no argv-length limit).
+- Session hygiene: the FIRST Codex call of the Claude session is fresh (omit `--resume-last`) and MUST include the context preamble above; follow-up calls in the same session use `--resume-last` (no preamble) but always reference the plan file path.
+- Plan-critique calls are read-only: no `--write`. Only the execute phase passes `--write`.
+- Run every round synchronously (foreground Bash, 10-min timeout).
+- Exit codes: 0 ok, 3 usage-limit, 4 timeout, 5 auth, 6 codex CLI not found, 1 other (already retried once if transient). Branch on the exit code.
+
 ## TWO HARD RULES (read these first, they govern everything below)
 
 ### Rule 1 — Genuine convergence, not one-shot dumping
@@ -99,7 +114,7 @@ Use `templates/plan.md`. Plan includes:
 
 ### Round 2 — Codex critiques v1
 
-Invoke via the `codex-rescue` subagent (`--fresh`, `--effort high`, plan-only — no `--write`):
+Invoke via `python tools/codex_exec.py --prompt-file <f> --effort high` (fresh: omit `--resume-last`, include the preamble; plan-only — no `--write`):
 
 ```
 Plan critique only — DO NOT write any files.
@@ -125,7 +140,7 @@ For ALTERNATIVES that are clearly stronger: accept and update Approach. Note the
 
 ### Round 4 — Codex re-reviews v2
 
-Invoke `codex-rescue` again (`--resume-last`, `--effort high`, plan-only):
+Invoke `python tools/codex_exec.py --prompt-file <f> --resume-last --effort high` again (plan-only — no `--write`):
 
 ```
 Plan re-critique only — DO NOT write any files.
@@ -301,7 +316,7 @@ When the plan locks, Claude picks the executor using these rules. Don't ask Jere
 
 **Default Claude on toss-ups.** Codex doesn't have MCP tools or skill awareness.
 
-**Codex invocation when picked:** `codex-rescue` subagent with `--write`, `--effort high`, `--fresh` on first call, `--resume-last` for follow-ups. Prompt references the plan file: `Read plans/<YYYY-MM-DD-slug>.md and implement steps 1-N. Resume the plan-debate session so the implementation reflects the agreed approach.`
+**Codex invocation when picked:** `python tools/codex_exec.py --prompt-file <f> --write --effort high` (`--resume-last` if a Codex call already ran this session, else fresh with the preamble). Prompt references the plan file: `Read plans/<YYYY-MM-DD-slug>.md and implement steps 1-N. Resume the plan-debate session so the implementation reflects the agreed approach.`
 
 ### Execute-start checkpoint (re-confirm the executor before starting)
 
@@ -351,6 +366,7 @@ The two principles still hold across the handoff: silent debate, single final ou
 The silent debate forces Codex's planning strength onto every plan without leaking the messy middle to Jeremy. The review half of that (forcing both models' review strengths onto the diff) now lives in `review-with-codex`.
 
 ## Changelog
+- 2026-07-18: Codex now invoked via the hardened `tools/codex_exec.py` wrapper instead of the codex-rescue subagent / slash commands (which the model cannot reliably run). Planning debate keeps its resume semantics; only the invocation mechanism changed.
 - 2026-05-17: created.
 - 2026-05-17: rewrote for genuine convergence + single final output after Jeremy flagged that the loop was dumping both opinions instead of converging silently.
 - 2026-05-18: added Execute-start checkpoint — Claude re-confirms (or switches) the executor right before starting execution, in case the work shape drifted from what the plan-lock anticipated.
