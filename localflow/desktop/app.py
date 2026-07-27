@@ -47,9 +47,10 @@ from localflow.desktop import config
 from localflow.desktop.capture import StreamRecorder
 from localflow.desktop.inject import (
     clear_modifiers,
+    focused_control,
     inject_text,
+    live_patch,
     patch_text,
-    type_text,
 )
 
 log = logging.getLogger("localflow.desktop.app")
@@ -198,19 +199,26 @@ class PushToTalkListener:
     down, on_stop when any key of it is released — the app's TapHoldGate
     turns that into hold-to-talk or tap-to-toggle (M11).
 
-    While `suppress` is set (a dictation is live) this also owns the physical
-    keyboard: every key is swallowed before the focused app sees it, except
-    the hotkey itself and Esc (`on_cancel`), which are handled here and
-    swallowed too. The hook dies with the process, so a crash can never leave
-    the keyboard dead."""
+    While `suppress` is set (a dictation is live) this also guards the
+    dictation's TARGET field: keys that would land in it are swallowed so
+    the user can't corrupt the text being streamed in, while the keyboard
+    stays alive everywhere else (Jeremy 27 Jul). `target` is a callable
+    returning that field's HWND; without one (tests, embedders, capture
+    failed) the whole keyboard is suppressed — the old M11 rule, which is
+    also the safe one when injection follows the focus. The hotkey is
+    handled here and swallowed wherever the focus is; Esc cancels only from
+    inside the target. The hook dies with the process, so a crash can never
+    leave the keyboard dead."""
 
     def __init__(self, combo: str, on_start, on_stop,
-                 suppress: threading.Event | None = None, on_cancel=None):
+                 suppress: threading.Event | None = None, on_cancel=None,
+                 target=None):
         self._combo = set(keyboard.HotKey.parse(to_pynput_combo(combo)))
         self._on_start = on_start
         self._on_stop = on_stop
         self._on_cancel = on_cancel
         self._suppress = suppress
+        self._target = target
         self._pressed: set = set()
         self._active = False
         self._listener = keyboard.Listener(
@@ -242,8 +250,10 @@ class PushToTalkListener:
     def _win32_filter(self, msg, data):
         """Low-level keyboard hook, called for EVERY key before the focused
         app sees it (M11). Transparent when idle. While `suppress` is set the
-        keyboard is DEAD in the focused app: the hotkey and Esc are handled
-        here and swallowed along with everything else.
+        keyboard is dead in the dictation's TARGET field only: the hotkey is
+        handled here and swallowed from anywhere; other keys pass through
+        untouched when the focus is elsewhere (27 Jul — the user keeps
+        working while the stream lands in the original field).
 
         Return True = the key reaches the app AND on_press/on_release;
         return False = the app only; suppress_event() = nobody. Errors fail
@@ -264,6 +274,12 @@ class PushToTalkListener:
                     self._handle_press(key)
                 elif msg in _RELEASE_MSGS:
                     self._handle_release(key)
+            elif not self._focus_on_target():
+                # Typing somewhere OTHER than the field being dictated into:
+                # that keyboard stays alive. Esc included — elsewhere it
+                # keeps its normal meaning; the hotkey still stops from
+                # anywhere.
+                return True
             elif data.vkCode == _VK_ESCAPE and msg in _PRESS_MSGS:
                 if self._on_cancel is not None:
                     self._safely(self._on_cancel)
@@ -271,6 +287,17 @@ class PushToTalkListener:
             log.exception("key filter failed — letting the key through")
             return True
         self._listener.suppress_event()   # raises; the app never sees the key
+
+    def _focus_on_target(self) -> bool:
+        """Whether the keyboard focus is in the field this dictation types
+        into. No target info (tests, embedders, or the capture failed and
+        injection follows the focus) means the old M11 rule: suppress all."""
+        if self._target is None:
+            return True
+        tgt = self._target()
+        if tgt is None:
+            return True
+        return focused_control() == tgt
 
     def _handle_press(self, key) -> None:
         k = self._listener.canonical(key)  # ctrl_l/ctrl_r -> ctrl, etc.
@@ -404,6 +431,12 @@ class LocalFlowApp:
         # and commits the words two decodes agree on. None until _run() builds
         # it (after warmup); log-only in M12.
         self.livetyper = None
+        # The HWND of the field the current dictation types into, captured at
+        # start. Live revisions and the final patch post straight to it, so
+        # the text keeps landing there when focus moves (27 Jul). Safe as a
+        # single slot: a stale dictation's typed_for() is "" so its final
+        # never patches, and the livetyper only patches the current id.
+        self._live_target: int | None = None
         self._dictation_id = 0
         self._produce_lock = threading.Lock()
         self._pending_id: int | None = None
@@ -490,6 +523,11 @@ class LocalFlowApp:
             # hold can never attach to this one).
             self._dictation_id += 1
             self.recorder.start()
+        # The field under the caret RIGHT NOW is this dictation's target —
+        # everything the dictation types is posted to it, wherever the user
+        # goes afterwards. Only meaningful with live typing; the v1.1 paste
+        # path stays focus-follows.
+        self._live_target = focused_control() if self.live_typing else None
         self._grab_keyboard()
         self._set_state("rec")
         # FR-2 indicator (tray dot; console line kept for --no-tray). ASCII
@@ -878,13 +916,16 @@ class LocalFlowApp:
         final sends no keystrokes at all."""
         if not typed:
             return
-        n_back, retype = patch_plan(typed, final)
+        # loose: punctuation/case drift in already-typed words is left alone
+        # (fixing a mid-text comma via keystrokes means retyping everything
+        # after it); real word differences are patched from where they start.
+        n_back, retype = patch_plan(typed, final, loose=True)
         if not n_back and not retype:
             log.info("live typing matched the final text - nothing to patch")
             return
         log.info("final patch: %d backspace(s), retyping %r", n_back, retype)
         try:
-            patch_text(n_back, retype)
+            patch_text(n_back, retype, target=self._live_target)
         except Exception:
             log.exception("final patch failed - the live text stays as typed")
 
@@ -1297,21 +1338,23 @@ def _run(args: argparse.Namespace) -> int:
     app.segmenter = Segmenter(recorder, vad=None, emit=app.emit_segment,
                               current_id=lambda: app._dictation_id,
                               segment_seconds=cfg.segment_seconds)
-    # M12/M13: the preview loop commits words DURING the dictation and types
-    # each committed chunk into the focused app. is_dictating excludes the mic
-    # test / calibration (they also put the recorder in `recording` but are not
-    # speech to type) and live_typing=false (v1.1 mode: nothing streams).
+    # M12/M13: the preview loop types the live hypothesis DURING the dictation
+    # and revises it in place as decodes improve (Google-style interim
+    # results). is_dictating excludes the mic test / calibration (they also
+    # put the recorder in `recording` but are not speech to type) and
+    # live_typing=false (v1.1 mode: nothing streams).
     from localflow.desktop.livetyper import LiveTyper
     app.livetyper = LiveTyper(
         recorder, engine_lock=app.engine_lock,
         is_dictating=lambda: (recorder.recording and not app.mic_test_active
                               and app.live_typing),
         current_id=lambda: app._dictation_id,
-        on_commit=type_text)
+        on_patch=lambda n, t: live_patch(n, t, target=app._live_target))
     # Held in a ref so the settings window can rebuild it live (M8).
     hotkey_ref = {"listener": PushToTalkListener(
         cfg.hotkey, app.on_hotkey_down, app.on_hotkey_up,
-        suppress=app.suppress_keys, on_cancel=app.cancel_dictation)}
+        suppress=app.suppress_keys, on_cancel=app.cancel_dictation,
+        target=lambda: app._live_target)}
     hotkey_ref["listener"].start()
 
     # Read-aloud (TTS): press read_aloud_hotkey to speak the SELECTED text, or
@@ -1434,7 +1477,8 @@ def _run(args: argparse.Namespace) -> int:
         old = hotkey_ref["listener"]
         new = PushToTalkListener(combo, app.on_hotkey_down, app.on_hotkey_up,
                                  suppress=app.suppress_keys,
-                                 on_cancel=app.cancel_dictation)
+                                 on_cancel=app.cancel_dictation,
+                                 target=lambda: app._live_target)
         new.start()
         hotkey_ref["listener"] = new
         old.stop()

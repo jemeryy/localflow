@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import gc
 import logging
 import re
 import time
@@ -119,7 +120,8 @@ class SttEngine:
         return config
 
     def transcribe(self, audio_16k_mono: np.ndarray,
-                   timestamps: bool = False) -> tuple[str, dict]:
+                   timestamps: bool = False,
+                   rebuild_on_failure: bool = True) -> tuple[str, dict]:
         """audio: float32 mono @16kHz. Returns (text, meta).
 
         meta = {"stt_ms": int, "device": str, "model": str, "chunks": ...}
@@ -128,6 +130,11 @@ class SttEngine:
         trailing silence hallucinations by their timing (meta["chunks"] is a
         list of (text, start_ts, end_ts), else None). It roughly doubles decode
         time, so it is only turned on when the hallucination filter is active.
+
+        `rebuild_on_failure=False` makes a failed decode just raise instead of
+        rebuilding on the fallback device. Disposable callers (the live preview)
+        use it: a rebuild costs ~15s under the engine lock and would demote
+        every later dictation to CPU over one skippable beat.
         """
         audio = np.ascontiguousarray(audio_16k_mono, dtype=np.float32)
         if len(audio) == 0:
@@ -139,12 +146,20 @@ class SttEngine:
             t0 = time.perf_counter()
             result = self._pipe.generate(audio, self._config)
         except Exception as e:
-            if self.device == self.fallback_device:
+            if self.device == self.fallback_device or not rebuild_on_failure:
                 raise
             log.warning(
                 "inference on %s FAILED (%s: %s) — rebuilding on %s and retrying",
                 self.device, type(e).__name__, e, self.fallback_device,
             )
+            # Drop the failed pipeline BEFORE building its replacement: holding
+            # both at once doubles the model in memory, and what gets us here is
+            # usually memory pressure already (live 27 Jul on the shared-memory
+            # iGPU: GPU "bad allocation", then the CPU rebuild died the same
+            # way). If the rebuild fails too, _pipe stays None and the next call
+            # retries the rebuild — the engine heals when memory frees up.
+            self._pipe = None
+            gc.collect()
             self.device, self._pipe, self.load_s = self._build_with_fallback(
                 self.fallback_device
             )

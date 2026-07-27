@@ -1412,13 +1412,14 @@ def test_segmenter_dormant_when_disabled_or_too_short():
     assert calls == []                            # 5s buffer < 30s target
 
 
-# ---- M12: streaming commit engine (preview loop) -------------------------
+# ---- M12: streaming preview engine (interim results, revised in place) ---
 
 
-def _livetyper(texts, window_s=5.0, dictating=True, typed=None):
+def _livetyper(texts, window_s=5.0, dictating=True, screen=None):
     """A LiveTyper over a fake recorder and a stub engine that returns
     `texts` one per decode (the last one repeats). No model, no mic.
-    `typed` (a list) collects the chunks it would inject (M13)."""
+    `screen` (a one-element list) plays the focused app: each patch is
+    applied exactly as backspaces + typing would (M13)."""
     import threading
 
     import numpy as np
@@ -1434,31 +1435,103 @@ def _livetyper(texts, window_s=5.0, dictating=True, typed=None):
     class StubEngine:
         calls = 0
 
-        def transcribe(self, audio, timestamps=False):
+        def transcribe(self, audio, timestamps=False, rebuild_on_failure=True):
             assert timestamps is False        # preview is the fast path
+            assert rebuild_on_failure is False   # a preview never rebuilds
             text = texts[min(self.calls, len(texts) - 1)]
             self.calls += 1
             return text, {}
 
+    def on_patch(n_back, text):
+        s = screen[0]
+        assert n_back <= len(s)               # never backspace past our text
+        screen[0] = s[:len(s) - n_back] + text if n_back else s + text
+
     lt = LiveTyper(FakeRecorder(), engine_lock=threading.Lock(),
                    is_dictating=lambda: dictating, current_id=lambda: 1,
                    engine=StubEngine(),
-                   on_commit=None if typed is None else typed.append)
+                   on_patch=None if screen is None else on_patch)
     return lt
 
 
-def test_livetyper_commits_only_what_two_decodes_agree_on():
-    """LocalAgreement-2 end to end: the first decode commits nothing, then
-    each tick commits the prefix the previous decode already said."""
+def test_livetyper_types_interior_words_immediately_and_holds_the_edge():
+    """Interim results: every word types on the decode that produced it,
+    except the newest word, which waits until two consecutive decodes end
+    the same way (the live edge flickers mid-word)."""
     lt = _livetyper(["hello there",
                      "hello there my",
                      "hello there my friend indeed"])
     lt._tick()
-    assert lt.text() == ""                    # one decode is not evidence
+    assert lt.text() == "hello"               # "there" is the flickery edge
     lt._tick()
     assert lt.text() == "hello there"
     lt._tick()
-    assert lt.text() == "hello there my"      # "friend indeed" not agreed yet
+    assert lt.text() == "hello there my friend"
+
+
+def test_livetyper_stable_hypothesis_releases_the_edge_word():
+    """A pause: the hypothesis stops changing, so the held word types too."""
+    lt = _livetyper(["hello there", "hello there"])
+    lt._tick()
+    assert lt.text() == "hello"
+    lt._tick()
+    assert lt.text() == "hello there"
+
+
+def test_livetyper_revises_typed_words_when_the_decode_changes_its_mind():
+    """The Google model: interim text is corrected in place - backspace the
+    divergent tail, retype - instead of waiting for agreement up front."""
+    screen = [""]
+    lt = _livetyper(["i rode a bike quickly",
+                     "i wrote a book quickly",
+                     "i wrote a book quickly"], screen=screen)
+    lt._tick()
+    assert screen[0] == "i rode a bike"
+    lt._tick()
+    assert screen[0] == "i wrote a book"      # revised, not appended
+    lt._tick()
+    assert screen[0] == "i wrote a book quickly"
+    assert screen[0] == lt.text()             # accounting matches the app
+
+
+def test_livetyper_freezes_words_beyond_the_revisable_tail():
+    """Only the last few typed words are revisable mid-dictation. A decode
+    that rethinks the start of the sentence must NOT retype the line (live
+    27 Jul: the sentence was rewritten over and over); the final patch owns
+    real corrections."""
+    screen = [""]
+    lt = _livetyper(["one two three four five six seven eight",
+                     "one moo three four five six seven eight",
+                     "one moo three four five six seven eight"], screen=screen)
+    lt._tick()
+    assert screen[0] == "one two three four five six seven"
+    lt._tick()                    # word 2 changed - it is frozen now
+    assert screen[0] == "one two three four five six seven"
+    lt._tick()                    # stable: the held edge word still arrives
+    assert screen[0] == "one two three four five six seven eight"
+    assert screen[0] == lt.text()
+
+
+def test_livetyper_strips_silence_hallucinations_at_the_live_edge():
+    """A pause must never type Whisper's silence artifacts (live 27 Jul:
+    "You." typed mid-dictation). Same filter as the final pass."""
+    lt = _livetyper(["okay done. Thank you.", "okay done. Thank you."])
+    lt._tick()
+    lt._tick()
+    assert lt.text() == "okay done."          # the stock tail never types
+
+    lt = _livetyper(["You.", "You."])         # a silent window decodes to
+    lt._tick()                                # ONLY the artifact
+    lt._tick()
+    assert lt.text() == ""
+
+
+def test_livetyper_one_empty_decode_never_erases_typed_words():
+    lt = _livetyper(["hello there", ""])
+    lt._tick()
+    assert lt.text() == "hello"
+    lt._tick()                                # a flaky decode returns nothing
+    assert lt.text() == "hello"               # the final pass owns erasing
 
 
 def test_livetyper_skips_the_beat_when_the_engine_is_busy():
@@ -1490,29 +1563,25 @@ def test_livetyper_short_buffer_and_wrong_dictation_are_ignored():
     assert lt.text() == "hello there"
 
 
-def test_livetyper_segment_cut_holds_commits_until_the_real_text_lands():
-    """A Tier 1 cut closes the window. The cut segment's real text belongs
-    BEFORE anything the new window commits, and typed text can't be inserted
-    after the fact - so the new window holds until reconciliation, then
-    commits normally. The stream stays append-only (M13)."""
-    typed: list[str] = []
-    lt = _livetyper(["hello there",
-                     "hello there my",
+def test_livetyper_segment_text_revises_the_cut_region_in_place():
+    """A Tier 1 cut freezes the hypothesis as provisional text (typing never
+    pauses); the segment's authoritative text then revises it in place."""
+    screen = [""]
+    lt = _livetyper(["hello there my",
                      "second part",
                      "second part now",
-                     "second part now ok"], typed=typed)
+                     "second part now ok"], screen=screen)
     lt._tick()
-    lt._tick()
-    assert lt.text() == "hello there"
+    assert screen[0] == "hello there"
     lt.on_cut(1)                              # segmenter drained the buffer
+    assert screen[0] == "hello there my"      # held edge types: audio final
     lt._tick()
-    lt._tick()                                # would commit, but must wait
-    assert lt.text() == "hello there"
+    assert screen[0] == "hello there my second"    # new window keeps flowing
     lt.on_segment_text(1, "Hello there, my friend.")
-    assert lt.text() == "hello there my friend."
-    lt._tick()                                # now the new window flows again
-    assert lt.text() == "hello there my friend. second part now"
-    assert "".join(typed) == lt.text()        # append-only, in order
+    assert screen[0] == "hello there my friend. second"   # revised in place
+    lt._tick()
+    assert screen[0] == "hello there my friend. second part"
+    assert screen[0] == lt.text()
 
 
 def test_livetyper_flushes_once_when_the_dictation_ends():
@@ -1526,37 +1595,81 @@ def test_livetyper_flushes_once_when_the_dictation_ends():
     lt.is_dictating = lambda: True
     lt.current_id = lambda: 2                 # a new dictation resets it all
     lt._tick()
-    assert lt.text() == "" and not lt._flushed
+    # Fresh screen: only THIS dictation's decode ("my" is the held edge).
+    assert lt.text() == "hello there" and not lt._flushed
+    assert lt.typed_for(1) == ""              # the old dictation is gone
 
 
 # ---- M13: live injection + final patch + the live_typing switch ----------
 
 
-def test_livetyper_types_every_commit_exactly_once_and_in_order():
-    """What the app receives IS the committed stream: chunks concatenate to
-    text(), with the joining space carried on the FOLLOWING chunk."""
-    typed: list[str] = []
-    lt = _livetyper(["hello there",
-                     "hello there my",
-                     "hello there my friend"], typed=typed)
-    lt._tick()
-    lt._tick()
-    assert typed == ["hello there"]           # no leading space on the first
-    lt._tick()
-    assert typed == ["hello there", " my"]
-    assert "".join(typed) == lt.text()
-
-
-def test_livetyper_close_stops_commits_that_land_after_the_stop():
+def test_livetyper_close_stops_typing_that_lands_after_the_stop():
     """A preview decode started while recording finishes seconds later; a
-    commit typed after the final patch would be text nobody can take back."""
-    typed: list[str] = []
-    lt = _livetyper(["hello there", "hello there my"], typed=typed)
+    revision typed after the final patch would corrupt text nobody can take
+    back. Late segment texts are skipped too - the final patch fixes it all."""
+    screen = [""]
+    lt = _livetyper(["hello there", "hello there my"], screen=screen)
     lt._tick()
     lt.close(1)
-    lt._tick()                                # decode still ran; commit drops
-    assert typed == [] and lt.typed_for(1) == ""
+    lt._tick()                                # decode still ran; typing drops
+    lt.on_segment_text(1, "hello there my friend")
+    assert screen[0] == "hello"
+    assert lt.typed_for(1) == "hello"         # what the final patch works on
     assert lt.typed_for(99) == ""             # never patch another dictation
+
+
+def _fake_user32(monkeypatch, alive_hwnd):
+    """Replace inject's user32 with a recorder: posted messages are captured,
+    IsWindow answers for exactly one HWND."""
+    from localflow.desktop import inject
+
+    posted: list[tuple] = []
+
+    class FakeUser32:
+        @staticmethod
+        def IsWindow(h):
+            return h == alive_hwnd
+
+        @staticmethod
+        def PostMessageW(h, msg, w, lp):
+            posted.append((h, msg, w))
+
+    monkeypatch.setattr(inject, "_user32", FakeUser32())
+    return posted
+
+
+def test_live_patch_posts_to_the_target_window(monkeypatch):
+    """With a target the revision is POSTED to that window (it lands in the
+    original field even when focus moved), never sent to the focus."""
+    from localflow.desktop import inject
+
+    posted = _fake_user32(monkeypatch, alive_hwnd=42)
+    inject.live_patch(2, "hi", target=42)
+    keydowns = [p for p in posted if p[1] == 0x0100]
+    chars = [p for p in posted if p[1] == 0x0102]
+    assert [p[0] for p in posted] == [42] * len(posted)
+    assert len(keydowns) == 2 and keydowns[0][2] == 0x08   # two backspaces
+    assert [c[2] for c in chars] == [ord("h"), ord("i")]
+
+
+def test_patches_to_a_dead_target_are_dropped(monkeypatch):
+    """The target window closed mid-dictation: dropping the patch beats
+    spilling backspaces + text into whatever the user is doing now."""
+    from localflow.desktop import inject
+
+    posted = _fake_user32(monkeypatch, alive_hwnd=42)
+    inject.live_patch(1, "x", target=999)
+    inject.patch_text(1, "x", target=999)
+    assert posted == []
+
+
+def test_patch_text_posts_to_the_target_window(monkeypatch):
+    from localflow.desktop import inject
+
+    posted = _fake_user32(monkeypatch, alive_hwnd=42)
+    inject.patch_text(1, "a", target=42)
+    assert [(p[1], p[2]) for p in posted] == [
+        (0x0100, 0x08), (0x0101, 0x08), (0x0102, ord("a"))]
 
 
 def _patching_app(monkeypatch, typed_text, recorder=None):
@@ -1565,8 +1678,9 @@ def _patching_app(monkeypatch, typed_text, recorder=None):
     from localflow.desktop import app as app_mod
 
     sent: dict = {"patch": None, "paste": None}
-    monkeypatch.setattr(app_mod, "patch_text",
-                        lambda n, retype: sent.__setitem__("patch", (n, retype)))
+    monkeypatch.setattr(
+        app_mod, "patch_text",
+        lambda n, retype, target=None: sent.__setitem__("patch", (n, retype)))
     monkeypatch.setattr(app_mod, "inject_text",
                         lambda text, **kw: sent.__setitem__("paste", text) or True)
 
@@ -1586,7 +1700,9 @@ def test_finish_patches_the_live_typed_text_instead_of_pasting(monkeypatch):
     app._finish_dictation(["I wrote a book"], 10, "GPU", _time.perf_counter(),
                           had_audio=True, dictation_id=5)
     assert sent["paste"] is None
-    assert sent["patch"] == (len("i rode a bike"), "I wrote a book")
+    # "i"/"I" is a case-only difference, so word 1 is kept and only the
+    # divergent tail is rewritten.
+    assert sent["patch"] == (len(" rode a bike"), " wrote a book")
 
 
 def test_finish_sends_nothing_when_live_typing_already_matched(monkeypatch):
@@ -1816,3 +1932,50 @@ def test_key_filter_suppresses_everything_but_the_hotkey_and_esc():
     with pytest.raises(SystemHook.SuppressException):        # Esc
         ptt._win32_filter(0x100, key(0x1B))
     assert events == ["start", "stop", "cancel"]
+
+
+def test_key_filter_locks_only_the_dictation_target(monkeypatch):
+    """With a target (27 Jul): keys into the dictated field are swallowed,
+    the rest of the keyboard stays alive - including Esc, which only cancels
+    from inside the target. The hotkey still works from anywhere."""
+    import threading
+    import types
+
+    from pynput._util.win32 import SystemHook
+
+    from localflow.desktop import app as app_mod
+    from localflow.desktop.app import PushToTalkListener
+
+    events: list[str] = []
+    suppress = threading.Event()
+    ptt = PushToTalkListener("alt+`",
+                             lambda: events.append("start"),
+                             lambda: events.append("stop"),
+                             suppress=suppress,
+                             on_cancel=lambda: events.append("cancel"),
+                             target=lambda: 42)
+
+    def key(vk, flags=0):
+        return types.SimpleNamespace(vkCode=vk, flags=flags)
+
+    suppress.set()
+    monkeypatch.setattr(app_mod, "focused_control", lambda: 42)
+    with pytest.raises(SystemHook.SuppressException):   # in the target: dead
+        ptt._win32_filter(0x100, key(0x41))
+    with pytest.raises(SystemHook.SuppressException):   # Esc cancels here
+        ptt._win32_filter(0x100, key(0x1B))
+    assert events == ["cancel"]
+
+    monkeypatch.setattr(app_mod, "focused_control", lambda: 7)
+    assert ptt._win32_filter(0x100, key(0x41)) is True  # elsewhere: alive
+    assert ptt._win32_filter(0x100, key(0x1B)) is True  # Esc means Esc there
+    with pytest.raises(SystemHook.SuppressException):   # hotkey: ours anywhere
+        ptt._win32_filter(0x104, key(0xA4))
+    with pytest.raises(SystemHook.SuppressException):
+        ptt._win32_filter(0x104, key(0xC0))
+    assert events == ["cancel", "start"]
+
+    # No target captured (injection follows focus): the old M11 full lock.
+    ptt._target = lambda: None
+    with pytest.raises(SystemHook.SuppressException):
+        ptt._win32_filter(0x100, key(0x41))

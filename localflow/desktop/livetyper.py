@@ -1,24 +1,34 @@
-"""M12: the streaming commit engine (log-only).
+"""M12/M13: the streaming preview engine — Google-style interim results.
 
 While a dictation runs, this thread re-decodes the recorder's uncommitted
-buffer about once a second and commits the words that two consecutive decodes
-agree on (LocalAgreement-2, `core.live.commit_prefix`). Each committed chunk
-goes to `on_commit`, which M13 wires to the keystroke injector - so the
-committed stream IS what is already in the focused app, and the worker's final
-patch (`core.live.patch_plan` against `typed_for`) only has to fix the
-difference. The stream is strictly append-only for that reason.
+buffer about once a second and TYPES the current hypothesis into the focused
+app straight away, revising what it already typed (backspace + retype) when a
+newer decode disagrees. That is the interim-results model Google's streaming
+STT uses: words appear the moment they are recognised, marked non-final, and
+are corrected in place; the final pass on release is the is_final result —
+the worker patches the screen to the authoritative text once, via
+`typed_for()` and `core.live.patch_plan`.
 
-Threading: same discipline as the Segmenter - this thread only READS the
+Three things keep the stream calm:
+- the NEWEST word of a hypothesis is held back until two consecutive decodes
+  agree on it (the live edge flickers while a word is still being spoken),
+- every hypothesis goes through `strip_hallucinations` first, so a pause
+  never types Whisper's silence artifacts ("You.", "Thank you."),
+- only the last REVISE_TAIL_WORDS typed words are ever revised mid-dictation.
+  Older words are FROZEN until the final patch — a decode that rethinks the
+  start of the sentence can no longer rewrite the whole line every beat
+  (live 27 Jul: the sentence was retyped over and over).
+Revisions use `patch_plan(loose=True)`, which ignores punctuation/case drift
+in already-typed words — only a genuinely different word triggers keystrokes.
+
+Threading: same discipline as the Segmenter — this thread only READS the
 recorder (snapshot) and never queues work. The engine is strictly
 single-threaded, so a preview decode takes the app's engine lock
 NON-BLOCKING and skips the beat whenever a segment or the final decode owns
 it. A preview must never make a real dictation wait behind it.
 
-Preview decodes are the FAST path: no timestamps, no hallucination filter, no
-preprocessing. Those belong to the final pass, which is what determines the
-text that actually stays (M13 patches the difference); paying denoise on a
-growing window every second would eat the cadence this milestone exists to
-prove.
+Preview decodes are the FAST path: no timestamps, no preprocessing. The
+final pass owns quality; this loop owns feel.
 """
 
 from __future__ import annotations
@@ -27,26 +37,30 @@ import logging
 import threading
 import time
 
-from localflow.core import ensure_16k_mono
-from localflow.core.live import commit_prefix
+from localflow.core import ensure_16k_mono, strip_hallucinations
+from localflow.core.live import patch_plan
 
 log = logging.getLogger("localflow.desktop.livetyper")
 
-POLL_INTERVAL_S = 1.0
+POLL_INTERVAL_S = 0.7
 MIN_WINDOW_S = 1.5      # a shorter window decodes to noise; wait for audio
+REVISE_TAIL_WORDS = 4   # only this many trailing words are revisable live
 
 
 class LiveTyper:
-    """Polls a StreamRecorder while it records and commits stabilised words.
+    """Polls a StreamRecorder while it records and live-types the hypothesis.
 
     `is_dictating() -> bool` and `current_id() -> int` are supplied by the app
     (a mic test also puts the recorder in `recording`, and that audio is not a
     dictation); `engine` is set after warmup, like the Segmenter's VAD.
+    `on_patch(n_backspaces, text)` applies one revision to the focused app;
+    it is always called under `_lock`, so the screen is mutated in exactly
+    the order this class accounts for it.
     """
 
     def __init__(self, recorder, engine_lock, is_dictating, current_id,
                  engine=None, poll_interval_s: float = POLL_INTERVAL_S,
-                 min_window_s: float = MIN_WINDOW_S, on_commit=None):
+                 min_window_s: float = MIN_WINDOW_S, on_patch=None):
         self.recorder = recorder
         self.engine = engine
         self.engine_lock = engine_lock
@@ -54,26 +68,25 @@ class LiveTyper:
         self.current_id = current_id
         self.poll_interval_s = poll_interval_s
         self.min_window_s = min_window_s
-        # M13: called with each newly committed chunk (leading space included
-        # when it continues an existing stream). Always called under _lock, so
-        # what the app types is exactly what text() says, in that order.
-        self.on_commit = on_commit
+        self.on_patch = on_patch
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._loop, daemon=True,
                                         name="localflow-livetyper")
-        # Committed words. `_regions` are windows the Tier 1 segmenter has
-        # already cut away (oldest first), `_window` is the live one; the
-        # stream is their concatenation. Splitting it that way is what lets a
-        # cut segment's authoritative text land AFTER the new window has
-        # already committed words without reordering anything.
+        # `_regions` are windows the Tier 1 segmenter already cut away
+        # (oldest first, provisional preview text until the segment's
+        # authoritative text REPLACES it); `_window` is the live hypothesis.
+        # `_screen` is exactly what this dictation has typed into the app —
+        # the thing every patch is computed against and what typed_for()
+        # hands the final pass.
         self._lock = threading.Lock()
         self._id: int | None = None
         self._regions: list[list[str]] = []
-        self._reconciled = 0          # regions still awaiting their segment text
+        self._reconciled = 0          # regions already given their segment text
         self._window: list[str] = []
-        self._prev: list[str] = []    # last hypothesis for the live window
+        self._prev: list[str] = []    # last raw hypothesis (edge agreement)
+        self._screen = ""
         self._flushed = False
-        self._closed = False          # the dictation ended: commit no more
+        self._closed = False          # the dictation ended: type no more
 
     def start(self) -> None:
         self._thread.start()
@@ -82,19 +95,20 @@ class LiveTyper:
         self._stop.set()
 
     def text(self) -> str:
-        """The committed stream so far, single-space joined."""
+        """What this dictation has typed into the app so far."""
         with self._lock:
-            return " ".join(self._words())
+            return self._screen
 
     # -- events from the app ---------------------------------------------
 
     def close(self, dictation_id: int) -> None:
-        """The dictation just stopped: commit nothing more (M13).
+        """The dictation just stopped: type nothing more (M13).
 
         A preview decode started while recording finishes SECONDS later, and
-        a commit landing after the final patch would type words nobody can
-        take back. Segment texts still in flight are unaffected — they are
-        authoritative, and the worker consumes them before the patch runs."""
+        a revision landing after the final patch would corrupt text nobody
+        can take back. The final patch fixes everything in one pass, so any
+        segment text still in flight is skipped too — `_screen` stays exactly
+        what is on screen, which is all the patch needs."""
         with self._lock:
             if dictation_id == self._id:
                 self._closed = True
@@ -104,49 +118,60 @@ class LiveTyper:
         patch. Empty for any other dictation - a stale final must never
         backspace text the current one is typing."""
         with self._lock:
-            return " ".join(self._words()) if dictation_id == self._id else ""
+            return self._screen if dictation_id == self._id else ""
 
     def on_cut(self, dictation_id: int) -> None:
         """Tier 1 cut: the live window's audio just left the recorder, so
-        close the window and start a fresh one. The cut segment's real text
-        arrives later, via on_segment_text."""
+        freeze the current hypothesis as that region's provisional text and
+        start a fresh window. The segment's real text arrives later, via
+        on_segment_text, and revises it in place."""
         with self._lock:
             if dictation_id != self._id:
                 return
-            self._regions.append(self._window)
+            self._regions.append(self._prev)
             self._window = []
             self._prev = []
+            self._apply()       # the held edge word types now: audio is final
 
     def on_segment_text(self, dictation_id: int, text: str) -> None:
-        """The worker finished a cut segment: its text is authoritative for
-        that region. Whatever the preview had not committed yet is appended;
-        what was already committed stays put (a commit never retracts)."""
-        words = text.split()
+        """The worker finished a cut segment: its text REPLACES the preview's
+        provisional text for that region, and the screen is revised to match.
+        Called for every mid segment, silent ones included — reconciliation
+        is in cut order, so skipping one would shift every later segment onto
+        the wrong region."""
         with self._lock:
-            if dictation_id != self._id:
-                return
+            if dictation_id != self._id or self._closed:
+                return          # the final patch will fix everything at once
             if self._reconciled >= len(self._regions):
                 self._regions.append([])      # text before its cut: can't
-            region = self._regions[self._reconciled]   # happen, but never drop
-            # ponytail: aligned by word COUNT, not a diff - the preview and the
-            # final pipeline can word the same audio differently. M13's final
-            # patch fixes any drift; a diff here would only move the guesswork.
-            extra = words[len(region):]
-            region.extend(extra)
-            self._reconciled += 1
-            self._emit(extra, len(self._words()) > len(extra))
-        if extra:
-            log.info("live commit (segment, +%d): %s", len(extra),
-                     " ".join(extra))
+            self._regions[self._reconciled] = text.split()   # happen, but
+            self._reconciled += 1                            # never drop it
+            self._apply()
 
     # -- the loop ---------------------------------------------------------
 
     def _loop(self) -> None:
-        while not self._stop.wait(self.poll_interval_s):
+        wait = self.poll_interval_s
+        while not self._stop.wait(wait):
+            t0 = time.perf_counter()
+            failed = False
             try:
                 self._tick()
             except Exception:
+                failed = True
                 log.exception("live preview pass failed - dictation continues")
+            spent = time.perf_counter() - t0
+            # Tick on the poll interval while decodes are cheap, but never
+            # spend more than half the wall clock decoding. Back-to-back
+            # previews on a long window starve the final decode of the engine
+            # lock and were what pushed the shared-memory iGPU into "bad
+            # allocation" (live 27 Jul).
+            wait = max(self.poll_interval_s - spent, spent)
+            if failed:
+                # A failed decode is nearly always memory pressure on the
+                # shared-memory iGPU. Retrying every beat under pressure is
+                # what turns a hiccup into a spiral - give it room instead.
+                wait = max(wait, self.poll_interval_s * 3)
 
     def _tick(self) -> None:
         if self.engine is None:
@@ -168,43 +193,59 @@ class LiveTyper:
             return          # a segment/final decode owns it - skip this beat
         try:
             t0 = time.perf_counter()
-            text, _meta = self.engine.transcribe(audio16, timestamps=False)
+            # rebuild_on_failure=False: a preview is disposable. Letting it
+            # trigger the CPU fallback would stall ~15s under the engine lock
+            # and demote every later dictation to CPU over one skippable beat.
+            text, _meta = self.engine.transcribe(audio16, timestamps=False,
+                                                 rebuild_on_failure=False)
         finally:
             self.engine_lock.release()
         log.debug("preview: %.1fs window decoded in %dms -> %r",
                   len(snap) / rate, int((time.perf_counter() - t0) * 1000), text)
-        self._commit(text.split(), dictation_id)
+        # The same silence-artifact filter the final pass uses: a pause must
+        # never type "You." / "Thank you." (live 27 Jul).
+        self._revise(strip_hallucinations(text).split(), dictation_id)
 
-    def _commit(self, words: list[str], dictation_id: int) -> None:
+    def _revise(self, words: list[str], dictation_id: int) -> None:
         with self._lock:
             if dictation_id != self._id or self._closed:
                 return          # the dictation ended while we were decoding
-            if self._reconciled < len(self._regions):
-                # A cut segment's authoritative text is still in flight, and
-                # its words belong BEFORE anything this window commits. Typed
-                # text cannot be inserted after the fact, so hold the beat;
-                # _prev still advances, so the tick after it lands commits at
-                # once. Costs a ~1s typing pause per segment cut (every 30s).
-                self._prev = words
-                return
-            n = commit_prefix(self._prev, words, len(self._window))
-            fresh = words[len(self._window):n]
+            if not words and self._window:
+                return  # one empty decode never erases typed words; the
+                        # final pass erases them if it was genuinely silence
+            # Hold the newest word until two consecutive decodes agree on the
+            # whole hypothesis — the live edge flickers while a word is still
+            # being spoken. Everything older types immediately (interim
+            # results); a later decode revises it if Whisper changes its mind.
+            stable = words == self._prev
             self._prev = words
-            self._window.extend(fresh)
-            total = len(self._words())
-            self._emit(fresh, total > len(fresh))
-        if fresh:
-            log.info("live commit (+%d, %d total): %s", len(fresh), total,
-                     " ".join(fresh))
+            self._window = words if stable else words[:-1]
+            self._apply()
 
-    def _emit(self, fresh: list[str], preceded: bool) -> None:
-        """Type a newly committed chunk (M13). Called under _lock so the app
-        receives chunks in exactly the order text() reports them - the stream
-        is append-only, and typing cannot be reordered afterwards."""
-        if not fresh or self.on_commit is None:
+    def _apply(self) -> None:
+        """Revise the screen to match the current desired text (under _lock)."""
+        desired_words: list[str] = []
+        for region in self._regions:
+            desired_words.extend(region)
+        desired_words.extend(self._window)
+        # Freeze everything but the last few typed words: a decode (or a
+        # segment reconciliation) that changes its mind about older words is
+        # ignored — the final patch fixes real errors ONCE at the end.
+        # Bounded rewrites are what make the stream watchable (live 27 Jul).
+        screen_words = self._screen.split()
+        frozen = len(screen_words) - REVISE_TAIL_WORDS
+        if frozen > 0:
+            desired_words[:frozen] = screen_words[:frozen]
+        desired = " ".join(desired_words)
+        n_back, retype = patch_plan(self._screen, desired, loose=True)
+        if not n_back and not retype:
+            return
+        self._screen = self._screen[:len(self._screen) - n_back] + retype
+        log.info("live type (-%d chars, +%r)", n_back, retype)
+        if self.on_patch is None:
             return
         try:
-            self.on_commit((" " if preceded else "") + " ".join(fresh))
+            self.on_patch(n_back, retype)
         except Exception:
             log.exception("live typing failed - the final patch still runs")
 
@@ -215,24 +256,17 @@ class LiveTyper:
             self._reconciled = 0
             self._window = []
             self._prev = []
+            self._screen = ""
             self._flushed = False
             self._closed = False
 
     def _flush(self) -> None:
-        """Dictation over: log the committed stream, once. The state is kept
-        until the NEXT dictation resets it, so a segment text still in flight
-        can land instead of racing a teardown."""
+        """Dictation over: log what was typed, once. The state is kept until
+        the NEXT dictation resets it, so typed_for() stays answerable while
+        the worker runs the final patch."""
         with self._lock:
             if self._id is None or self._flushed:
                 return
             self._flushed = True
-            words = self._words()
-        log.info("live stream ended - %d words committed: %s",
-                 len(words), " ".join(words))
-
-    def _words(self) -> list[str]:
-        out: list[str] = []
-        for region in self._regions:
-            out.extend(region)
-        out.extend(self._window)
-        return out
+            screen = self._screen
+        log.info("live stream ended - on screen: %s", screen)

@@ -1,5 +1,11 @@
 """Text injection (FR-10/11/12): clipboard paste with save/restore, or typed keys.
 
+Live typing (M13) is TARGETED: the control that had the keyboard focus when
+the dictation started is captured (`focused_control`) and every revision is
+POSTED straight to that window with window messages, not sent to whatever has
+focus now. That is what lets the stream keep landing in the original field
+while the user works somewhere else (Jeremy 27 Jul).
+
 UIPI limit (FR-11): injecting into an elevated (run-as-administrator) window
 silently fails — Windows blocks synthetic input across integrity levels and
 reports no error. Documented, not fought, in v1.
@@ -9,12 +15,80 @@ from __future__ import annotations
 
 import ctypes
 import logging
+import re
 import time
+from ctypes import wintypes
 
 import pyperclip
 from pynput.keyboard import Controller, Key
 
 log = logging.getLogger("localflow.desktop.inject")
+
+_user32 = ctypes.windll.user32
+# Declared argtypes: HWNDs and LPARAMs are pointer-sized — the default c_int
+# conversion would truncate them on 64-bit Python.
+_user32.PostMessageW.argtypes = (wintypes.HWND, wintypes.UINT,
+                                 wintypes.WPARAM, wintypes.LPARAM)
+_user32.IsWindow.argtypes = (wintypes.HWND,)
+_user32.GetForegroundWindow.restype = wintypes.HWND
+_user32.GetWindowThreadProcessId.argtypes = (
+    wintypes.HWND, ctypes.POINTER(wintypes.DWORD))
+
+
+class _GUITHREADINFO(ctypes.Structure):
+    _fields_ = (("cbSize", wintypes.DWORD), ("flags", wintypes.DWORD),
+                ("hwndActive", wintypes.HWND), ("hwndFocus", wintypes.HWND),
+                ("hwndCapture", wintypes.HWND), ("hwndMenuOwner", wintypes.HWND),
+                ("hwndMoveSize", wintypes.HWND), ("hwndCaret", wintypes.HWND),
+                ("rcCaret", wintypes.RECT))
+
+
+def focused_control() -> int | None:
+    """HWND of the control that owns the keyboard focus right now — the
+    dictation's target, captured at start. Falls back to the foreground
+    window when its focused child can't be read; None when there is no
+    foreground window at all (then injection stays focus-follows, as before).
+    """
+    fg = _user32.GetForegroundWindow()
+    if not fg:
+        return None
+    tid = _user32.GetWindowThreadProcessId(fg, None)
+    info = _GUITHREADINFO(cbSize=ctypes.sizeof(_GUITHREADINFO))
+    if _user32.GetGUIThreadInfo(tid, ctypes.byref(info)) and info.hwndFocus:
+        return info.hwndFocus
+    return fg
+
+
+_WM_KEYDOWN, _WM_KEYUP, _WM_CHAR = 0x0100, 0x0101, 0x0102
+_VK_BACK = 0x08
+_BACK_DOWN_LP = 1 | (0x0E << 16)             # repeat 1, backspace scancode
+_BACK_UP_LP = _BACK_DOWN_LP | (0x3 << 30)    # previous-state + transition
+
+
+def _post_backspace(hwnd: int) -> None:
+    # POSTED (not sent) so a hung target can never stall the dictation. The
+    # target thread's own TranslateMessage turns the key-down into the
+    # WM_CHAR classic edit controls delete on; Chromium deletes on the
+    # key-down itself. Either way: one deletion.
+    _user32.PostMessageW(hwnd, _WM_KEYDOWN, _VK_BACK, _BACK_DOWN_LP)
+    _user32.PostMessageW(hwnd, _WM_KEYUP, _VK_BACK, _BACK_UP_LP)
+
+
+def _post_text(hwnd: int, text: str) -> None:
+    data = text.encode("utf-16-le")          # WM_CHAR takes UTF-16 units
+    for i in range(0, len(data), 2):
+        _user32.PostMessageW(hwnd, _WM_CHAR,
+                             int.from_bytes(data[i:i + 2], "little"), 1)
+
+
+def _target_alive(target: int | None, what: str) -> bool:
+    """A captured target that has since been closed drops the patch — falling
+    back to SendInput would spill the words into whatever the user is doing
+    now, which is worse than losing a revision."""
+    if target is None or _user32.IsWindow(target):
+        return True
+    log.warning("target window is gone - %s dropped", what)
+    return False
 
 # Modifier VKs -> the key that releases them: shift, ctrl, alt, lwin, rwin.
 _MODIFIER_KEYS = ((0x10, Key.shift), (0x11, Key.ctrl), (0x12, Key.alt),
@@ -56,28 +130,67 @@ def inject_text(text: str, mode: str = "paste",
     return True
 
 
-def type_text(text: str) -> None:
-    """Type `text` as keystrokes with NO modifier wait (M13 live typing).
-
-    The hotkey's Alt stays physically down for a whole hold-mode dictation,
-    so _wait_modifiers_released here would stall every commit for its full
-    timeout. Safe without it: pynput sends characters as KEYEVENTF_UNICODE,
-    which ignores modifier state entirely, and M11's clear_modifiers has
-    already told the focused app that Alt is up.
-    """
-    if text:
-        _keyboard.type(text)
+# Between-word gap for a live revision's retype: enough that words visibly
+# stream in one at a time (the Google feel), small enough to never lag the
+# next decode. Synchronous on the caller's thread — when the dictation ends
+# nothing is queued anywhere, so typing stops the instant close() lands.
+LIVE_WORD_GAP_S = 0.08
+_WORD_PIECE = re.compile(r"\s*\S+")
 
 
-def patch_text(n_backspaces: int, retype: str) -> None:
+def live_patch(n_backspaces: int, text: str, target: int | None = None) -> None:
+    """Apply one live revision (M13): backspace the divergent tail, then type
+    the new words one by one. `target` is the HWND captured at dictation
+    start — revisions are posted straight to it, so they keep landing in the
+    field the dictation started in even after the user switches window/tab.
+    None falls back to typing into the focus (capture failed). NO modifier
+    wait — the hotkey's Alt stays physically down for a whole hold, and
+    waiting would stall every revision for its full timeout. Safe: M11's
+    suppression eats the physical keys, clear_modifiers told the app every
+    modifier is up, and injected events pass the suppression hook
+    (LLKHF_INJECTED)."""
+    if not _target_alive(target, "live revision"):
+        return
+    for _ in range(n_backspaces):
+        if target is not None:
+            _post_backspace(target)
+        else:
+            _keyboard.tap(Key.backspace)
+    if not text:
+        return
+    pieces = _WORD_PIECE.findall(text)
+    if "".join(pieces) != text:
+        pieces = [text]          # odd spacing: type it verbatim, unpaced
+    for i, piece in enumerate(pieces):
+        if i:
+            time.sleep(LIVE_WORD_GAP_S)
+        if target is not None:
+            _post_text(target, piece)
+        else:
+            _keyboard.type(piece)
+
+
+def patch_text(n_backspaces: int, retype: str, target: int | None = None) -> None:
     """M13 final patch: delete the divergent suffix, type the correction.
+    With a `target` HWND the patch is posted straight to the dictation's
+    original field (no modifier wait needed — posted messages never consult
+    the physical keyboard state, and the target thread never saw the
+    hotkey's Alt go down: the suppression hook ate it).
 
-    Backspace is a real virtual key (unlike unicode typing), so the hotkey's
-    modifiers have to be out of the way first — Alt+Backspace is "undo" in
-    plenty of apps, not a delete. By this point the dictation has ended, so
-    the wait returns almost immediately.
+    In the SendInput fallback, backspace is a real virtual key (unlike
+    unicode typing), so the hotkey's modifiers have to be out of the way
+    first — Alt+Backspace is "undo" in plenty of apps, not a delete. By this
+    point the dictation has ended, so the wait returns almost immediately.
     """
     if not n_backspaces and not retype:
+        return
+    if target is not None:
+        if not _target_alive(target, "final patch"):
+            return
+        for _ in range(n_backspaces):
+            _post_backspace(target)
+        if retype:
+            _post_text(target, retype)
         return
     _wait_modifiers_released()
     for _ in range(n_backspaces):

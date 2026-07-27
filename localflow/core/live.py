@@ -41,13 +41,29 @@ def commit_prefix(prev_words: list[str], new_words: list[str],
     return max(agreed, committed_len)
 
 
-def patch_plan(typed: str, final: str) -> tuple[int, str]:
+def patch_plan(typed: str, final: str, loose: bool = False) -> tuple[int, str]:
     """(backspaces, text to retype) that turns `typed` into `final`.
 
-    Word-aligned: keep the longest common WORD prefix (exact match - this is
-    the final text, punctuation and all), delete the rest of `typed`, retype
-    the rest of `final`. Aligning on words stops a late one-word revision from
-    rewriting a whole paragraph.
+    Word-aligned: keep the longest common WORD prefix, delete the rest of
+    `typed`, retype the rest of `final`. Aligning on words stops a late
+    one-word revision from rewriting a whole paragraph.
+
+    The prefix match ignores CASE. Whisper capitalises the same word
+    differently depending on how much audio it saw ("I mean" from the preview,
+    "i mean" from the final pass), and treating that as a divergence rewrote
+    the whole line over one letter (live 27 Jul: 25 backspaces to change "I" to
+    "i").
+
+    `loose=True` (live revisions and the final patch over live-typed text)
+    also ignores PUNCTUATION in the kept prefix — Whisper re-punctuates a word
+    every time the buffer around it grows ("hello" -> "Hello,"), and honouring
+    that would rewrite the whole line once a second. The kept prefix keeps the
+    TYPED form; then the keep point walks back over any words whose typed form
+    still differs (case aside), so trailing punctuation ("friend" ->
+    "friend.") is fixed cheaply at the cursor while a stale mid-text comma is
+    left alone. ponytail: mid-text punctuation-only fixes are skipped — fixing
+    them via keystrokes means retyping everything after, the exact churn this
+    mode exists to stop.
     """
     if typed == final:
         return 0, ""
@@ -55,9 +71,16 @@ def patch_plan(typed: str, final: str) -> tuple[int, str]:
     f = [m.span() for m in _WORD.finditer(final)]
     keep = 0
     for (a0, a1), (b0, b1) in zip(t, f):
-        if typed[a0:a1] != final[b0:b1]:
+        a, b = typed[a0:a1], final[b0:b1]
+        if (_norm(a) != _norm(b)) if loose else (a.casefold() != b.casefold()):
             break
         keep += 1
+    if loose:
+        # Fix trailing loose-matched words whose typed form is still wrong
+        # ("friend" vs "friend.") — they sit at the cursor, so it's cheap.
+        while keep and typed[slice(*t[keep - 1])].casefold() != \
+                final[slice(*f[keep - 1])].casefold():
+            keep -= 1
     t_end = t[keep - 1][1] if keep else 0
     f_end = f[keep - 1][1] if keep else 0
     return len(typed) - t_end, final[f_end:]

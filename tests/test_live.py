@@ -66,3 +66,48 @@ def test_full_rewrite_backspaces_everything():
 
 def test_trailing_space_is_trimmed():
     assert patch_plan("hello there ", "hello there") == (1, "")
+
+
+def test_case_only_difference_does_not_rewrite_the_line():
+    """Live 27 Jul: the final pass said "i mean" where the preview typed
+    "I mean" and the whole line got backspaced over one letter."""
+    back, retype = patch_plan("I mean like since we have",
+                              "i mean like since we have Hello?")
+    assert back == 0
+    assert retype == " Hello?"
+
+
+def test_punctuation_still_counts_as_a_difference():
+    back, retype = patch_plan("hello there", "hello there.")
+    assert back == len(" there")
+    assert retype == " there."
+
+
+# ---- loose mode (live revisions + the final patch over live-typed text) --
+
+
+def test_loose_ignores_punctuation_and_case_drift():
+    """Whisper re-punctuates typed words every decode ("hello" -> "Hello,");
+    honouring that would rewrite the line once a second."""
+    assert patch_plan("hello there my", "Hello, there my", loose=True) == (0, "")
+
+
+def test_loose_still_fixes_the_trailing_words_cheaply():
+    """Trailing form fixes sit at the cursor, so they ARE applied."""
+    back, retype = patch_plan("hello there my friend",
+                              "Hello, there my friend.", loose=True)
+    assert back == len(" friend")
+    assert retype == " friend."
+
+
+def test_loose_patches_real_word_changes_from_where_they_start():
+    back, retype = patch_plan("i rode a bike", "I wrote a book", loose=True)
+    assert back == len(" rode a bike")
+    assert retype == " wrote a book"
+
+
+def test_loose_appends_new_words_without_touching_the_rest():
+    back, retype = patch_plan("I mean like since we have",
+                              "i mean like since we have Hello?", loose=True)
+    assert back == 0
+    assert retype == " Hello?"
