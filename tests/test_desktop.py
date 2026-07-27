@@ -1454,62 +1454,45 @@ def _livetyper(texts, window_s=5.0, dictating=True, screen=None):
     return lt
 
 
-def test_livetyper_types_interior_words_immediately_and_holds_the_edge():
-    """Interim results: every word types on the decode that produced it,
-    except the newest word, which waits until two consecutive decodes end
-    the same way (the live edge flickers mid-word)."""
+def test_livetyper_types_words_once_two_decodes_agree():
+    """Append-only committed stream (27 Jul): a word types once two
+    consecutive decodes agree on it (LocalAgreement-2), and is then FINAL."""
     lt = _livetyper(["hello there",
                      "hello there my",
                      "hello there my friend indeed"])
     lt._tick()
-    assert lt.text() == "hello"               # "there" is the flickery edge
+    assert lt.text() == ""                    # nothing agreed yet
     lt._tick()
     assert lt.text() == "hello there"
     lt._tick()
-    assert lt.text() == "hello there my friend"
+    assert lt.text() == "hello there my"
 
 
-def test_livetyper_stable_hypothesis_releases_the_edge_word():
-    """A pause: the hypothesis stops changing, so the held word types too."""
+def test_livetyper_stable_hypothesis_commits_every_word():
+    """A pause: the hypothesis stops changing, so all of it commits."""
     lt = _livetyper(["hello there", "hello there"])
     lt._tick()
-    assert lt.text() == "hello"
+    assert lt.text() == ""
     lt._tick()
     assert lt.text() == "hello there"
 
 
-def test_livetyper_revises_typed_words_when_the_decode_changes_its_mind():
-    """The Google model: interim text is corrected in place - backspace the
-    divergent tail, retype - instead of waiting for agreement up front."""
+def test_livetyper_never_revises_typed_words():
+    """No correction (Jeremy 27 Jul): a decode that changes its mind about
+    typed words leaves them alone - genuinely new words still flow."""
     screen = [""]
-    lt = _livetyper(["i rode a bike quickly",
-                     "i wrote a book quickly",
-                     "i wrote a book quickly"], screen=screen)
+    lt = _livetyper(["i rode a bike",
+                     "i rode a bike",
+                     "i wrote a book fast",
+                     "i wrote a book fast"], screen=screen)
+    lt._tick()
     lt._tick()
     assert screen[0] == "i rode a bike"
-    lt._tick()
-    assert screen[0] == "i wrote a book"      # revised, not appended
-    lt._tick()
-    assert screen[0] == "i wrote a book quickly"
+    lt._tick()                                # rethink: ignored
+    assert screen[0] == "i rode a bike"
+    lt._tick()                                # the NEW word still arrives
+    assert screen[0] == "i rode a bike fast"
     assert screen[0] == lt.text()             # accounting matches the app
-
-
-def test_livetyper_freezes_words_beyond_the_revisable_tail():
-    """Only the last few typed words are revisable mid-dictation. A decode
-    that rethinks the start of the sentence must NOT retype the line (live
-    27 Jul: the sentence was rewritten over and over); the final patch owns
-    real corrections."""
-    screen = [""]
-    lt = _livetyper(["one two three four five six seven eight",
-                     "one moo three four five six seven eight",
-                     "one moo three four five six seven eight"], screen=screen)
-    lt._tick()
-    assert screen[0] == "one two three four five six seven"
-    lt._tick()                    # word 2 changed - it is frozen now
-    assert screen[0] == "one two three four five six seven"
-    lt._tick()                    # stable: the held edge word still arrives
-    assert screen[0] == "one two three four five six seven eight"
-    assert screen[0] == lt.text()
 
 
 def test_livetyper_strips_silence_hallucinations_at_the_live_edge():
@@ -1527,11 +1510,12 @@ def test_livetyper_strips_silence_hallucinations_at_the_live_edge():
 
 
 def test_livetyper_one_empty_decode_never_erases_typed_words():
-    lt = _livetyper(["hello there", ""])
+    lt = _livetyper(["hello there", "hello there", ""])
     lt._tick()
-    assert lt.text() == "hello"
+    lt._tick()
+    assert lt.text() == "hello there"
     lt._tick()                                # a flaky decode returns nothing
-    assert lt.text() == "hello"               # the final pass owns erasing
+    assert lt.text() == "hello there"         # typed text is final
 
 
 def test_livetyper_skips_the_beat_when_the_engine_is_busy():
@@ -1563,23 +1547,25 @@ def test_livetyper_short_buffer_and_wrong_dictation_are_ignored():
     assert lt.text() == "hello there"
 
 
-def test_livetyper_segment_text_revises_the_cut_region_in_place():
-    """A Tier 1 cut freezes the hypothesis as provisional text (typing never
-    pauses); the segment's authoritative text then revises it in place."""
+def test_livetyper_cut_pauses_until_the_segment_tail_lands():
+    """A Tier 1 cut: typing pauses until the cut window's authoritative text
+    appends its missing tail, so the tail can never land after the next
+    window's words (append-only means order is everything)."""
     screen = [""]
     lt = _livetyper(["hello there my",
+                     "hello there my",
                      "second part",
-                     "second part now",
-                     "second part now ok"], screen=screen)
+                     "second part"], screen=screen)
     lt._tick()
-    assert screen[0] == "hello there"
+    lt._tick()
+    assert screen[0] == "hello there my"
     lt.on_cut(1)                              # segmenter drained the buffer
-    assert screen[0] == "hello there my"      # held edge types: audio final
-    lt._tick()
-    assert screen[0] == "hello there my second"    # new window keeps flowing
+    lt._tick()                                # paused: no decode, no typing
+    assert lt.engine.calls == 2 and screen[0] == "hello there my"
     lt.on_segment_text(1, "Hello there, my friend.")
-    assert screen[0] == "hello there my friend. second"   # revised in place
+    assert screen[0] == "hello there my friend."   # only the missing tail
     lt._tick()
+    lt._tick()                                # the new window streams on
     assert screen[0] == "hello there my friend. second part"
     assert screen[0] == lt.text()
 
@@ -1595,27 +1581,43 @@ def test_livetyper_flushes_once_when_the_dictation_ends():
     lt.is_dictating = lambda: True
     lt.current_id = lambda: 2                 # a new dictation resets it all
     lt._tick()
-    # Fresh screen: only THIS dictation's decode ("my" is the held edge).
-    assert lt.text() == "hello there" and not lt._flushed
+    # Fresh screen: the new dictation's first decode commits nothing yet.
+    assert lt.text() == "" and not lt._flushed
     assert lt.typed_for(1) == ""              # the old dictation is gone
 
 
-# ---- M13: live injection + final patch + the live_typing switch ----------
+# ---- M13: live injection + the final tail + the live_typing switch -------
 
 
-def test_livetyper_close_stops_typing_that_lands_after_the_stop():
-    """A preview decode started while recording finishes seconds later; a
-    revision typed after the final patch would corrupt text nobody can take
-    back. Late segment texts are skipped too - the final patch fixes it all."""
+def test_livetyper_close_blocks_previews_but_the_final_tail_still_lands():
+    """A preview decode started while recording finishes seconds later: it
+    must not type. The authoritative final drain still appends the words the
+    preview never got to - the ONLY typing after release (27 Jul: no
+    correction, no duplicates)."""
     screen = [""]
-    lt = _livetyper(["hello there", "hello there my"], screen=screen)
+    lt = _livetyper(["hello there", "hello there", "hello there my"],
+                    screen=screen)
     lt._tick()
+    lt._tick()
+    assert screen[0] == "hello there"
     lt.close(1)
-    lt._tick()                                # decode still ran; typing drops
-    lt.on_segment_text(1, "hello there my friend")
-    assert screen[0] == "hello"
-    assert lt.typed_for(1) == "hello"         # what the final patch works on
-    assert lt.typed_for(99) == ""             # never patch another dictation
+    lt._tick()                                # late decode: dropped
+    assert screen[0] == "hello there"
+    lt.on_segment_text(1, "hello there my friend")   # the final drain
+    assert screen[0] == "hello there my friend"      # tail only, no rewrite
+    assert lt.typed_for(1) == "hello there my friend"
+    assert lt.typed_for(99) == ""             # never touch another dictation
+
+
+def test_livetyper_discard_blocks_segment_tails_too():
+    """Esc: nothing may type after the cancel, authoritative tails included."""
+    screen = [""]
+    lt = _livetyper(["hello there", "hello there"], screen=screen)
+    lt._tick()
+    lt._tick()
+    lt.close(1, discard=True)
+    lt.on_segment_text(1, "hello there my")
+    assert screen[0] == "hello there"
 
 
 def _fake_user32(monkeypatch, alive_hwnd, wnd_class="RichEditD2DPT"):
@@ -1712,16 +1714,15 @@ def _patching_app(monkeypatch, typed_text, recorder=None):
     return app, sent
 
 
-def test_finish_patches_the_live_typed_text_instead_of_pasting(monkeypatch):
-    """The words are already in the app, so the final pass backspaces the
-    divergent suffix and retypes it - no paste at all."""
+def test_finish_never_corrects_streamed_text(monkeypatch):
+    """No correction pass (27 Jul): even when the final decode disagrees
+    with what was streamed, the screen is left alone - no patch, no paste.
+    The final drain's tail was already appended via on_segment_text."""
     app, sent = _patching_app(monkeypatch, "i rode a bike")
     app._finish_dictation(["I wrote a book"], 10, "GPU", _time.perf_counter(),
                           had_audio=True, dictation_id=5)
-    assert sent["paste"] is None
-    # "i"/"I" is a case-only difference, so word 1 is kept and only the
-    # divergent tail is rewritten.
-    assert sent["patch"] == (len(" rode a bike"), " wrote a book")
+    assert sent == {"patch": None, "paste": None}
+    assert app.last_text == "I wrote a book"
 
 
 def test_finish_sends_nothing_when_live_typing_already_matched(monkeypatch):
@@ -1779,8 +1780,9 @@ def test_stop_closes_the_livetyper_before_the_final_is_queued(recorder):
     app = _bare_app(recorder=recorder)
     closed: list[int] = []
     app.livetyper = type("Stub", (), {
-        "close": lambda _self, did: closed.append(did),
+        "close": lambda _self, did, discard=False: closed.append(did),
         "typed_for": lambda _self, did: "",
+        "on_segment_text": lambda _self, did, text: None,
     })()
     app.on_hotkey_down()
     app.on_hotkey_up()

@@ -557,7 +557,7 @@ class LocalFlowApp:
         discarded."""
         with self._produce_lock:
             self.recorder.stop()
-            self._close_livetyper()
+            self._close_livetyper(discard=True)
             self._work.put(_Segment(audio=np.zeros(0, dtype=np.float32),
                                     rate=self.recorder.rate,
                                     dictation_id=self._dictation_id,
@@ -565,12 +565,13 @@ class LocalFlowApp:
         self._set_state("busy")
         print("[--] cancelled - nothing pasted", flush=True)
 
-    def _close_livetyper(self) -> None:
-        """M13: stop the preview committing the moment recording ends. A
-        decode started while recording lands seconds later, and a commit
-        typed AFTER the final patch would be text nobody can take back."""
+    def _close_livetyper(self, discard: bool = False) -> None:
+        """M13: stop the preview committing the moment recording ends — a
+        decode started while recording lands seconds later. The worker's
+        authoritative segment tails still append; `discard` (Esc) blocks
+        those too."""
         if self.livetyper is not None:
-            self.livetyper.close(self._dictation_id)
+            self.livetyper.close(self._dictation_id, discard=discard)
 
     def _grab_keyboard(self) -> None:
         """M11: kill the physical keyboard for the length of the dictation and
@@ -771,11 +772,13 @@ class LocalFlowApp:
                 self._pending_texts.append(result.raw_text)
                 self._pending_stt_ms += result.stt_ms
                 self._pending_stt_device = result.device
-        if not item.final and self.livetyper is not None:
-            # M12: this segment's text is authoritative for the window the
-            # preview was guessing at. Called for EVERY mid segment, silent
-            # ones included - the reconciliation is in cut order, so skipping
-            # one would shift every later segment onto the wrong window.
+        if self.livetyper is not None and not item.cancelled:
+            # This segment's text is authoritative for the window the preview
+            # was streaming: the livetyper appends the words it had not typed
+            # yet (append-only, no correction — Jeremy 27 Jul). Called for
+            # EVERY segment in queue order, silent mids and the final drain
+            # included - reconciliation is in cut order, so skipping one
+            # would shift every later segment onto the wrong window.
             self.livetyper.on_segment_text(item.dictation_id, seg_text)
         if item.final:
             if item.cancelled:      # Esc (M11): drop the whole dictation
@@ -812,9 +815,11 @@ class LocalFlowApp:
         holds a single segment, so this matches the old per-utterance path.
         `peak` is the raw mic peak across the dictation - auto_gain's input.
 
-        With live typing on (M13) the words are already in the app, so the
-        final text is PATCHED in rather than pasted: same end result, minus
-        the wait."""
+        With live typing on (M13) the words are already in the app — the
+        final drain's tail was appended by on_segment_text before this runs —
+        and NO correction pass touches them (Jeremy 27 Jul). The one
+        exception is a final that produced nothing at all: typed text is
+        taken back, or it would be words no dictation produced."""
         typed = self._typed_text(dictation_id)
         raw_joined = " ".join(t.strip() for t in texts if t and t.strip())
         if raw_joined and self.filter_hallucinations:
@@ -867,8 +872,7 @@ class LocalFlowApp:
         # text even when the paste went nowhere (target wasn't focused).
         self.last_text = text
         if typed:
-            self._patch_typed(typed, text)
-            injected = True          # the words are in the app either way
+            injected = True          # streamed + tail already appended
         else:
             injected = inject_text(text, mode=self.inject_mode,
                                    restore_delay_s=self.restore_delay_s)
@@ -885,7 +889,7 @@ class LocalFlowApp:
             cleanup_note = (f", cleanup {cleanup_ms}ms"
                             if cleanup_ms is not None else "")
             # FR-7 per-utterance log + release-to-paste total (feeds AT-4).
-            print(f"[ok] {'patched' if typed else 'pasted'} {len(text)} chars "
+            print(f"[ok] {'streamed' if typed else 'pasted'} {len(text)} chars "
                   f"in {total_ms}ms "
                   f"(stt {stt_ms}ms on {device}{cleanup_note}, "
                   f"n={len(self.latencies_ms)}): {text!r}", flush=True)
@@ -910,10 +914,9 @@ class LocalFlowApp:
         return self.livetyper.typed_for(dictation_id)
 
     def _patch_typed(self, typed: str, final: str) -> None:
-        """Turn the live-typed text into the final text in place: backspace
-        the divergent suffix, retype it (M13). Word-aligned, so a late
-        one-word revision never rewrites a whole paragraph, and an identical
-        final sends no keystrokes at all."""
+        """Turn the live-typed text into the final text in place (M13).
+        Since the no-correction rule (27 Jul) its only caller is the
+        silence take-back: final="" erases text the dictation disowned."""
         if not typed:
             return
         # loose: punctuation/case drift in already-typed words is left alone
@@ -1338,10 +1341,10 @@ def _run(args: argparse.Namespace) -> int:
     app.segmenter = Segmenter(recorder, vad=None, emit=app.emit_segment,
                               current_id=lambda: app._dictation_id,
                               segment_seconds=cfg.segment_seconds)
-    # M12/M13: the preview loop types the live hypothesis DURING the dictation
-    # and revises it in place as decodes improve (Google-style interim
-    # results). is_dictating excludes the mic test / calibration (they also
-    # put the recorder in `recording` but are not speech to type) and
+    # M12/M13: the preview loop types committed words DURING the dictation
+    # (append-only: two decodes must agree, nothing is ever rewritten -
+    # Jeremy 27 Jul). is_dictating excludes the mic test / calibration (they
+    # also put the recorder in `recording` but are not speech to type) and
     # live_typing=false (v1.1 mode: nothing streams).
     from localflow.desktop.livetyper import LiveTyper
     app.livetyper = LiveTyper(
