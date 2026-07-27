@@ -64,14 +64,36 @@ _VK_BACK = 0x08
 _BACK_DOWN_LP = 1 | (0x0E << 16)             # repeat 1, backspace scancode
 _BACK_UP_LP = _BACK_DOWN_LP | (0x3 << 30)    # previous-state + transition
 
+# Window classes whose text surface deletes on the KEY-DOWN itself and
+# ignores a 0x08 char: Chromium (Chrome/Edge/VS Code/Electron) and Gecko.
+# ponytail: class sniff — extend the tuple when some app deletes on neither.
+_KEYDOWN_DELETE_CLASSES = ("Chrome_RenderWidgetHostHWND", "MozillaWindowClass")
 
-def _post_backspace(hwnd: int) -> None:
-    # POSTED (not sent) so a hung target can never stall the dictation. The
-    # target thread's own TranslateMessage turns the key-down into the
-    # WM_CHAR classic edit controls delete on; Chromium deletes on the
-    # key-down itself. Either way: one deletion.
-    _user32.PostMessageW(hwnd, _WM_KEYDOWN, _VK_BACK, _BACK_DOWN_LP)
-    _user32.PostMessageW(hwnd, _WM_KEYUP, _VK_BACK, _BACK_UP_LP)
+
+def _keydown_deletes(hwnd: int) -> bool:
+    buf = ctypes.create_unicode_buffer(64)
+    _user32.GetClassNameW(hwnd, buf, 64)
+    return any(c in buf.value for c in _KEYDOWN_DELETE_CLASSES)
+
+
+def _post_backspaces(hwnd: int, n: int) -> None:
+    """Delete `n` chars in the target. POSTED (not sent) so a hung target can
+    never stall the dictation. Two styles, because ordering is sacred:
+    posting a raw key-down would make the target's own TranslateMessage
+    enqueue the deleting WM_CHAR at the BACK of its queue — behind the
+    replacement text we already posted — so the deletes landed after the
+    retype and every revision garbled the line (live 27 Jul). Classic edit
+    controls therefore get the WM_CHAR 0x08 they would have been handed
+    anyway; Chromium/Gecko surfaces delete on the key-down itself (and
+    ignore the 0x08 char), so they get the key pair. Both stay FIFO with
+    the WM_CHAR text that follows."""
+    if _keydown_deletes(hwnd):
+        for _ in range(n):
+            _user32.PostMessageW(hwnd, _WM_KEYDOWN, _VK_BACK, _BACK_DOWN_LP)
+            _user32.PostMessageW(hwnd, _WM_KEYUP, _VK_BACK, _BACK_UP_LP)
+    else:
+        for _ in range(n):
+            _user32.PostMessageW(hwnd, _WM_CHAR, _VK_BACK, 1)
 
 
 def _post_text(hwnd: int, text: str) -> None:
@@ -151,10 +173,10 @@ def live_patch(n_backspaces: int, text: str, target: int | None = None) -> None:
     (LLKHF_INJECTED)."""
     if not _target_alive(target, "live revision"):
         return
-    for _ in range(n_backspaces):
-        if target is not None:
-            _post_backspace(target)
-        else:
+    if target is not None:
+        _post_backspaces(target, n_backspaces)
+    else:
+        for _ in range(n_backspaces):
             _keyboard.tap(Key.backspace)
     if not text:
         return
@@ -187,8 +209,7 @@ def patch_text(n_backspaces: int, retype: str, target: int | None = None) -> Non
     if target is not None:
         if not _target_alive(target, "final patch"):
             return
-        for _ in range(n_backspaces):
-            _post_backspace(target)
+        _post_backspaces(target, n_backspaces)
         if retype:
             _post_text(target, retype)
         return

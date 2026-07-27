@@ -1618,9 +1618,10 @@ def test_livetyper_close_stops_typing_that_lands_after_the_stop():
     assert lt.typed_for(99) == ""             # never patch another dictation
 
 
-def _fake_user32(monkeypatch, alive_hwnd):
+def _fake_user32(monkeypatch, alive_hwnd, wnd_class="RichEditD2DPT"):
     """Replace inject's user32 with a recorder: posted messages are captured,
-    IsWindow answers for exactly one HWND."""
+    IsWindow answers for exactly one HWND, GetClassNameW reports
+    `wnd_class` (Notepad's RichEdit by default)."""
     from localflow.desktop import inject
 
     posted: list[tuple] = []
@@ -1634,22 +1635,40 @@ def _fake_user32(monkeypatch, alive_hwnd):
         def PostMessageW(h, msg, w, lp):
             posted.append((h, msg, w))
 
+        @staticmethod
+        def GetClassNameW(h, buf, n):
+            buf.value = wnd_class
+            return len(wnd_class)
+
     monkeypatch.setattr(inject, "_user32", FakeUser32())
     return posted
 
 
 def test_live_patch_posts_to_the_target_window(monkeypatch):
     """With a target the revision is POSTED to that window (it lands in the
-    original field even when focus moved), never sent to the focus."""
+    original field even when focus moved), never sent to the focus. A plain
+    edit control deletes on WM_CHAR 0x08 — posting a key-down instead made
+    the app's own queue put the delete BEHIND our text (garbled rewrites,
+    live 27 Jul), so everything must flow through one FIFO char stream."""
     from localflow.desktop import inject
 
     posted = _fake_user32(monkeypatch, alive_hwnd=42)
     inject.live_patch(2, "hi", target=42)
-    keydowns = [p for p in posted if p[1] == 0x0100]
-    chars = [p for p in posted if p[1] == 0x0102]
-    assert [p[0] for p in posted] == [42] * len(posted)
-    assert len(keydowns) == 2 and keydowns[0][2] == 0x08   # two backspaces
-    assert [c[2] for c in chars] == [ord("h"), ord("i")]
+    assert posted == [(42, 0x0102, 0x08), (42, 0x0102, 0x08),
+                      (42, 0x0102, ord("h")), (42, 0x0102, ord("i"))]
+
+
+def test_live_patch_uses_key_backspaces_on_chromium(monkeypatch):
+    """Chromium surfaces (browser, VS Code) delete on the key-down itself
+    and ignore a 0x08 char, so they get the key pair — still FIFO with the
+    text that follows."""
+    from localflow.desktop import inject
+
+    posted = _fake_user32(monkeypatch, alive_hwnd=42,
+                          wnd_class="Chrome_RenderWidgetHostHWND")
+    inject.live_patch(1, "x", target=42)
+    assert [(p[1], p[2]) for p in posted] == [
+        (0x0100, 0x08), (0x0101, 0x08), (0x0102, ord("x"))]
 
 
 def test_patches_to_a_dead_target_are_dropped(monkeypatch):
@@ -1669,7 +1688,7 @@ def test_patch_text_posts_to_the_target_window(monkeypatch):
     posted = _fake_user32(monkeypatch, alive_hwnd=42)
     inject.patch_text(1, "a", target=42)
     assert [(p[1], p[2]) for p in posted] == [
-        (0x0100, 0x08), (0x0101, 0x08), (0x0102, ord("a"))]
+        (0x0102, 0x08), (0x0102, ord("a"))]
 
 
 def _patching_app(monkeypatch, typed_text, recorder=None):
