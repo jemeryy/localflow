@@ -18,5 +18,20 @@
       "PowerShell(git diff *)",
       "PowerShell(git show *)"
     ]
+  },
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup|clear",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "if [ -f \"${CLAUDE_PROJECT_DIR}/plans/NEXT.md\" ]; then head -c 2000 \"${CLAUDE_PROJECT_DIR}/plans/NEXT.md\"; fi",
+            "timeout": 10,
+            "statusMessage": "Loading latest handoff pointer"
+          }
+        ]
+      }
+    ]
   }
 }

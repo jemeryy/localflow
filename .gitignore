@@ -16,3 +16,6 @@ models/
 
 # Audio scratch
 *.wav
+
+# session-handoff resume pointer (per-checkout, regenerated each handoff)
+plans/NEXT.md

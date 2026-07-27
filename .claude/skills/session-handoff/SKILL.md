@@ -1,6 +1,6 @@
 ---
 name: session-handoff
-description: Use when the user says "session handoff", "wrap up session", "hand off", "handoff summary", or wants a structured end-of-session summary before clearing context. Writes a handoff markdown file (in this project's handoffs folder) covering decisions, shipped changes, key files, running state, verification steps, deferrals, and open questions so a fresh agent can continue seamlessly. Project-agnostic: it discovers this project's own paths.
+description: Use when the user says "session handoff", "s/h", "wrap up session", "hand off", "handoff summary", or wants a structured end-of-session summary before clearing context. Writes a handoff markdown file (in this project's handoffs folder) covering decisions, shipped changes, key files, running state, verification steps, deferrals, and open questions so a fresh agent can continue seamlessly. Project-agnostic: it discovers this project's own paths.
 ---
 
 # Session Handoff
@@ -18,8 +18,8 @@ instance of you, not a stakeholder.
 
 ## When to invoke
 
-User says: "session handoff", "wrap up session", "hand off", "handoff summary", "let's
-wrap up", "summarize before I clear", or any near-equivalent. Also invoke proactively
+User says: "session handoff", "s/h" (the shorthand), "wrap up session", "hand off",
+"handoff summary", "let's wrap up", "summarize before I clear", or any near-equivalent. Also invoke proactively
 if the user says they are about to `/clear` without having run it yet.
 
 ## Where to write it (discover this project's convention)
@@ -51,6 +51,31 @@ INSIDE the file (the next agent may have a different working directory).
    No `git log`, no broad `Glob` sweeps. If you didn't touch it this session, it doesn't
    belong here.
 4. **Produce the output in a markdown file.** Write a file. Do not update memory.
+
+## Write the NEXT.md resume pointer
+
+After the handoff doc is written, overwrite `NEXT.md` in the SAME folder you wrote the
+handoff doc into (`handoffs/NEXT.md` or `docs/NEXT.md`, whichever this project uses),
+with exactly this content and nothing else:
+
+```
+# NEXT (auto-written by session-handoff, read by the SessionStart hook)
+Updated: <YYYY-MM-DD HH:MM> by session handoff.
+Latest handoff: <ABSOLUTE path to the handoff doc just written>
+Next step: <same next-step line as below, in shorthand>
+```
+
+NEXT.md is gitignored on purpose: do NOT commit it. It is a per-checkout convenience
+pointer, regenerated every handoff, and this project's SessionStart hook injects it into
+each fresh session so you no longer have to hand-type "read <handoff path>" to resume.
+
+## End with the next step (one prose line, NOT a code block)
+
+After the handoff doc and NEXT.md are written, end your chat message with a single
+**next-step line in plain prose** — do NOT wrap it in a fenced code block. Format it as
+`Next step: read <handoff-doc absolute path>, then <next action in shorthand>`. The same
+line is saved as the final "Next step" section inside the handoff doc, so it survives a
+`/clear`.
 
 ## Output template — use exactly this structure, every time
 
@@ -91,6 +116,9 @@ INSIDE the file (the next agent may have a different working directory).
 
 ## Next steps
 <the most likely next tasks for a fresh agent, likely following the plan>
+
+## Next step (for the next session after /clear)
+Next step: read <ABSOLUTE path to THIS handoff doc>, then <next action in shorthand>.
 ```
 
 ## Hard rules
@@ -108,6 +136,9 @@ INSIDE the file (the next agent may have a different working directory).
 6. **Background process IDs are critical.** If you started any `run_in_background`
    shells, their IDs must appear in "Running state" with the kill command — the next
    agent cannot find them otherwise.
+7. **Write NEXT.md and end with the next step.** Overwrite the gitignored `NEXT.md` in
+   the handoffs folder with the resume pointer, and end your chat message with a single
+   next-step prose line (never a fenced code block).
 
 ## Anti-patterns — do not do these
 
