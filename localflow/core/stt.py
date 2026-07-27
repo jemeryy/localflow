@@ -3,12 +3,40 @@
 from __future__ import annotations
 
 import logging
+import re
 import time
 from pathlib import Path
 
 import numpy as np
 
 log = logging.getLogger("localflow.core.stt")
+
+# Whisper special/timestamp markers ("<|7.00|>", "<|en|>", "<|transcribe|>").
+# openvino_genai leaks these into the decoded text in return_timestamps mode
+# (seen live 11 Jul: "<|7.00|> replaced by..."). Strip them from every decode.
+_SPECIAL_TOKEN = re.compile(r"<\|[^|>]*\|>")
+
+
+def strip_special_tokens(text: str) -> str:
+    return _SPECIAL_TOKEN.sub("", text)
+
+
+def to_language_token(code: str | None) -> str | None:
+    """Map a config language code to the Whisper token the pipeline wants.
+
+    "en" -> "<|en|>" (force English), "fr"/"es"/"zh"/... -> "<|xx|>", and
+    "auto"/"detect"/""/None -> None (let Whisper detect the language per
+    utterance). Already-bracketed tokens pass through unchanged.
+    """
+    if code is None:
+        return None
+    c = code.strip().lower()
+    if c in ("", "auto", "detect", "none"):
+        return None
+    c = c.strip("<|>")               # tolerate "<|fr|>" written in the config
+    if c in ("", "auto", "detect"):
+        return None
+    return f"<|{c}|>"
 
 
 class SttEngine:
@@ -34,7 +62,9 @@ class SttEngine:
         self.requested_device = device
         self.fallback_device = fallback_device
         self.model_name = model_name or Path(model_dir).name
-        self.language = language
+        # Accept either a Whisper token ("<|en|>") or a plain code ("en",
+        # "fr", "auto"); None / "auto" means detect the language per utterance.
+        self.language = to_language_token(language)
         # Vocabulary biasing: Whisper conditions on this text, so domain
         # words listed here ("Codex", "OpenVINO", ...) are far more likely
         # to be transcribed as themselves instead of near-homophones.
@@ -76,8 +106,9 @@ class SttEngine:
 
     def _make_config(self):
         config = self._pipe.get_generation_config()
-        config.language = self.language
+        config.language = self.language     # None = detect per utterance
         config.task = "transcribe"
+        log.info("STT language: %s", self.language or "auto-detect")
         if self.initial_prompt:
             if hasattr(config, "initial_prompt"):
                 config.initial_prompt = self.initial_prompt
@@ -87,15 +118,23 @@ class SttEngine:
                             "hot_words are ignored")
         return config
 
-    def transcribe(self, audio_16k_mono: np.ndarray) -> tuple[str, dict]:
+    def transcribe(self, audio_16k_mono: np.ndarray,
+                   timestamps: bool = False) -> tuple[str, dict]:
         """audio: float32 mono @16kHz. Returns (text, meta).
 
-        meta = {"stt_ms": int, "device": str, "model": str}
+        meta = {"stt_ms": int, "device": str, "model": str, "chunks": ...}
+
+        `timestamps` enables return_timestamps so the pipeline can drop
+        trailing silence hallucinations by their timing (meta["chunks"] is a
+        list of (text, start_ts, end_ts), else None). It roughly doubles decode
+        time, so it is only turned on when the hallucination filter is active.
         """
         audio = np.ascontiguousarray(audio_16k_mono, dtype=np.float32)
         if len(audio) == 0:
-            return "", {"stt_ms": 0, "device": self.device, "model": self.model_name}
+            return "", {"stt_ms": 0, "device": self.device,
+                        "model": self.model_name, "chunks": None}
 
+        self._config.return_timestamps = bool(timestamps)
         try:
             t0 = time.perf_counter()
             result = self._pipe.generate(audio, self._config)
@@ -110,10 +149,19 @@ class SttEngine:
                 self.fallback_device
             )
             self._config = self._make_config()
+            self._config.return_timestamps = bool(timestamps)
             t0 = time.perf_counter()
             result = self._pipe.generate(audio, self._config)
 
         stt_ms = int((time.perf_counter() - t0) * 1000)
-        text = str(result).strip()
+        text = strip_special_tokens(str(result)).strip()
+        chunks = None
+        if timestamps:
+            raw = getattr(result, "chunks", None) or []
+            # Don't .strip() per-chunk text: the pipeline joins chunks and
+            # relies on Whisper's leading spaces to keep words apart.
+            chunks = [(strip_special_tokens(c.text), float(c.start_ts),
+                       float(c.end_ts)) for c in raw]
         log.debug("stt: %dms on %s -> %r", stt_ms, self.device, text)
-        return text, {"stt_ms": stt_ms, "device": self.device, "model": self.model_name}
+        return text, {"stt_ms": stt_ms, "device": self.device,
+                      "model": self.model_name, "chunks": chunks}

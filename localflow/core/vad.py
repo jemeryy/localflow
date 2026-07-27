@@ -5,7 +5,6 @@ from __future__ import annotations
 import logging
 
 import numpy as np
-from silero_vad import get_speech_timestamps, load_silero_vad
 
 from .audio import TARGET_RATE
 
@@ -35,14 +34,39 @@ class VadGate:
         self.min_speech_ms = min_speech_ms
         self.leading_pad = int(leading_pad_s * TARGET_RATE)
         self.trailing_pad = int(trailing_pad_s * TARGET_RATE)
-        # Weights ship inside the silero-vad wheel; ONNX runs on CPU in <1ms
-        # per frame, leaving GPU/NPU free for STT. No network involved.
+        # silero_vad is imported HERE, not at module top: it pulls in
+        # onnxruntime and costs ~2.4s to import. VadGate is only ever built on
+        # the background warmup thread, so deferring the import keeps that cost
+        # off the startup critical path (the hotkey goes live ~2.4s sooner).
+        # Weights ship inside the wheel; ONNX runs on CPU in <1ms per frame,
+        # leaving GPU/NPU free for STT. No network involved.
+        from silero_vad import get_speech_timestamps, load_silero_vad
+        self._get_speech_timestamps = get_speech_timestamps
         self._model = load_silero_vad(onnx=True)
+
+    def speech_spans(self, audio_16k_mono: np.ndarray) -> list[tuple[int, int]]:
+        """(start, end) sample indices of every speech span, sorted. Used by
+        the Tier 1 segmenter to find a silence to cut a long hold at; unlike
+        trim() it returns the raw span boundaries and never gates to None.
+
+        NOTE: get_speech_timestamps mutates the Silero model's internal state,
+        so this instance must not be shared with the worker's VadGate — the
+        segmenter is given its own gate.
+        """
+        audio = np.ascontiguousarray(audio_16k_mono, dtype=np.float32)
+        spans = self._get_speech_timestamps(
+            audio,
+            self._model,
+            threshold=self.threshold,
+            sampling_rate=TARGET_RATE,
+            min_speech_duration_ms=self.min_speech_ms,
+        )
+        return [(int(s["start"]), int(s["end"])) for s in spans]
 
     def trim(self, audio_16k_mono: np.ndarray) -> np.ndarray | None:
         audio = np.ascontiguousarray(audio_16k_mono, dtype=np.float32)
         total_s = len(audio) / TARGET_RATE
-        spans = get_speech_timestamps(
+        spans = self._get_speech_timestamps(
             audio,
             self._model,
             threshold=self.threshold,

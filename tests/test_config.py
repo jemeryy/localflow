@@ -204,3 +204,73 @@ def test_overlay_visibility_and_position_validation(tmp_path):
     p.write_text("overlay_position = [1, 2, 3]\n", encoding="utf-8")
     with pytest.raises(ValueError):
         config.load_config(p)
+
+
+def test_max_utterance_s_default_and_validation(tmp_path):
+    assert config.Config().max_utterance_s == 300.0
+
+    p = tmp_path / "localflow.toml"
+    p.write_text("max_utterance_s = 0\n", encoding="utf-8")     # 0 = unlimited
+    assert config.load_config(p).max_utterance_s == 0.0
+
+    p.write_text("max_utterance_s = 120\n", encoding="utf-8")
+    assert config.load_config(p).max_utterance_s == 120.0
+
+    p.write_text("max_utterance_s = -5\n", encoding="utf-8")    # negative
+    with pytest.raises(ValueError):
+        config.load_config(p)
+
+    p.write_text("max_utterance_s = 99999\n", encoding="utf-8")  # over 1h cap
+    with pytest.raises(ValueError):
+        config.load_config(p)
+
+
+def test_stt_language_default_and_load(tmp_path):
+    assert config.Config().stt_language == "en"
+    p = tmp_path / "localflow.toml"
+    p.write_text('stt_language = "auto"\n', encoding="utf-8")
+    assert config.load_config(p).stt_language == "auto"
+    p.write_text('stt_language = "fr"\n', encoding="utf-8")
+    assert config.load_config(p).stt_language == "fr"
+
+
+def test_filter_hallucinations_default_and_load(tmp_path):
+    assert config.Config().filter_hallucinations is True
+    p = tmp_path / "localflow.toml"
+    p.write_text("filter_hallucinations = false\n", encoding="utf-8")
+    assert config.load_config(p).filter_hallucinations is False
+
+
+def test_auto_gain_default_and_load(tmp_path):
+    assert config.Config().auto_gain is True
+    p = tmp_path / "localflow.toml"
+    p.write_text("auto_gain = false\n", encoding="utf-8")
+    assert config.load_config(p).auto_gain is False
+
+
+def test_stt_language_is_restart_only():
+    from localflow.desktop.app import RESTART_KEYS
+    assert "stt_language" in RESTART_KEYS
+
+
+def test_segment_seconds_default_and_validation(tmp_path):
+    assert config.Config().segment_seconds == 30.0
+
+    p = tmp_path / "localflow.toml"
+    p.write_text("segment_seconds = 0\n", encoding="utf-8")       # off
+    assert config.load_config(p).segment_seconds == 0.0
+
+    p.write_text("segment_seconds = 45\n", encoding="utf-8")
+    assert config.load_config(p).segment_seconds == 45.0
+
+    p.write_text("segment_seconds = 5\n", encoding="utf-8")       # too choppy
+    with pytest.raises(ValueError):
+        config.load_config(p)
+
+    p.write_text("segment_seconds = -1\n", encoding="utf-8")      # negative
+    with pytest.raises(ValueError):
+        config.load_config(p)
+
+    p.write_text("segment_seconds = 900\n", encoding="utf-8")     # over the cap
+    with pytest.raises(ValueError):
+        config.load_config(p)

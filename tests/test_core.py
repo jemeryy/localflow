@@ -153,12 +153,33 @@ def test_transcribe_audio_end_to_end_on_gpu(engine):
     from localflow.core import VadGate, transcribe_audio
 
     audio, _ = sf.read(TEST_WAV, dtype="float32")
-    result = transcribe_audio(audio, engine, vad=VadGate())
+    transcribe_audio(audio, engine, vad=VadGate())              # warm the decode
+    result = transcribe_audio(audio, engine, vad=VadGate())     # filter on (default)
     assert result.device == "GPU", "expected the iGPU on the target machine"
     assert "quick brown fox" in result.raw_text.lower()
-    assert result.stt_ms < 2_000
+    # The timestamp-based filter (default on) both KEEPS the real final word
+    # and DROPS the trailing-silence hallucination this TTS clip provokes.
+    assert "windows" in result.raw_text.lower()
+    assert "thank you" not in result.raw_text.lower()
+    assert result.stt_ms < 2_000                                # warm, with timestamps
     assert result.clean_text is None and result.cleanup_ms is None
     assert result.duration_s > 1.0
+
+
+@needs_model
+@needs_wav
+def test_filter_off_is_the_fast_path(engine):
+    """filter_hallucinations=false skips timestamps — the fast decode."""
+    import soundfile as sf
+
+    from localflow.core import VadGate, transcribe_audio
+
+    audio, _ = sf.read(TEST_WAV, dtype="float32")
+    transcribe_audio(audio, engine, vad=VadGate(), filter_hallucinations=False)
+    result = transcribe_audio(audio, engine, vad=VadGate(),
+                              filter_hallucinations=False)
+    assert "quick brown fox" in result.raw_text.lower()
+    assert result.stt_ms < 1_500
 
 
 @needs_model

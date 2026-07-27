@@ -3,12 +3,26 @@
 
 hotkey = "alt+`"          # hold-to-talk combo, e.g. "alt+`", "ctrl+space", "f9"
 stt_model_dir = "models/whisper-turbo-ov"
+stt_language = "en"       # "en", "auto" (detect each time), or a Whisper code
+                          # like "fr"/"es"/"de"/"zh"/"ja". Restart to apply.
 device = "GPU"            # GPU | NPU | CPU
 fallback_device = "CPU"
 cache_dir = "models/ov_cache"
 inject_mode = "paste"     # paste (clipboard+Ctrl+V) | type (keystrokes, slower)
 restore_delay_ms = 500    # clipboard restore delay; raise it if a slow app
                           # ever pastes your OLD clipboard instead of speech
+max_utterance_s = 300     # longest single hold-to-talk (seconds). Whisper
+                          # stitches long audio itself, so talk for minutes;
+                          # 0 = no limit. Also editable in Settings.
+segment_seconds = 30      # Tier 1: past this many seconds of one hold, cut at
+                          # a silence and transcribe that piece while you keep
+                          # talking (short wait on release). 0 = off.
+live_typing = true        # type words into the focused app ~1-2s behind your
+                          # voice, then correct the ending when you stop. Also
+                          # enables tap-to-toggle (tap to start, tap to stop,
+                          # Esc cancels) and blanks the keyboard while
+                          # dictating. false = the v1.1 way: hold to talk, one
+                          # paste on release. Also editable in Settings.
 overlay_enabled = true    # Wispr-style waveform pill while recording (FR-2)
 cleanup_enabled = false   # LLM cleanup: removes filler, fixes punctuation.
                           # false = NOT loaded at startup (saves ~2-3GB memory
@@ -34,5 +48,9 @@ hot_words = []
 overlay_visibility = "always"
 pill_size = 1.01
 vad_threshold = 0.42
+filter_hallucinations = true  # drop the stray word Whisper appends on trailing
+                          # silence (uses timestamps; also stops the real last
+                          # word dropping; ~2x STT time). false = faster, no fix
+tts_volume = 0.8
 
 [replacements]

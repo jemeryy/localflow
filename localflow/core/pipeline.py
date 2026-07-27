@@ -10,6 +10,11 @@ import numpy as np
 
 from .audio import TARGET_RATE
 from .cleanup import CleanupEngine
+from .hallucination import (
+    collapse_repeats,
+    drop_trailing_hallucinated_chunks,
+    strip_hallucinations,
+)
 from .preprocess import AudioPreprocessor
 from .stt import SttEngine
 from .vad import VadGate
@@ -34,15 +39,20 @@ def transcribe_audio(
     cleanup: CleanupEngine | None = None,
     vad: VadGate | None = None,
     preprocess: AudioPreprocessor | None = None,
+    filter_hallucinations: bool = True,
 ) -> TranscriptResult:
     """Run the core pipeline: (optional) preprocess -> (optional) VAD trim ->
-    STT -> (optional) cleanup.
+    STT -> hallucination filter -> (optional) cleanup.
 
     Preprocessing (high-pass / denoise / normalize) runs first, on the full
     buffer, so the noise estimate can see the non-speech regions and both the
     VAD and Whisper receive the cleaned signal. If the VAD gate then finds no
     speech, returns a result with raw_text == "" and zero timings — callers
     must treat that as "produce no output" (FR-4).
+
+    `filter_hallucinations` strips Whisper's trailing-silence artifacts (a
+    detached trailing "You.", or a whole-utterance stock phrase) from the raw
+    text before cleanup; a gated whole-utterance becomes "" (paste nothing).
     """
     audio = np.ascontiguousarray(audio_16k_mono, dtype=np.float32)
 
@@ -59,7 +69,20 @@ def transcribe_audio(
         audio = trimmed
 
     duration_s = len(audio) / TARGET_RATE
-    raw_text, meta = stt.transcribe(audio)
+    # Timestamps let us drop trailing silence hallucinations by their timing
+    # (a stray word/phrase Whisper appends to the tail); only worth the ~2x
+    # decode cost when the filter is on.
+    raw_text, meta = stt.transcribe(audio, timestamps=filter_hallucinations)
+
+    if filter_hallucinations and raw_text:
+        original = raw_text
+        chunks = meta.get("chunks")
+        if chunks:
+            raw_text = drop_trailing_hallucinated_chunks(chunks, duration_s)
+        raw_text = collapse_repeats(raw_text)       # decode-loop repeats
+        raw_text = strip_hallucinations(raw_text)   # whole-utterance backstop
+        if raw_text != original:
+            log.info("hallucination filter: %r -> %r", original, raw_text)
 
     clean_text: str | None = None
     cleanup_ms: int | None = None

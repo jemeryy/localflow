@@ -5,6 +5,8 @@ The live end-to-end injection check is scripts/m3_inject_check.py.
 
 from __future__ import annotations
 
+import time as _time
+
 import numpy as np
 import pytest
 
@@ -73,6 +75,36 @@ def test_stream_recorder_caps_at_max_seconds(recorder):
         recorder._on_chunk(_chunk(0.0), 1600, None, None)
     audio, _ = recorder.stop()
     assert len(audio) == 16_000  # FR-3: exactly the cap, rest discarded
+
+
+def test_stream_recorder_unlimited_never_caps(monkeypatch):
+    """max_seconds <= 0 = unlimited: the callback keeps every frame however
+    long the key is held (memory grows, no discard)."""
+    from localflow.desktop import capture
+
+    monkeypatch.setattr(capture.sd, "query_devices", _fake_query_devices)
+    monkeypatch.setattr(capture.sd, "InputStream", _FakeStream)
+    rec = capture.StreamRecorder(max_seconds=0, preroll_s=0.2)
+    assert rec._max_frames is None
+    rec.start()
+    for _ in range(30):  # 3s against a 1s-ish machine cap would truncate
+        rec._on_chunk(_chunk(0.5), 1600, None, None)
+    audio, _ = rec.stop()
+    assert len(audio) == 30 * 1600            # nothing discarded
+
+
+def test_set_max_seconds_updates_cap_live(recorder):
+    """set_max_seconds recomputes the frame limit against the current rate;
+    0 flips to unlimited. Takes effect on the NEXT dictation."""
+    recorder.set_max_seconds(2.0)
+    assert recorder._max_frames == 2 * 16_000
+    recorder.start()
+    for _ in range(25):  # 2.5s against the new 2.0s cap
+        recorder._on_chunk(_chunk(0.0), 1600, None, None)
+    audio, _ = recorder.stop()
+    assert len(audio) == 2 * 16_000
+    recorder.set_max_seconds(0)
+    assert recorder._max_frames is None
 
 
 def test_stream_recorder_stop_without_start_is_safe(recorder):
@@ -179,12 +211,21 @@ def test_push_to_talk_fires_on_hold_and_release():
 # ---- M4 ----------------------------------------------------------------
 
 
-def _bare_app(recorder=None, on_state=None):
+def _hold_mode(app, tap_max_s=0.0):
+    """Drive this app's hotkey as a HOLD (v1.1 push-to-talk). tap_max_s=0
+    makes every key-up a hold release, so a down/up pair still means "one
+    dictation" without a real 0.3s wait (M11). The tap-to-toggle path has
+    its own tests."""
+    app._gate.tap_max_s = tap_max_s
+    return app
+
+
+def _bare_app(recorder=None, on_state=None, tap_max_s=0.0):
     from localflow.desktop.app import LocalFlowApp
 
     # engine/vad are only touched inside _process, which these tests avoid
-    return LocalFlowApp(engine=None, vad=None, recorder=recorder,
-                        on_state=on_state)
+    return _hold_mode(LocalFlowApp(engine=None, vad=None, recorder=recorder,
+                                   on_state=on_state), tap_max_s)
 
 
 def test_latency_summary_percentiles():
@@ -211,6 +252,33 @@ def test_state_callbacks_fire_on_hotkey_and_survive_errors(recorder):
 
     app.on_state = boom
     app._set_state("idle")                   # must not raise
+
+
+def test_no_output_hook_fires_when_dictation_yields_no_text():
+    """Jeremy 11 Jul: a dictation that produces nothing (silence gate,
+    garbage decode, dead mic) must give visible feedback - the pill flash
+    hook fires on every no-output path, with a mic-specific message when
+    the recorder delivered zero frames."""
+    import time as _time
+
+    app = _bare_app()
+    notes: list[str] = []
+    app.on_no_output = notes.append
+
+    app._finish_dictation([], 0, "?", _time.perf_counter(), had_audio=True)
+    assert notes and "heard" in notes[-1].lower()      # silence/gated path
+
+    app._finish_dictation([], 0, "?", _time.perf_counter(), had_audio=False)
+    assert "mic" in notes[-1].lower()                  # dead-mic path
+
+    app.on_no_output = None                            # unwired: no crash
+    app._finish_dictation([], 0, "?", _time.perf_counter(), had_audio=True)
+
+    def boom(message):
+        raise RuntimeError("overlay gone")
+
+    app.on_no_output = boom                            # broken: must not raise
+    app._finish_dictation([], 0, "?", _time.perf_counter(), had_audio=True)
 
 
 def test_bar_heights_pads_scales_and_clamps():
@@ -698,7 +766,8 @@ def test_worker_waits_for_warm_event(monkeypatch):
 
     transcribed: list[str] = []
 
-    def fake_transcribe(audio, engine, cleanup=None, vad=None, preprocess=None):
+    def fake_transcribe(audio, engine, cleanup=None, vad=None, preprocess=None,
+                        filter_hallucinations=True):
         transcribed.append("call")
         return types.SimpleNamespace(raw_text="hello", clean_text=None,
                                      cleanup_ms=None, stt_ms=1, device="CPU")
@@ -868,6 +937,8 @@ def test_apply_settings_dispatches_live_and_returns_restart():
         "hotkey": lambda v: calls.setdefault("hotkey", v),
         "preprocess": lambda: calls.setdefault("preprocess", True),
         "restore_delay": lambda v: calls.setdefault("restore_delay", v),
+        "max_utterance": lambda v: calls.setdefault("max_utterance", v),
+        "segment": lambda v: calls.setdefault("segment", v),
         "inject_mode": lambda v: calls.setdefault("inject_mode", v),
         "input_device": lambda v: calls.setdefault("input_device", v),
         "visibility": lambda v: calls.setdefault("visibility", v),
@@ -878,6 +949,8 @@ def test_apply_settings_dispatches_live_and_returns_restart():
         "hotkey": "f9",
         "denoise_strength": 0.3,
         "restore_delay_ms": 700,
+        "max_utterance_s": 0.0,
+        "segment_seconds": 45.0,
         "inject_mode": "type",
         "input_device": "Samsung",
         "overlay_visibility": "dictating",
@@ -890,6 +963,8 @@ def test_apply_settings_dispatches_live_and_returns_restart():
     assert calls["hotkey"] == "f9"
     assert calls["preprocess"] is True
     assert calls["restore_delay"] == 0.7
+    assert calls["max_utterance"] == 0.0
+    assert calls["segment"] == 45.0
     assert calls["inject_mode"] == "type"
     assert calls["input_device"] == "Samsung"
     assert calls["visibility"] == "dictating"
@@ -938,7 +1013,6 @@ def test_mic_test_suppresses_hotkey_down_and_its_release(recorder):
     app.toggle_recording()                    # pill click also refused
     assert recorder.recording
     app.mic_test_active = False
-    app._hotkey_suppressed = False
     recorder.stop()
     # normal dictation works again afterwards
     app.on_hotkey_down()
@@ -976,3 +1050,769 @@ def test_mic_watcher_on_switch_fires_after_swap(recorder, monkeypatch):
     current["id"] = "mic-B"
     assert watcher.check_once() is True          # swapped...
     assert fired == [1]                          # ...and the app was told
+
+
+# -- Tier 1: VAD-segmented streaming ----------------------------------------
+
+
+def _unlimited_recorder(monkeypatch):
+    """A recorder with no per-utterance cap, so drain/snapshot tests are not
+    truncated by max_seconds while feeding many chunks."""
+    from localflow.desktop import capture
+
+    monkeypatch.setattr(capture.sd, "query_devices", _fake_query_devices)
+    monkeypatch.setattr(capture.sd, "InputStream", _FakeStream)
+    return capture.StreamRecorder(max_seconds=0, preroll_s=0.2)
+
+
+def test_drain_segment_keeps_remainder(monkeypatch):
+    """drain_segment hands back the front of the buffer and KEEPS the tail as
+    the next segment's start, so consecutive segments are contiguous."""
+    rec = _unlimited_recorder(monkeypatch)
+    rec.start()
+    for i in range(10):                          # chunks tagged 0..9
+        rec._on_chunk(_chunk(float(i)), 1600, None, None)
+    assert rec.buffered_frames() == 10 * 1600
+
+    seg = rec.drain_segment(4 * 1600)            # take the first four chunks
+    assert len(seg) == 4 * 1600
+    assert float(seg[0]) == 0.0 and float(seg[-1]) == 3.0
+    assert rec.buffered_frames() == 6 * 1600     # tail kept
+
+    audio, _ = rec.stop()                        # remainder flows on unbroken
+    assert len(audio) == 6 * 1600
+    assert float(audio[0]) == 4.0 and float(audio[-1]) == 9.0
+
+
+def test_drain_segment_empty_when_not_recording(monkeypatch):
+    """A cut that races stop() must return nothing, so no stray segment is
+    ever enqueued after the on-release final."""
+    rec = _unlimited_recorder(monkeypatch)
+    assert len(rec.drain_segment(1600)) == 0     # never started
+    rec.start()
+    rec._on_chunk(_chunk(1.0), 1600, None, None)
+    rec.stop()                                   # recording ends, buffer emptied
+    assert len(rec.drain_segment(1600)) == 0
+
+
+def test_snapshot_is_a_copy_and_does_not_stop(monkeypatch):
+    rec = _unlimited_recorder(monkeypatch)
+    rec.start()
+    for _ in range(3):
+        rec._on_chunk(_chunk(0.5), 1600, None, None)
+    snap = rec.snapshot()
+    assert len(snap) == 3 * 1600
+    assert rec.recording                         # still going
+    rec._on_chunk(_chunk(0.5), 1600, None, None)
+    assert len(rec.snapshot()) == 4 * 1600       # live buffer grew...
+    assert len(snap) == 3 * 1600                 # ...the old copy did not
+
+
+def test_emit_segment_guards_id_and_recording(recorder):
+    """emit_segment only drains for the current, still-recording dictation -
+    a stale id (a cut from a prior hold) or a finished hold is refused."""
+    app = _bare_app(recorder=recorder)
+    recorder.open()
+    assert app.emit_segment(1600, app._dictation_id) is False  # not recording
+    app.on_hotkey_down()
+    recorder._on_chunk(_chunk(1.0), 1600, None, None)
+    assert app.emit_segment(1600, 999) is False                # wrong dictation
+    assert app._work.qsize() == 0
+    assert app.emit_segment(1600, app._dictation_id) is True
+    assert app._work.qsize() == 1
+
+
+def test_multi_segment_dictation_joins_and_pastes_once(recorder, monkeypatch):
+    """Mid-dictation segments are transcribed during the hold and their texts
+    accumulate; the on-release final joins them and pastes ONCE, in order."""
+    import types
+
+    from localflow.desktop import app as app_module
+
+    pasted: list[str] = []
+
+    def fake_transcribe(audio, engine, cleanup=None, vad=None, preprocess=None,
+                        filter_hallucinations=True):
+        # encode the segment's first sample so ordering is checkable
+        return types.SimpleNamespace(
+            raw_text=f"part{int(round(float(audio[0])))}", clean_text=None,
+            cleanup_ms=None, stt_ms=5, device="CPU")
+
+    monkeypatch.setattr(app_module, "ensure_16k_mono", lambda a, r: a)
+    monkeypatch.setattr(app_module, "transcribe_audio", fake_transcribe)
+    monkeypatch.setattr(app_module, "inject_text",
+                        lambda text, **k: pasted.append(text) or True)
+
+    app = _hold_mode(app_module.LocalFlowApp(engine=object(), vad=None,
+                                             recorder=recorder))
+    app.warm.set()
+    app.start_worker()
+    recorder.open()
+
+    app.on_hotkey_down()                          # dictation begins
+    recorder._on_chunk(_chunk(1.0), 1600, None, None)
+    assert app.emit_segment(1600, app._dictation_id) is True     # part1
+    recorder._on_chunk(_chunk(2.0), 1600, None, None)
+    assert app.emit_segment(1600, app._dictation_id) is True     # part2
+    recorder._on_chunk(_chunk(3.0), 1600, None, None)            # final tail
+    app.on_hotkey_up()                            # part3 + flush
+
+    assert _wait(lambda: len(pasted) == 1)
+    assert pasted[0] == "part1 part2 part3"
+    assert app.latencies_ms and len(app.latencies_ms) == 1       # one paste
+
+
+def test_segment_worker_cleanup_runs_once_on_joined_text(recorder, monkeypatch):
+    """Cleanup is applied ONCE to the joined transcript, not per segment."""
+    import types
+
+    from localflow.desktop import app as app_module
+
+    cleaned: list[str] = []
+    pasted: list[str] = []
+
+    def fake_transcribe(audio, engine, cleanup=None, vad=None, preprocess=None,
+                        filter_hallucinations=True):
+        assert cleanup is None                    # segments never carry cleanup
+        return types.SimpleNamespace(
+            raw_text=f"p{int(round(float(audio[0])))}", clean_text=None,
+            cleanup_ms=None, stt_ms=3, device="CPU")
+
+    class Cleanup:
+        def clean(self, text):
+            cleaned.append(text)
+            return text.upper()
+
+    monkeypatch.setattr(app_module, "ensure_16k_mono", lambda a, r: a)
+    monkeypatch.setattr(app_module, "transcribe_audio", fake_transcribe)
+    monkeypatch.setattr(app_module, "inject_text",
+                        lambda text, **k: pasted.append(text) or True)
+
+    app = _hold_mode(app_module.LocalFlowApp(engine=object(), vad=None,
+                                             recorder=recorder,
+                                             cleanup=Cleanup()))
+    app.warm.set()
+    app.start_worker()
+    recorder.open()
+
+    app.on_hotkey_down()
+    recorder._on_chunk(_chunk(1.0), 1600, None, None)
+    assert app.emit_segment(1600, app._dictation_id) is True
+    recorder._on_chunk(_chunk(2.0), 1600, None, None)
+    app.on_hotkey_up()
+
+    assert _wait(lambda: len(pasted) == 1)
+    assert cleaned == ["p1 p2"]                   # cleaned once, joined
+    assert pasted[0] == "P1 P2"
+
+
+def test_last_text_records_final_transcript(recorder, monkeypatch):
+    """app.last_text holds the last dictation's final text so the pill's
+    "Copy last dictation" can recover it — set independent of history."""
+    import types
+
+    from localflow.desktop import app as app_module
+
+    def fake_transcribe(audio, engine, cleanup=None, vad=None, preprocess=None,
+                        filter_hallucinations=True):
+        return types.SimpleNamespace(raw_text="hello world", clean_text=None,
+                                     cleanup_ms=None, stt_ms=5, device="CPU")
+
+    monkeypatch.setattr(app_module, "ensure_16k_mono", lambda a, r: a)
+    monkeypatch.setattr(app_module, "transcribe_audio", fake_transcribe)
+    monkeypatch.setattr(app_module, "inject_text", lambda text, **k: True)
+
+    app = _hold_mode(app_module.LocalFlowApp(engine=object(), vad=None,
+                                             recorder=recorder))
+    app.warm.set()
+    app.start_worker()
+    recorder.open()
+
+    assert app.last_text is None
+    app.on_hotkey_down()
+    recorder._on_chunk(_chunk(1.0), 1600, None, None)
+    app.on_hotkey_up()
+    assert _wait(lambda: app.last_text == "hello world")
+
+
+def test_last_text_survives_a_failed_paste(recorder, monkeypatch):
+    """The recover-the-text case: even when injection reports failure (the
+    target wasn't focused), last_text still holds the transcript."""
+    import types
+
+    from localflow.desktop import app as app_module
+
+    def fake_transcribe(audio, engine, cleanup=None, vad=None, preprocess=None,
+                        filter_hallucinations=True):
+        return types.SimpleNamespace(raw_text="lost words", clean_text=None,
+                                     cleanup_ms=None, stt_ms=5, device="CPU")
+
+    monkeypatch.setattr(app_module, "ensure_16k_mono", lambda a, r: a)
+    monkeypatch.setattr(app_module, "transcribe_audio", fake_transcribe)
+    monkeypatch.setattr(app_module, "inject_text", lambda text, **k: False)
+
+    app = _hold_mode(app_module.LocalFlowApp(engine=object(), vad=None,
+                                             recorder=recorder))
+    app.warm.set()
+    app.start_worker()
+    recorder.open()
+    app.on_hotkey_down()
+    recorder._on_chunk(_chunk(1.0), 1600, None, None)
+    app.on_hotkey_up()
+    assert _wait(lambda: app.last_text == "lost words")
+    assert not app.latencies_ms                   # nothing pasted
+
+
+def test_filter_hallucinations_flag_reaches_transcribe(recorder, monkeypatch):
+    """app.filter_hallucinations is threaded through to transcribe_audio so a
+    live settings toggle takes effect on the next dictation."""
+    import types
+
+    from localflow.desktop import app as app_module
+
+    seen: dict = {}
+
+    def fake_transcribe(audio, engine, cleanup=None, vad=None, preprocess=None,
+                        filter_hallucinations=True):
+        seen["flag"] = filter_hallucinations
+        return types.SimpleNamespace(raw_text="hi", clean_text=None,
+                                     cleanup_ms=None, stt_ms=1, device="CPU")
+
+    monkeypatch.setattr(app_module, "ensure_16k_mono", lambda a, r: a)
+    monkeypatch.setattr(app_module, "transcribe_audio", fake_transcribe)
+    monkeypatch.setattr(app_module, "inject_text", lambda text, **k: True)
+
+    app = _hold_mode(app_module.LocalFlowApp(engine=object(), vad=None,
+                                             recorder=recorder))
+    app.filter_hallucinations = False
+    app.warm.set()
+    app.start_worker()
+    recorder.open()
+    app.on_hotkey_down()
+    recorder._on_chunk(_chunk(1.0), 1600, None, None)
+    app.on_hotkey_up()
+    assert _wait(lambda: seen.get("flag") is False)
+
+
+def test_worker_waits_for_backgrounded_engine(recorder, monkeypatch):
+    """M11: the app is now built with engine=None (the model loads on the
+    background startup thread). The worker must block on app.warm until the
+    engine arrives, never transcribing with a None engine, then flush."""
+    import time
+    import types
+
+    from localflow.desktop import app as app_module
+
+    def fake_transcribe(audio, engine, cleanup=None, vad=None, preprocess=None,
+                        filter_hallucinations=True):
+        assert engine is not None      # never driven before the engine is set
+        return types.SimpleNamespace(raw_text="deferred", clean_text=None,
+                                     cleanup_ms=None, stt_ms=1, device="CPU")
+
+    monkeypatch.setattr(app_module, "ensure_16k_mono", lambda a, r: a)
+    monkeypatch.setattr(app_module, "transcribe_audio", fake_transcribe)
+    pasted: list[str] = []
+    monkeypatch.setattr(app_module, "inject_text",
+                        lambda text, **k: pasted.append(text) or True)
+
+    app = _hold_mode(app_module.LocalFlowApp(None, None, recorder))  # engine=None
+    assert not app.warm.is_set()                          # not usable yet
+    app.start_worker()
+    recorder.open()
+    app.on_hotkey_down()
+    recorder._on_chunk(_chunk(1.0), 1600, None, None)
+    app.on_hotkey_up()                                    # queued behind warm
+    time.sleep(0.1)
+    assert pasted == []                                   # engine not ready -> waits
+    # the "startup thread" completes: engine + vad arrive, then warm is set
+    app.engine = object()
+    app.warm.set()
+    assert _wait(lambda: pasted == ["deferred"])
+
+
+def test_apply_settings_filter_hallucinations_is_live():
+    from localflow.desktop import config as config_mod
+    from localflow.desktop.app import apply_settings
+
+    cfg = config_mod.Config()
+    calls = {}
+    hooks = {"filter_hallucinations": lambda v: calls.setdefault("v", v)}
+    restart = apply_settings({"filter_hallucinations": False}, cfg, hooks)
+    assert restart == set()
+    assert calls["v"] is False
+    assert cfg.filter_hallucinations is False
+
+
+def test_apply_settings_stt_language_needs_restart():
+    from localflow.desktop import config as config_mod
+    from localflow.desktop.app import apply_settings
+
+    cfg = config_mod.Config()
+    restart = apply_settings({"stt_language": "fr"}, cfg, {})
+    assert restart == {"stt_language"}
+    assert cfg.stt_language == "fr"
+
+
+def test_segmenter_emits_a_cut_at_silence():
+    """The Segmenter finds a silence in a long buffer and calls emit with the
+    mapped native-frame cut. Uses a fake recorder + a stub VAD so no model or
+    mic is needed."""
+    import numpy as np
+
+    from localflow.core.audio import TARGET_RATE
+    from localflow.desktop.segmenter import Segmenter
+
+    rate = 16_000
+
+    class FakeRecorder:
+        recording = True
+        rate = 16_000
+
+        def buffered_frames(self):
+            return 30 * rate
+
+        def snapshot(self):
+            return np.zeros(30 * rate, dtype=np.float32)  # 30s (content unused)
+
+    class StubVad:
+        # speech 0-10s then 12-20s: an internal gap at 10-12s (cut ~11s) and a
+        # trailing gap 20-30s (cut ~25s) -> the last wins.
+        def speech_spans(self, audio16):
+            return [(0, 10 * TARGET_RATE), (12 * TARGET_RATE, 20 * TARGET_RATE)]
+
+    emitted: list[tuple[int, int]] = []
+    seg = Segmenter(FakeRecorder(), StubVad(),
+                    emit=lambda cut, did: emitted.append((cut, did)) or True,
+                    current_id=lambda: 7, segment_seconds=25.0)
+    seg._tick()
+    assert len(emitted) == 1
+    cut, did = emitted[0]
+    assert did == 7
+    assert cut == (20 * rate + 30 * rate) // 2    # trailing-gap midpoint, 25s
+
+
+def test_segmenter_dormant_when_disabled_or_too_short():
+    from localflow.desktop.segmenter import Segmenter
+
+    class FakeRecorder:
+        recording = True
+        rate = 16_000
+
+        def buffered_frames(self):
+            return 5 * 16_000                     # under any sane target
+
+    calls: list = []
+    seg = Segmenter(FakeRecorder(), object(),
+                    emit=lambda *a: calls.append(a) or True,
+                    current_id=lambda: 1, segment_seconds=0)  # off
+    seg._tick()
+    assert calls == []                            # disabled -> never scans
+    seg.set_segment_seconds(30.0)
+    seg._tick()
+    assert calls == []                            # 5s buffer < 30s target
+
+
+# ---- M12: streaming commit engine (preview loop) -------------------------
+
+
+def _livetyper(texts, window_s=5.0, dictating=True, typed=None):
+    """A LiveTyper over a fake recorder and a stub engine that returns
+    `texts` one per decode (the last one repeats). No model, no mic.
+    `typed` (a list) collects the chunks it would inject (M13)."""
+    import threading
+
+    import numpy as np
+
+    from localflow.desktop.livetyper import LiveTyper
+
+    class FakeRecorder:
+        rate = 16_000
+
+        def snapshot(self):
+            return np.zeros(int(window_s * 16_000), dtype=np.float32)
+
+    class StubEngine:
+        calls = 0
+
+        def transcribe(self, audio, timestamps=False):
+            assert timestamps is False        # preview is the fast path
+            text = texts[min(self.calls, len(texts) - 1)]
+            self.calls += 1
+            return text, {}
+
+    lt = LiveTyper(FakeRecorder(), engine_lock=threading.Lock(),
+                   is_dictating=lambda: dictating, current_id=lambda: 1,
+                   engine=StubEngine(),
+                   on_commit=None if typed is None else typed.append)
+    return lt
+
+
+def test_livetyper_commits_only_what_two_decodes_agree_on():
+    """LocalAgreement-2 end to end: the first decode commits nothing, then
+    each tick commits the prefix the previous decode already said."""
+    lt = _livetyper(["hello there",
+                     "hello there my",
+                     "hello there my friend indeed"])
+    lt._tick()
+    assert lt.text() == ""                    # one decode is not evidence
+    lt._tick()
+    assert lt.text() == "hello there"
+    lt._tick()
+    assert lt.text() == "hello there my"      # "friend indeed" not agreed yet
+
+
+def test_livetyper_skips_the_beat_when_the_engine_is_busy():
+    """A segment or final decode holding the engine lock must never make a
+    preview queue behind it - the tick is dropped."""
+    lt = _livetyper(["hello there", "hello there my"])
+    lt.engine_lock.acquire()
+    try:
+        lt._tick()
+        lt._tick()
+    finally:
+        lt.engine_lock.release()
+    assert lt.engine.calls == 0 and lt.text() == ""
+    lt._tick()
+    lt._tick()
+    assert lt.text() == "hello there"         # and it resumes cleanly after
+
+
+def test_livetyper_short_buffer_and_wrong_dictation_are_ignored():
+    lt = _livetyper(["hello there"], window_s=0.5)
+    lt._tick()
+    assert lt.engine.calls == 0               # under min_window_s: no decode
+
+    lt = _livetyper(["hello there", "hello there my"])
+    lt._tick()
+    lt._tick()
+    lt.on_cut(99)                             # a stale dictation's cut
+    lt.on_segment_text(99, "garbage")
+    assert lt.text() == "hello there"
+
+
+def test_livetyper_segment_cut_holds_commits_until_the_real_text_lands():
+    """A Tier 1 cut closes the window. The cut segment's real text belongs
+    BEFORE anything the new window commits, and typed text can't be inserted
+    after the fact - so the new window holds until reconciliation, then
+    commits normally. The stream stays append-only (M13)."""
+    typed: list[str] = []
+    lt = _livetyper(["hello there",
+                     "hello there my",
+                     "second part",
+                     "second part now",
+                     "second part now ok"], typed=typed)
+    lt._tick()
+    lt._tick()
+    assert lt.text() == "hello there"
+    lt.on_cut(1)                              # segmenter drained the buffer
+    lt._tick()
+    lt._tick()                                # would commit, but must wait
+    assert lt.text() == "hello there"
+    lt.on_segment_text(1, "Hello there, my friend.")
+    assert lt.text() == "hello there my friend."
+    lt._tick()                                # now the new window flows again
+    assert lt.text() == "hello there my friend. second part now"
+    assert "".join(typed) == lt.text()        # append-only, in order
+
+
+def test_livetyper_flushes_once_when_the_dictation_ends():
+    lt = _livetyper(["hello there", "hello there my"])
+    lt._tick()
+    lt._tick()
+    lt.is_dictating = lambda: False
+    lt._tick()
+    assert lt._flushed and lt.text() == "hello there"   # state kept for M13
+    lt._tick()                                          # no second flush
+    lt.is_dictating = lambda: True
+    lt.current_id = lambda: 2                 # a new dictation resets it all
+    lt._tick()
+    assert lt.text() == "" and not lt._flushed
+
+
+# ---- M13: live injection + final patch + the live_typing switch ----------
+
+
+def test_livetyper_types_every_commit_exactly_once_and_in_order():
+    """What the app receives IS the committed stream: chunks concatenate to
+    text(), with the joining space carried on the FOLLOWING chunk."""
+    typed: list[str] = []
+    lt = _livetyper(["hello there",
+                     "hello there my",
+                     "hello there my friend"], typed=typed)
+    lt._tick()
+    lt._tick()
+    assert typed == ["hello there"]           # no leading space on the first
+    lt._tick()
+    assert typed == ["hello there", " my"]
+    assert "".join(typed) == lt.text()
+
+
+def test_livetyper_close_stops_commits_that_land_after_the_stop():
+    """A preview decode started while recording finishes seconds later; a
+    commit typed after the final patch would be text nobody can take back."""
+    typed: list[str] = []
+    lt = _livetyper(["hello there", "hello there my"], typed=typed)
+    lt._tick()
+    lt.close(1)
+    lt._tick()                                # decode still ran; commit drops
+    assert typed == [] and lt.typed_for(1) == ""
+    assert lt.typed_for(99) == ""             # never patch another dictation
+
+
+def _patching_app(monkeypatch, typed_text, recorder=None):
+    """A bare app whose live typing already typed `typed_text`, with the
+    injectors captured instead of sent to Windows."""
+    from localflow.desktop import app as app_mod
+
+    sent: dict = {"patch": None, "paste": None}
+    monkeypatch.setattr(app_mod, "patch_text",
+                        lambda n, retype: sent.__setitem__("patch", (n, retype)))
+    monkeypatch.setattr(app_mod, "inject_text",
+                        lambda text, **kw: sent.__setitem__("paste", text) or True)
+
+    class StubLiveTyper:
+        def typed_for(self, dictation_id):
+            return typed_text if dictation_id == 5 else ""
+
+    app = _bare_app(recorder=recorder)
+    app.livetyper = StubLiveTyper()
+    return app, sent
+
+
+def test_finish_patches_the_live_typed_text_instead_of_pasting(monkeypatch):
+    """The words are already in the app, so the final pass backspaces the
+    divergent suffix and retypes it - no paste at all."""
+    app, sent = _patching_app(monkeypatch, "i rode a bike")
+    app._finish_dictation(["I wrote a book"], 10, "GPU", _time.perf_counter(),
+                          had_audio=True, dictation_id=5)
+    assert sent["paste"] is None
+    assert sent["patch"] == (len("i rode a bike"), "I wrote a book")
+
+
+def test_finish_sends_nothing_when_live_typing_already_matched(monkeypatch):
+    app, sent = _patching_app(monkeypatch, "hello there friend")
+    app._finish_dictation(["hello there friend"], 10, "GPU",
+                          _time.perf_counter(), had_audio=True, dictation_id=5)
+    assert sent == {"patch": None, "paste": None}
+    assert app.last_text == "hello there friend"      # still recorded
+
+
+def test_finish_takes_back_typed_text_the_final_pass_threw_away(monkeypatch):
+    """The preview typed a hallucinated tail the final pass filtered out.
+    Leaving it would put words in the document no dictation produced."""
+    app, sent = _patching_app(monkeypatch, "you")
+    app._finish_dictation([], 0, "GPU", _time.perf_counter(), had_audio=True,
+                          dictation_id=5)
+    assert sent["patch"] == (3, "")
+
+
+def test_finish_pastes_when_live_typing_never_ran(monkeypatch):
+    """live_typing off (or a dictation the preview never touched): the
+    LiveTyper reports nothing typed, so this is exactly the v1.1 paste."""
+    app, sent = _patching_app(monkeypatch, "i rode a bike")
+    app._finish_dictation(["I wrote a book"], 10, "GPU", _time.perf_counter(),
+                          had_audio=True, dictation_id=4)   # not the typed id
+    assert sent["patch"] is None and sent["paste"] == "I wrote a book"
+
+
+def test_live_typing_off_is_v1_1_hold_to_talk(recorder):
+    """The switch has to reach the interaction shell too: no tap toggle, no
+    keyboard suppression."""
+    import threading
+
+    from localflow.desktop.app import LocalFlowApp
+
+    suppress = threading.Event()
+    app = LocalFlowApp(engine=None, vad=None, recorder=recorder,
+                       suppress_keys=suppress)
+    app.set_live_typing(False)
+    app.on_hotkey_down()
+    assert recorder.recording
+    assert not suppress.is_set()                  # keyboard stays alive
+    app.on_hotkey_up()                            # a quick tap = a release
+    assert not recorder.recording and app._work.qsize() == 1
+
+    app.set_live_typing(True)
+    app.on_hotkey_down()
+    assert suppress.is_set()
+    app.on_hotkey_up()                            # < 0.3s = tap, latches on
+    assert recorder.recording
+
+
+def test_stop_closes_the_livetyper_before_the_final_is_queued(recorder):
+    """Ordering: nothing may commit (and type) once the audio is drained."""
+    app = _bare_app(recorder=recorder)
+    closed: list[int] = []
+    app.livetyper = type("Stub", (), {
+        "close": lambda _self, did: closed.append(did),
+        "typed_for": lambda _self, did: "",
+    })()
+    app.on_hotkey_down()
+    app.on_hotkey_up()
+    assert closed == [app._dictation_id]
+    app.on_hotkey_down()
+    app.cancel_dictation()                        # Esc closes it too
+    assert closed == [1, 2]
+
+
+# ---- M11: tap/hold gate, keyboard suppression, Esc cancel ----------------
+
+
+def _gate(tap_max_s=0.3):
+    from localflow.desktop.app import TapHoldGate
+
+    return TapHoldGate(tap_max_s=tap_max_s)
+
+
+def test_gate_hold_starts_and_stops_on_release():
+    from localflow.desktop.app import TapHoldGate as G
+
+    g = _gate()
+    assert g.key_down(0.0) == G.START
+    assert g.key_down(0.05) == G.NONE          # OS auto-repeat while held
+    assert g.active
+    assert g.key_up(1.2) == G.STOP             # long press = v1.1 hold
+    assert not g.active
+
+
+def test_gate_tap_latches_until_the_next_tap():
+    from localflow.desktop.app import TapHoldGate as G
+
+    g = _gate()
+    assert g.key_down(0.0) == G.START
+    assert g.key_up(0.12) == G.NONE            # tap: keep recording
+    assert g.active
+    assert g.key_down(5.0) == G.STOP           # second tap ends it...
+    assert g.key_up(5.4) == G.NONE             # ...and its release is a no-op
+    assert not g.active
+    assert g.key_down(6.0) == G.START          # and the next press is fresh
+
+
+def test_gate_cancel_and_click_paths():
+    from localflow.desktop.app import TapHoldGate as G
+
+    g = _gate()
+    assert g.cancel() == G.NONE                # nothing running
+    g.key_down(0.0)
+    assert g.cancel() == G.CANCEL              # Esc mid-hold
+    assert g.key_up(0.9) == G.NONE             # the still-held key is swallowed
+    assert not g.active
+
+    assert g.click() == G.START                # pill click toggles on...
+    assert g.click() == G.STOP                 # ...and off
+    g.click()
+    assert g.cancel() == G.CANCEL              # Esc also ends a clicked one
+
+
+def test_hotkey_tap_toggles_and_hold_still_pastes(recorder):
+    """M11 through the app: a quick tap latches recording on (nothing
+    enqueued yet), the next tap finishes it; a long press behaves exactly
+    like v1.1."""
+    states: list[str] = []
+    app = _bare_app(recorder=recorder, on_state=states.append, tap_max_s=0.3)
+    app.on_hotkey_down()
+    app.on_hotkey_up()                            # < 0.3s = tap
+    assert recorder.recording                     # latched on
+    assert app._work.qsize() == 0
+    app.on_hotkey_down()                          # second tap
+    assert not recorder.recording
+    app.on_hotkey_up()                            # swallowed
+    assert app._work.qsize() == 1
+    assert states == ["rec", "busy"]
+
+
+def test_esc_cancel_discards_the_dictation(recorder):
+    """Esc mid-dictation: recording stops, a cancelled final flushes the
+    accumulation, and nothing is pasted or remembered."""
+    from localflow.desktop.app import _Segment
+
+    app = _bare_app(recorder=recorder)
+    app.on_hotkey_down()
+    assert recorder.recording
+    app.cancel_dictation()
+    assert not recorder.recording
+    item = app._work.get_nowait()
+    assert item.final and item.cancelled and len(item.audio) == 0
+
+    app._pending_id = item.dictation_id
+    app._pending_texts = ["half a sentence"]
+    app._handle_segment(item)
+    assert app._pending_texts == []               # dropped, not pasted
+    assert app.last_text is None
+    # the swallowed key-up must not start or stop anything
+    app.on_hotkey_up()
+    assert app._work.qsize() == 0
+    assert isinstance(item, _Segment)
+
+
+def test_keyboard_suppression_spans_exactly_one_dictation(recorder, monkeypatch):
+    """The hook flag is set for the length of a dictation and cleared on
+    stop AND on cancel; the synthetic modifier clear fires once per start."""
+    from localflow.desktop import app as app_mod
+
+    cleared: list[int] = []
+    monkeypatch.setattr(app_mod, "clear_modifiers",
+                        lambda: cleared.append(1))
+    import threading
+
+    app = _bare_app(recorder=recorder)
+    app.suppress_keys = threading.Event()
+    app.on_hotkey_down()
+    assert app.suppress_keys.is_set() and cleared == [1]
+    app.on_hotkey_up()
+    assert not app.suppress_keys.is_set()
+
+    app.on_hotkey_down()
+    app.cancel_dictation()
+    assert not app.suppress_keys.is_set()
+    assert cleared == [1, 1]
+
+    # Esc frees the keyboard even if the gate thinks nothing is running.
+    app.suppress_keys.set()
+    app.cancel_dictation()
+    assert not app.suppress_keys.is_set()
+
+
+def test_key_filter_suppresses_everything_but_the_hotkey_and_esc():
+    """The low-level filter (M11): transparent when idle; while a dictation
+    runs it swallows every physical key, routing only the hotkey and Esc to
+    us. Never starts the real OS hook."""
+    import threading
+    import types
+
+    from pynput._util.win32 import SystemHook
+
+    from localflow.desktop.app import PushToTalkListener
+
+    events: list[str] = []
+    suppress = threading.Event()
+    ptt = PushToTalkListener("alt+`",
+                             lambda: events.append("start"),
+                             lambda: events.append("stop"),
+                             suppress=suppress,
+                             on_cancel=lambda: events.append("cancel"))
+    assert 0xA4 in ptt._vk_keys and 0xC0 in ptt._vk_keys  # lalt, backquote
+
+    def key(vk, flags=0):
+        return types.SimpleNamespace(vkCode=vk, flags=flags)
+
+    assert ptt._win32_filter(0x100, key(0x41)) is True       # idle: 'a' passes
+    assert ptt._win32_filter(0x100, key(0x41, flags=0x10)) is False  # injected
+
+    suppress.set()
+    with pytest.raises(SystemHook.SuppressException):        # 'a' is swallowed
+        ptt._win32_filter(0x100, key(0x41))
+    assert events == []
+    assert ptt._win32_filter(0x100, key(0x41, flags=0x10)) is False  # our typing
+
+    with pytest.raises(SystemHook.SuppressException):        # alt down
+        ptt._win32_filter(0x104, key(0xA4))
+    with pytest.raises(SystemHook.SuppressException):        # ` down
+        ptt._win32_filter(0x104, key(0xC0))
+    assert events == ["start"]                               # combo completed
+    with pytest.raises(SystemHook.SuppressException):        # ` up
+        ptt._win32_filter(0x105, key(0xC0))
+    assert events == ["start", "stop"]
+    with pytest.raises(SystemHook.SuppressException):        # Esc
+        ptt._win32_filter(0x100, key(0x1B))
+    assert events == ["start", "stop", "cancel"]

@@ -15,6 +15,8 @@ from __future__ import annotations
 import logging
 import threading
 
+from .micgain import COM_LOCK, com_release
+
 log = logging.getLogger("localflow.desktop.micwatch")
 
 _E_CAPTURE = 1   # EDataFlow.eCapture
@@ -24,9 +26,16 @@ _E_CONSOLE = 0   # ERole.eConsole — the plain "Default Device" in Settings
 def _default_endpoint_id() -> str:
     from pycaw.pycaw import AudioUtilities
 
-    enumerator = AudioUtilities.GetDeviceEnumerator()
-    device = enumerator.GetDefaultAudioEndpoint(_E_CAPTURE, _E_CONSOLE)
-    return str(device.GetId())
+    # COM_LOCK: never run pycaw COM concurrently with the auto-gain worker
+    # path (13 Jul _ctypes access-violation crashes — see micgain.py).
+    with COM_LOCK:
+        enumerator = device = None
+        try:
+            enumerator = AudioUtilities.GetDeviceEnumerator()
+            device = enumerator.GetDefaultAudioEndpoint(_E_CAPTURE, _E_CONSOLE)
+            return str(device.GetId())
+        finally:
+            com_release(device, enumerator)
 
 
 class DefaultMicWatcher:

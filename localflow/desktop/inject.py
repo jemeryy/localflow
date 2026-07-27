@@ -16,8 +16,10 @@ from pynput.keyboard import Controller, Key
 
 log = logging.getLogger("localflow.desktop.inject")
 
-# Modifier VKs for _wait_modifiers_released: shift, ctrl, alt, lwin, rwin.
-_MODIFIER_VKS = (0x10, 0x11, 0x12, 0x5B, 0x5C)
+# Modifier VKs -> the key that releases them: shift, ctrl, alt, lwin, rwin.
+_MODIFIER_KEYS = ((0x10, Key.shift), (0x11, Key.ctrl), (0x12, Key.alt),
+                  (0x5B, Key.cmd_l), (0x5C, Key.cmd_r))
+_MODIFIER_VKS = tuple(vk for vk, _ in _MODIFIER_KEYS)
 
 # FR-10(d): the target app reads the clipboard asynchronously after Ctrl+V
 # arrives — restoring too soon races the paste and the OLD clipboard content
@@ -54,6 +56,36 @@ def inject_text(text: str, mode: str = "paste",
     return True
 
 
+def type_text(text: str) -> None:
+    """Type `text` as keystrokes with NO modifier wait (M13 live typing).
+
+    The hotkey's Alt stays physically down for a whole hold-mode dictation,
+    so _wait_modifiers_released here would stall every commit for its full
+    timeout. Safe without it: pynput sends characters as KEYEVENTF_UNICODE,
+    which ignores modifier state entirely, and M11's clear_modifiers has
+    already told the focused app that Alt is up.
+    """
+    if text:
+        _keyboard.type(text)
+
+
+def patch_text(n_backspaces: int, retype: str) -> None:
+    """M13 final patch: delete the divergent suffix, type the correction.
+
+    Backspace is a real virtual key (unlike unicode typing), so the hotkey's
+    modifiers have to be out of the way first — Alt+Backspace is "undo" in
+    plenty of apps, not a delete. By this point the dictation has ended, so
+    the wait returns almost immediately.
+    """
+    if not n_backspaces and not retype:
+        return
+    _wait_modifiers_released()
+    for _ in range(n_backspaces):
+        _keyboard.tap(Key.backspace)
+    if retype:
+        _keyboard.type(retype)
+
+
 def _wait_modifiers_released(timeout_s: float = 1.5) -> None:
     """Block until the user's physical modifier keys are all up.
 
@@ -68,6 +100,24 @@ def _wait_modifiers_released(timeout_s: float = 1.5) -> None:
             return
         time.sleep(0.01)
     log.warning("modifier still held after %.1fs — injecting anyway", timeout_s)
+
+
+def clear_modifiers() -> None:
+    """Tell the focused app that every modifier is up (M11).
+
+    The Alt of alt+` stays physically down for the whole of a held dictation,
+    and anything typed into the app while Windows thinks Alt is down arrives
+    as Alt+key — menu accelerators and beeps, not text. One synthetic release
+    each fixes the app-visible state; the keyboard suppression that runs
+    alongside a dictation stops the OS auto-repeat from putting it back.
+    """
+    get_state = ctypes.windll.user32.GetAsyncKeyState
+    for vk, key in _MODIFIER_KEYS:
+        if get_state(vk) & 0x8000:
+            try:
+                _keyboard.release(key)
+            except Exception:
+                log.debug("could not release %r", key, exc_info=True)
 
 
 def _send_ctrl_v() -> None:

@@ -15,6 +15,7 @@ lives there and everything else is on its own thread.
 from __future__ import annotations
 
 import argparse
+import ctypes
 import gc
 import logging
 import os
@@ -22,6 +23,7 @@ import queue
 import sys
 import threading
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
@@ -31,18 +33,42 @@ from localflow.core import (
     AudioPreprocessor,
     SttEngine,
     VadGate,
+    collapse_repeats,
     ensure_16k_mono,
     estimate_noise_floor,
     high_pass,
     recommend_tuning,
+    to_language_token,
     transcribe_audio,
 )
 from localflow.core.dictionary import apply_replacements, mine_substitutions
+from localflow.core.live import patch_plan
 from localflow.desktop import config
 from localflow.desktop.capture import StreamRecorder
-from localflow.desktop.inject import inject_text
+from localflow.desktop.inject import (
+    clear_modifiers,
+    inject_text,
+    patch_text,
+    type_text,
+)
 
 log = logging.getLogger("localflow.desktop.app")
+
+
+@dataclass
+class _Segment:
+    """One unit of work on the worker queue (Tier 1). Mid-dictation segments
+    (final=False) are transcribed raw and their text accumulated; the final
+    one (produced on key-up) flushes the accumulation — join, cleanup,
+    dictionary, inject, history — exactly once. dictation_id groups the
+    segments of one hold together; t_release is stamped only on the final."""
+
+    audio: np.ndarray
+    rate: int
+    dictation_id: int
+    final: bool
+    t_release: float | None = None
+    cancelled: bool = False   # Esc (M11): flush the accumulation, paste nothing
 
 
 def _process_age_s() -> float | None:
@@ -85,19 +111,166 @@ def to_pynput_combo(combo: str) -> str:
     return "+".join(f"<{p}>" if len(p) > 1 else p for p in parts)
 
 
-class PushToTalkListener:
-    """Hold-to-record hotkey (FR-1): on_start fires when the full combo is
-    down, on_stop when any key of it is released. Push-to-talk, not toggle."""
+TAP_MAX_S = 0.3   # key-up within this of key-down = a tap, not a hold
 
-    def __init__(self, combo: str, on_start, on_stop):
+# Low-level keyboard hook constants (M11 suppression).
+_VK_ESCAPE = 0x1B
+_PRESS_MSGS = (0x0100, 0x0104)      # WM_KEYDOWN, WM_SYSKEYDOWN
+_RELEASE_MSGS = (0x0101, 0x0105)    # WM_KEYUP, WM_SYSKEYUP
+# LLKHF_INJECTED | LLKHF_LOWER_IL_INJECTED — a synthetic key, i.e. our own
+# typing or modifier clearing. Physical keys never set either bit.
+_INJECTED_FLAGS = 0x10 | 0x02
+# char -> vk for the hotkey's character key. Declared argtypes: without them
+# ctypes passes a str as a pointer and the call fails.
+_vk_key_scan = ctypes.windll.user32.VkKeyScanW
+_vk_key_scan.argtypes = (ctypes.c_wchar,)
+_vk_key_scan.restype = ctypes.c_short
+
+
+class TapHoldGate:
+    """Pure tap-vs-hold state machine for the dictation hotkey (M11).
+
+    Feed it key-downs, key-ups, pill clicks and Esc; it answers with the
+    action to take. A TAP (down and up inside `tap_max_s`) latches recording
+    on until the next tap, a pill click or Esc; a longer press is the v1.1
+    hold and ends on release. No OS, no threads, no clock of its own — the
+    caller passes the timestamp, so this is unit-testable.
+    """
+
+    START, STOP, CANCEL, NONE = "start", "stop", "cancel", "none"
+
+    def __init__(self, tap_max_s: float = TAP_MAX_S):
+        self.tap_max_s = tap_max_s
+        self._down_at: float | None = None   # set while the hotkey is held
+        self._latched = False                # tapped on; ends on the next tap
+        self._swallow_up = False             # the press that ended a dictation
+
+    @property
+    def active(self) -> bool:
+        return self._down_at is not None or self._latched
+
+    def key_down(self, now: float) -> str:
+        if self._latched:
+            # Second tap: end it here rather than on the release, so a long
+            # second press doesn't look like a fresh hold.
+            self._latched = False
+            self._swallow_up = True
+            return self.STOP
+        if self._down_at is not None:
+            return self.NONE                 # OS auto-repeat while held
+        self._down_at = now
+        return self.START
+
+    def key_up(self, now: float) -> str:
+        if self._swallow_up:
+            self._swallow_up = False
+            self._down_at = None
+            return self.NONE
+        if self._down_at is None:
+            return self.NONE
+        held, self._down_at = now - self._down_at, None
+        if held < self.tap_max_s:
+            self._latched = True             # tap: keep recording
+            return self.NONE
+        return self.STOP
+
+    def click(self) -> str:
+        """Pill click: a plain toggle, no key to wait on."""
+        if not self.active:
+            self._latched = True
+            return self.START
+        return self._end(self.STOP)
+
+    def cancel(self) -> str:
+        """Esc, or a start the app refused (mic test owns the recorder)."""
+        return self._end(self.CANCEL) if self.active else self.NONE
+
+    def _end(self, action: str) -> str:
+        if self._down_at is not None:
+            self._swallow_up = True          # the key is still physically down
+        self._down_at = None
+        self._latched = False
+        return action
+
+
+class PushToTalkListener:
+    """The dictation hotkey (FR-1). on_start fires when the full combo is
+    down, on_stop when any key of it is released — the app's TapHoldGate
+    turns that into hold-to-talk or tap-to-toggle (M11).
+
+    While `suppress` is set (a dictation is live) this also owns the physical
+    keyboard: every key is swallowed before the focused app sees it, except
+    the hotkey itself and Esc (`on_cancel`), which are handled here and
+    swallowed too. The hook dies with the process, so a crash can never leave
+    the keyboard dead."""
+
+    def __init__(self, combo: str, on_start, on_stop,
+                 suppress: threading.Event | None = None, on_cancel=None):
         self._combo = set(keyboard.HotKey.parse(to_pynput_combo(combo)))
         self._on_start = on_start
         self._on_stop = on_stop
+        self._on_cancel = on_cancel
+        self._suppress = suppress
         self._pressed: set = set()
         self._active = False
         self._listener = keyboard.Listener(
-            on_press=self._handle_press, on_release=self._handle_release
+            on_press=self._handle_press, on_release=self._handle_release,
+            win32_event_filter=self._win32_filter,
         )
+        self._vk_keys = self._combo_vk_map()
+
+    def _combo_vk_map(self) -> dict:
+        """Raw virtual-key code -> the combo key it stands for. The low-level
+        hook reports vks (left and right Alt are different codes), so this is
+        how the filter recognises the hotkey without pynput's key objects.
+        The values go back through _handle_press/_handle_release, which
+        canonicalise exactly as the normal on_press path does."""
+        canonical = self._listener.canonical
+        vks: dict = {}
+        for key in keyboard.Key:              # named keys, incl. alt_l/alt_r
+            vk = key.value.vk
+            if vk is not None and canonical(key) in self._combo:
+                vks[vk] = key
+        for key in self._combo:               # character keys, e.g. `
+            char = getattr(key, "char", None)
+            if char:
+                res = _vk_key_scan(char)
+                if res != -1:
+                    vks[res & 0xFF] = key     # low byte is the vk
+        return vks
+
+    def _win32_filter(self, msg, data):
+        """Low-level keyboard hook, called for EVERY key before the focused
+        app sees it (M11). Transparent when idle. While `suppress` is set the
+        keyboard is DEAD in the focused app: the hotkey and Esc are handled
+        here and swallowed along with everything else.
+
+        Return True = the key reaches the app AND on_press/on_release;
+        return False = the app only; suppress_event() = nobody. Errors fail
+        OPEN — a bug here must never leave the keyboard dead. Runs on the
+        hook thread under Windows' hook timeout, doing the same work the
+        on_press path already did on this same thread.
+        """
+        try:
+            if data.flags & _INJECTED_FLAGS:
+                # Text WE typed, or the modifier clear at dictation start.
+                # The app must get it; our hotkey handlers must not react.
+                return False
+            if self._suppress is None or not self._suppress.is_set():
+                return True
+            key = self._vk_keys.get(data.vkCode)
+            if key is not None:
+                if msg in _PRESS_MSGS:
+                    self._handle_press(key)
+                elif msg in _RELEASE_MSGS:
+                    self._handle_release(key)
+            elif data.vkCode == _VK_ESCAPE and msg in _PRESS_MSGS:
+                if self._on_cancel is not None:
+                    self._safely(self._on_cancel)
+        except Exception:
+            log.exception("key filter failed — letting the key through")
+            return True
+        self._listener.suppress_event()   # raises; the app never sees the key
 
     def _handle_press(self, key) -> None:
         k = self._listener.canonical(key)  # ctrl_l/ctrl_r -> ctrl, etc.
@@ -145,7 +318,8 @@ class LocalFlowApp:
                  recorder: StreamRecorder, inject_mode: str = "paste",
                  on_state=None, cleanup=None, restore_delay_s: float = 0.5,
                  preprocess: AudioPreprocessor | None = None,
-                 cleanup_loader=None):
+                 cleanup_loader=None,
+                 suppress_keys: threading.Event | None = None):
         self.engine = engine
         self.vad = vad
         self.recorder = recorder
@@ -154,6 +328,14 @@ class LocalFlowApp:
         # Audio cleanup (high-pass / denoise / normalize) before STT. None
         # means raw mic audio goes straight to the pipeline.
         self.preprocess = preprocess
+        # Drop Whisper's trailing-silence hallucinations (a stray "you" at the
+        # end, "thanks for watching", ...) before cleanup. Read per segment so
+        # a settings toggle applies live.
+        self.filter_hallucinations = True
+        # The last dictation's final text, for the pill's "Copy last dictation"
+        # menu (Jeremy: recover the text if the paste target wasn't focused).
+        # Kept in memory regardless of the history setting.
+        self.last_text: str | None = None
         # FR-8 sync clean mode. The LLM costs ~2-3GB of shared GPU memory and
         # seconds of load time, so by default it is NOT loaded at startup:
         # `cleanup_loader` (a zero-arg callable returning a CleanupEngine)
@@ -170,6 +352,11 @@ class LocalFlowApp:
         self.cleanup_active = cleanup is not None
         # FR-2 hook: called with 'idle' | 'rec' | 'busy' (tray sets this).
         self.on_state = on_state
+        # Called with a short message when a dictation produced NO text
+        # (silence gate, garbage decode, dead mic). Jeremy 11 Jul: without
+        # this the failure was invisible - no paste, no history, no cue.
+        # _run wires it to the pill's flash.
+        self.on_no_output = None
         self.latencies_ms: list[int] = []  # release-to-paste totals (AT-4)
         # M6: warmup (VadGate build + warm pass) runs on a background thread
         # after the hotkey goes live. `warm` gates the worker's first
@@ -191,14 +378,44 @@ class LocalFlowApp:
         # (found by review) - claim_mic_session() and on_hotkey_down both
         # decide under this lock, so exactly one owner wins.
         self.mic_session_lock = threading.Lock()
-        # A refused key-down must also swallow its key-up: the listener
-        # tracks the combo as active regardless, and an unpaired
-        # on_hotkey_up would stop (steal) the mic test's recording.
-        self._hotkey_suppressed = False
+        # M11: tap-to-toggle vs hold-to-talk, plus the keyboard suppression
+        # that runs for the length of a dictation. The gate also swallows the
+        # key-up of a refused key-down (the listener tracks the combo as
+        # active regardless, and an unpaired up would steal the mic test's
+        # recording). suppress_keys is None for tests and embedders: no hook
+        # is installed there, so no synthetic keys are ever sent.
+        self._gate = TapHoldGate()
+        self.suppress_keys = suppress_keys
+        # M13: live_typing off restores EXACTLY v1.1 — hold-to-talk (no tap
+        # toggle), no keyboard suppression, no preview loop, paste on release.
+        self.live_typing = True
         # M10: personal dictionary (applied after cleanup, before inject)
         # and the optional history store (None = history off, write nothing).
         self.replacements: dict[str, str] = {}
         self.history = None
+        # Tier 1 (VAD-segmented streaming). The segmenter cuts a long hold at
+        # silences and enqueues mid-dictation segments transcribed DURING the
+        # hold; the worker accumulates their raw texts and joins on release.
+        # None until _run() builds it (after warmup). _dictation_id groups a
+        # hold's segments; _produce_lock makes each drain+enqueue atomic so a
+        # mid cut can never race the on-release final past it on the queue.
+        self.segmenter = None
+        # M12: the streaming commit engine. Re-decodes the live buffer ~1/s
+        # and commits the words two decodes agree on. None until _run() builds
+        # it (after warmup); log-only in M12.
+        self.livetyper = None
+        self._dictation_id = 0
+        self._produce_lock = threading.Lock()
+        self._pending_id: int | None = None
+        self._pending_texts: list[str] = []
+        self._pending_stt_ms = 0
+        self._pending_stt_device = "?"
+        self._pending_had_audio = False
+        self._pending_peak = 0.0
+        # Auto mic gain (Jeremy 11 Jul): nudge the Windows input level after
+        # real-but-quiet dictations, like meeting apps do. OFF here so tests
+        # and embedders never touch COM; _run() arms it from cfg.auto_gain.
+        self.auto_gain = False
         self._work: queue.Queue = queue.Queue()
         self._worker = threading.Thread(target=self._drain, daemon=True)
 
@@ -210,6 +427,14 @@ class LocalFlowApp:
         except Exception:
             log.exception("state callback failed — app keeps running")
 
+    def _notify_no_output(self, message: str) -> None:
+        if self.on_no_output is None:
+            return
+        try:
+            self.on_no_output(message)
+        except Exception:
+            log.exception("no-output callback failed — app keeps running")
+
     def claim_mic_session(self) -> bool:
         """Atomically take the recorder for a mic test / calibration (M8/
         M9). False when a dictation is running or another session owns it;
@@ -220,45 +445,139 @@ class LocalFlowApp:
             self.mic_test_active = True
             return True
 
+    def set_live_typing(self, on: bool) -> None:
+        """M13's one switch. tap_max_s=0 makes every key-up a hold release,
+        which is what "no toggle mode" means; the pill click keeps toggling
+        (it did in v1.1 too). The preview loop reads live_typing through the
+        is_dictating hook _run gives it, so this also silences the typing."""
+        self.live_typing = bool(on)
+        self._gate.tap_max_s = TAP_MAX_S if on else 0.0
+
     def on_hotkey_down(self) -> None:
+        self._dispatch(self._gate.key_down(time.monotonic()))
+
+    def on_hotkey_up(self) -> None:
+        self._dispatch(self._gate.key_up(time.monotonic()))
+
+    def cancel_dictation(self) -> None:
+        """Esc while dictating: drop the audio, paste nothing. Frees the
+        keyboard unconditionally — Esc is the escape hatch, so it must work
+        even if the gate somehow thinks nothing is running."""
+        action = self._gate.cancel()
+        self._release_keyboard()
+        self._dispatch(action)
+
+    def _dispatch(self, action: str) -> None:
+        if action == TapHoldGate.START:
+            if not self._start_dictation():
+                self._gate.cancel()   # refused: swallow the matching key-up
+        elif action == TapHoldGate.STOP:
+            self._stop_dictation()
+        elif action == TapHoldGate.CANCEL:
+            self._cancel_dictation()
+
+    def _start_dictation(self) -> bool:
+        """Begin recording. False when the settings "Test mic"/"Calibrate"
+        owns the recorder — a dictation starting mid-test would truncate both
+        captures, so the caller rolls the gate back instead."""
         with self.mic_session_lock:
             if self.mic_test_active:
-                # The settings "Test mic"/"Calibrate" owns the recorder; a
-                # dictation starting mid-test would truncate both captures.
-                self._hotkey_suppressed = True
                 print("[--] mic test in progress - try again in a moment",
                       flush=True)
-                return
+                return False
+            # New dictation: bump the id so the segmenter and the final tag
+            # this hold's segments together (and a stale mid cut from a prior
+            # hold can never attach to this one).
+            self._dictation_id += 1
             self.recorder.start()
+        self._grab_keyboard()
         self._set_state("rec")
         # FR-2 indicator (tray dot; console line kept for --no-tray). ASCII
         # only: Windows consoles often run cp1252, which can't encode glyphs.
         print("[rec] recording - release to transcribe", flush=True)
+        return True
 
-    def on_hotkey_up(self) -> None:
-        if self._hotkey_suppressed:
-            self._hotkey_suppressed = False  # the matching refused key-down
-            return
-        audio, rate = self.recorder.stop()
+    def _stop_dictation(self) -> None:
+        self._release_keyboard()
+        # Atomic with any in-flight segment cut (Tier 1): stop() drains the
+        # whole remaining buffer as the FINAL segment while the produce lock is
+        # held, so a segmenter cut either lands fully before this or is refused
+        # (recording is now False) — never enqueued after the final.
+        with self._produce_lock:
+            audio, rate = self.recorder.stop()
+            self._close_livetyper()
+            self._work.put(_Segment(audio=audio, rate=rate,
+                                    dictation_id=self._dictation_id,
+                                    final=True, t_release=time.perf_counter()))
         self._set_state("busy")
-        # Hand off immediately: transcribe + inject must stay off the
-        # key-listener thread or held keys stop being tracked.
-        self._work.put((audio, rate, time.perf_counter()))
+
+    def _cancel_dictation(self) -> None:
+        """The captured audio is dropped here; a cancelled final still goes
+        on the queue so the worker flushes whatever mid-dictation segments
+        (Tier 1) it already accumulated instead of leaking them into the next
+        dictation. Segments already queued are still transcribed, then
+        discarded."""
+        with self._produce_lock:
+            self.recorder.stop()
+            self._close_livetyper()
+            self._work.put(_Segment(audio=np.zeros(0, dtype=np.float32),
+                                    rate=self.recorder.rate,
+                                    dictation_id=self._dictation_id,
+                                    final=True, cancelled=True))
+        self._set_state("busy")
+        print("[--] cancelled - nothing pasted", flush=True)
+
+    def _close_livetyper(self) -> None:
+        """M13: stop the preview committing the moment recording ends. A
+        decode started while recording lands seconds later, and a commit
+        typed AFTER the final patch would be text nobody can take back."""
+        if self.livetyper is not None:
+            self.livetyper.close(self._dictation_id)
+
+    def _grab_keyboard(self) -> None:
+        """M11: kill the physical keyboard for the length of the dictation and
+        clear the app-visible modifier state (the hotkey's Alt stays down
+        through a hold). No-op when no suppression event was supplied."""
+        if self.suppress_keys is None or not self.live_typing:
+            return
+        self.suppress_keys.set()
+        try:
+            clear_modifiers()
+        except Exception:
+            log.exception("could not clear held modifiers — typing into the "
+                          "focused app may misfire")
+
+    def _release_keyboard(self) -> None:
+        if self.suppress_keys is not None:
+            self.suppress_keys.clear()
+
+    def emit_segment(self, cut_frame: int, dictation_id: int) -> bool:
+        """Tier 1 (called by the Segmenter): atomically drain a mid-dictation
+        segment and enqueue it. Refused (False) if the hold already ended or
+        moved on to a new dictation since the segmenter scanned — the drain and
+        the enqueue happen together under the produce lock so ordering vs the
+        on-release final is guaranteed."""
+        with self._produce_lock:
+            if dictation_id != self._dictation_id or not self.recorder.recording:
+                return False
+            seg = self.recorder.drain_segment(cut_frame)
+            if len(seg) == 0:
+                return False
+            self._work.put(_Segment(audio=seg, rate=self.recorder.rate,
+                                    dictation_id=dictation_id, final=False))
+            if self.livetyper is not None:
+                # M12: that audio has left the buffer, so the preview window
+                # restarts here. Inside the produce lock for the same reason
+                # the enqueue is: a preview tick must never scan the drained
+                # buffer while still holding the pre-cut hypothesis.
+                self.livetyper.on_cut(dictation_id)
+        return True
 
     def toggle_recording(self) -> None:
         """Click-to-dictate (overlay): first call starts recording, second
         stops and transcribes. Runs on the overlay's Tk thread — both paths
         only flip the recorder and enqueue, same contract as the hotkey."""
-        if self.mic_test_active:
-            # recorder.recording is True DURING the mic test - a pill click
-            # must not stop (steal) the test capture.
-            print("[--] mic test in progress - try again in a moment",
-                  flush=True)
-            return
-        if self.recorder.recording:
-            self.on_hotkey_up()
-        else:
-            self.on_hotkey_down()
+        self._dispatch(self._gate.click())
 
     @property
     def cleanup_available(self) -> bool:
@@ -348,74 +667,253 @@ class LocalFlowApp:
             log.info("cleanup model loaded — cleanup is ON")
 
     def _drain(self) -> None:
+        # COM-initialize this worker thread (never uninitialized; the app
+        # hard-exits) so a cyclic GC that finalizes a pycaw/comtypes object
+        # here can't access-violate in _ctypes. Same guard as the overlay UI
+        # thread; micgain's auto-gain also runs on this thread.
+        try:
+            import comtypes
+            comtypes.CoInitialize()
+        except Exception:
+            log.debug("worker CoInitialize failed", exc_info=True)
         while True:
-            audio, rate, t_release = self._work.get()
+            item = self._work.get()
             try:
-                self._process(audio, rate, t_release)
+                if isinstance(item, tuple):
+                    # Legacy shape (audio, rate, t_release) = one complete
+                    # single-segment utterance. Kept so direct queue puts still
+                    # work exactly as before.
+                    audio, rate, t_release = item
+                    item = _Segment(audio=audio, rate=rate, dictation_id=-1,
+                                    final=True, t_release=t_release)
+                self._handle_segment(item)
             except Exception:
                 log.exception("utterance failed — app keeps running")
             finally:
                 # Back to idle only when nothing else is in flight: another
                 # dictation may be queued behind this one (likelier now that
                 # warmup can park the first), or the user may already be
-                # recording the next - never stomp those indicators.
+                # recording the next - never stomp those indicators. A held
+                # dictation whose mid-segments are being drained stays "rec".
                 if self._work.empty() and not (
                         self.recorder is not None and self.recorder.recording):
                     self._set_state("idle")
 
-    def _process(self, audio: np.ndarray, rate: int, t_release: float) -> None:
-        if len(audio) == 0:
-            # Zero frames from an open stream = wedged mic endpoint (seen
-            # live 3 Jul: Samsung USB delivered nothing to ANY process until
-            # replugged). Say so loudly instead of a silent no-paste.
-            log.warning("recording captured 0 frames from %r — the mic "
-                        "delivered no audio. If this repeats, replug the mic "
-                        "or change the Windows default input device.",
-                        self.recorder.device_name)
-            print("[--] nothing captured - mic delivered no audio", flush=True)
-            return
-        if not self.warm.is_set():
-            # A dictation in the first seconds after launch waits for the
-            # background warmup instead of racing it - the engine must NEVER
-            # be driven from two threads, so there is no timeout escape here.
-            # The warmup thread sets the event in a `finally`, so this wait
-            # always ends; the utterance runs later, it is never dropped.
-            log.info("dictation arrived before warmup finished - waiting")
-            print("[..] still warming up - transcribing shortly", flush=True)
-            self.warm.wait()
+    def _reset_pending(self, dictation_id: int | None) -> None:
+        self._pending_id = dictation_id
+        self._pending_texts = []
+        self._pending_stt_ms = 0
+        self._pending_stt_device = "?"
+        self._pending_had_audio = False
+        self._pending_peak = 0.0
+
+    def _handle_segment(self, item: _Segment) -> None:
+        """Worker step for one queued segment (Tier 1). Mid segments append
+        their raw text to the current dictation; the final one joins them and
+        runs cleanup + dictionary + inject + history once."""
+        if item.dictation_id != self._pending_id:
+            self._reset_pending(item.dictation_id)
+        seg_text = ""
+        if len(item.audio) > 0:
+            if not self.warm.is_set():
+                # A dictation in the first seconds after launch waits for the
+                # background warmup instead of racing it - the engine must
+                # NEVER be driven from two threads, so there is no timeout
+                # escape here. The warmup thread sets the event in a `finally`,
+                # so this wait always ends; the utterance is never dropped.
+                log.info("dictation arrived before warmup finished - waiting")
+                print("[..] still warming up - transcribing shortly", flush=True)
+                self.warm.wait()
+            self._pending_had_audio = True
+            self._pending_peak = max(self._pending_peak,
+                                     float(np.max(np.abs(item.audio))))
+            result = self._transcribe_segment(item.audio, item.rate)
+            seg_text = result.raw_text
+            if result.raw_text:
+                self._pending_texts.append(result.raw_text)
+                self._pending_stt_ms += result.stt_ms
+                self._pending_stt_device = result.device
+        if not item.final and self.livetyper is not None:
+            # M12: this segment's text is authoritative for the window the
+            # preview was guessing at. Called for EVERY mid segment, silent
+            # ones included - the reconciliation is in cut order, so skipping
+            # one would shift every later segment onto the wrong window.
+            self.livetyper.on_segment_text(item.dictation_id, seg_text)
+        if item.final:
+            if item.cancelled:      # Esc (M11): drop the whole dictation
+                log.info("dictation cancelled — discarded %d segment(s)",
+                         len(self._pending_texts))
+                self._reset_pending(None)
+                return
+            texts = self._pending_texts
+            stt_ms = self._pending_stt_ms
+            device = self._pending_stt_device
+            had_audio = self._pending_had_audio
+            peak = self._pending_peak
+            self._reset_pending(None)
+            self._finish_dictation(texts, stt_ms, device,
+                                   item.t_release or time.perf_counter(),
+                                   had_audio, peak=peak,
+                                   dictation_id=item.dictation_id)
+
+    def _transcribe_segment(self, audio: np.ndarray, rate: int):
+        """Raw STT of one segment (no cleanup, no inject) under the engine
+        lock. Cleanup runs once later on the joined text, not per segment."""
         audio16 = ensure_16k_mono(audio, rate)
-        cleanup = self.cleanup if self.cleanup_active else None
         with self.engine_lock:
-            result = transcribe_audio(audio16, self.engine, cleanup=cleanup,
-                                      vad=self.vad, preprocess=self.preprocess)
-        # clean_text is None when cleanup is off or failed — raw always wins
-        # over no paste (FR-8: cleanup can never block dictation).
-        text = result.clean_text if result.clean_text is not None else result.raw_text
+            return transcribe_audio(
+                audio16, self.engine, cleanup=None, vad=self.vad,
+                preprocess=self.preprocess,
+                filter_hallucinations=self.filter_hallucinations)
+
+    def _finish_dictation(self, texts: list[str], stt_ms: int, device: str,
+                          t_release: float, had_audio: bool,
+                          peak: float = 0.0, dictation_id: int = -1) -> None:
+        """Join a dictation's segment texts and run cleanup + dictionary +
+        inject + history ONCE (Tier 1). For a normal short dictation `texts`
+        holds a single segment, so this matches the old per-utterance path.
+        `peak` is the raw mic peak across the dictation - auto_gain's input.
+
+        With live typing on (M13) the words are already in the app, so the
+        final text is PATCHED in rather than pasted: same end result, minus
+        the wait."""
+        typed = self._typed_text(dictation_id)
+        raw_joined = " ".join(t.strip() for t in texts if t and t.strip())
+        if raw_joined and self.filter_hallucinations:
+            # Per-segment collapse ran in the pipeline; this catches a repeat
+            # straddling a Tier 1 segment join.
+            raw_joined = collapse_repeats(raw_joined)
+        if not raw_joined:
+            total_ms = int((time.perf_counter() - t_release) * 1000)
+            # The preview may have typed something the final pass then threw
+            # away (a hallucinated tail, a VAD-gated window). Take it back —
+            # leaving it would put words in the document that no dictation
+            # ever produced.
+            self._patch_typed(typed, "")
+            if not had_audio:
+                # Zero frames the whole hold = wedged mic endpoint (seen live
+                # 3 Jul: Samsung USB delivered nothing to ANY process until
+                # replugged). Say so loudly instead of a silent no-paste.
+                log.warning("recording captured 0 frames from %r — the mic "
+                            "delivered no audio. If this repeats, replug the "
+                            "mic or change the Windows default input device.",
+                            getattr(self.recorder, "device_name", "?"))
+                print("[--] nothing captured - mic delivered no audio",
+                      flush=True)
+                self._notify_no_output("Mic gave no audio - check the mic")
+            else:
+                print(f"[--] silence - nothing pasted ({total_ms}ms)",
+                      flush=True)
+                self._notify_no_output("Nothing heard - no text")
+            return
+        text = raw_joined
+        clean_text: str | None = None
+        cleanup_ms: int | None = None
+        cleanup = self.cleanup if self.cleanup_active else None
+        if cleanup is not None:
+            t0 = time.perf_counter()
+            try:  # FR-8: cleanup can never block dictation — raw wins on error
+                clean_text = cleanup.clean(raw_joined)
+                cleanup_ms = int((time.perf_counter() - t0) * 1000)
+                text = clean_text
+            except Exception:
+                log.warning("cleanup failed — keeping raw text only",
+                            exc_info=True)
+                clean_text = None
         if self.replacements:
             try:  # M10 dictionary; a bad rule must never block the paste
                 text = apply_replacements(text, self.replacements)
             except Exception:
                 log.exception("dictionary failed — pasting unmodified text")
-        injected = inject_text(text, mode=self.inject_mode,
-                               restore_delay_s=self.restore_delay_s)
+        # Remember it BEFORE injecting: "Copy last dictation" must recover the
+        # text even when the paste went nowhere (target wasn't focused).
+        self.last_text = text
+        if typed:
+            self._patch_typed(typed, text)
+            injected = True          # the words are in the app either way
+        else:
+            injected = inject_text(text, mode=self.inject_mode,
+                                   restore_delay_s=self.restore_delay_s)
         total_ms = int((time.perf_counter() - t_release) * 1000)
         if injected:
             self.latencies_ms.append(total_ms)
             history = self.history      # snapshot: the settings toggle can
             if history is not None:     # null this attr mid-utterance
                 history.append(
-                    raw_text=result.raw_text, clean_text=result.clean_text,
+                    raw_text=raw_joined, clean_text=clean_text,
                     final_text=text,
                     device=getattr(self.recorder, "device_name", "?"),
-                    stt_ms=result.stt_ms)
-            cleanup_note = (f", cleanup {result.cleanup_ms}ms"
-                            if result.cleanup_ms is not None else "")
+                    stt_ms=stt_ms)
+            cleanup_note = (f", cleanup {cleanup_ms}ms"
+                            if cleanup_ms is not None else "")
             # FR-7 per-utterance log + release-to-paste total (feeds AT-4).
-            print(f"[ok] pasted {len(text)} chars in {total_ms}ms "
-                  f"(stt {result.stt_ms}ms on {result.device}{cleanup_note}, "
+            print(f"[ok] {'patched' if typed else 'pasted'} {len(text)} chars "
+                  f"in {total_ms}ms "
+                  f"(stt {stt_ms}ms on {device}{cleanup_note}, "
                   f"n={len(self.latencies_ms)}): {text!r}", flush=True)
         else:
             print(f"[--] silence - nothing pasted ({total_ms}ms)", flush=True)
+            self._notify_no_output("Nothing heard - no text")
+        if self.auto_gain:
+            # Real speech was decoded this dictation, so the peak is a
+            # trustworthy loudness sample - adjust the Windows mic level on
+            # it. The all-silence paths returned above on purpose.
+            self._maybe_adjust_gain(peak)
+
+    def _typed_text(self, dictation_id: int) -> str:
+        """What live typing already put in the focused app for THIS dictation
+        (M13). Empty when the preview never ran for it - live typing off, or
+        the toggle flipped mid-dictation - and every path below then falls
+        straight back to the v1.1 paste. Asking the LiveTyper rather than the
+        current flag is what keeps a mid-dictation toggle honest: the answer
+        is what was actually typed, not what the setting says now."""
+        if self.livetyper is None:
+            return ""
+        return self.livetyper.typed_for(dictation_id)
+
+    def _patch_typed(self, typed: str, final: str) -> None:
+        """Turn the live-typed text into the final text in place: backspace
+        the divergent suffix, retype it (M13). Word-aligned, so a late
+        one-word revision never rewrites a whole paragraph, and an identical
+        final sends no keystrokes at all."""
+        if not typed:
+            return
+        n_back, retype = patch_plan(typed, final)
+        if not n_back and not retype:
+            log.info("live typing matched the final text - nothing to patch")
+            return
+        log.info("final patch: %d backspace(s), retyping %r", n_back, retype)
+        try:
+            patch_text(n_back, retype)
+        except Exception:
+            log.exception("final patch failed - the live text stays as typed")
+
+    def _maybe_adjust_gain(self, peak: float) -> None:
+        """auto_gain: one nudge of the WINDOWS mic input level after a
+        dictation that decoded speech but peaked too quiet (or clipped) -
+        what meeting apps' auto-sensitivity does; digital normalize can't
+        recover SNR the way a higher capture level can. Only while following
+        the system default: that is the endpoint being adjusted, and a
+        pinned mic is the user's explicit choice."""
+        rec = self.recorder
+        if (rec is None
+                or getattr(rec, "_configured_device", None) is not None
+                or getattr(rec, "fallback_active", False)):
+            return
+        try:
+            from localflow.desktop import micgain
+            changed = micgain.adjust_for_peak(peak)
+        except Exception:
+            log.debug("auto-gain skipped", exc_info=True)
+            return
+        if changed is not None:
+            old, new = changed
+            direction = "quiet" if new > old else "clipping"
+            log.info("auto-gain: dictation peaked %.3f (%s) - Windows mic "
+                     "input volume %d%% -> %d%%", peak, direction,
+                     round(old * 100), round(new * 100))
+            print(f"[..] mic {direction} - input volume "
+                  f"{round(old * 100)}% -> {round(new * 100)}%", flush=True)
 
     def latency_summary(self) -> str | None:
         """AT-4: p50/p95 release-to-paste over this session's pasted
@@ -453,8 +951,8 @@ def apply_cli_overrides(cfg: config.Config, args: argparse.Namespace) -> config.
 # everything else in Config has a live path in apply_settings below (the
 # settings window shows a "takes effect on restart" note for these).
 RESTART_KEYS = frozenset({
-    "device", "fallback_device", "stt_model_dir", "cleanup_model_dir",
-    "cache_dir", "hot_words", "overlay_enabled",
+    "device", "fallback_device", "stt_model_dir", "stt_language",
+    "cleanup_model_dir", "cache_dir", "hot_words", "overlay_enabled",
 })
 _PREPROCESS_KEYS = ("denoise_enabled", "normalize_audio", "denoise_strength")
 
@@ -481,18 +979,30 @@ def apply_settings(changes: dict, cfg: config.Config, hooks: dict) -> set[str]:
             hooks["hotkey"](value)
         elif key == "restore_delay_ms":
             hooks["restore_delay"](value / 1000.0)
+        elif key == "max_utterance_s":
+            hooks["max_utterance"](value)
+        elif key == "segment_seconds":
+            hooks["segment"](value)
         elif key == "inject_mode":
             hooks["inject_mode"](value)
         elif key == "input_device":
             hooks["input_device"](value)
         elif key == "vad_threshold":
             hooks["vad"](value)
+        elif key == "filter_hallucinations":
+            hooks["filter_hallucinations"](value)
+        elif key == "tts_length_scale":
+            hooks["tts_speed"](value)
+        elif key == "tts_volume":
+            hooks["tts_volume"](value)
         elif key == "overlay_visibility":
             hooks["visibility"](value)
         elif key == "pill_size":
             hooks["pill_size"](value)
         elif key == "cleanup_enabled":
             hooks["cleanup"](value)
+        elif key == "live_typing":
+            hooks["live_typing"](value)
         elif key == "overlay_position":
             pass                        # owned by the drag/reset paths
         elif key == "history_enabled":
@@ -543,6 +1053,26 @@ def _alert(message: str) -> None:
     ctypes.windll.user32.MessageBoxW(None, message, "LocalFlow", 0x40)
 
 
+# Keeps the crash.log file object alive: faulthandler holds only the fd, and
+# if the file were GC'd the fd could be reused and the handler would scribble
+# on some other file at the worst possible moment.
+_crash_log = None
+
+
+def _report_previous_crash(crash_path: Path) -> None:
+    """If the previous run died hard (native fault or import failure), say so
+    in THIS run's normal log — the evidence is otherwise only in crash.log,
+    which nobody reads until a session goes hunting for it."""
+    try:
+        tail = crash_path.read_text(encoding="utf-8", errors="replace")[-65536:]
+    except OSError:
+        return
+    last_run = tail.rsplit("--- LocalFlow start", 1)[-1]
+    if "Windows fatal exception" in last_run or "failed to import" in tail[-4096:]:
+        log.warning("previous run CRASHED - the reason is recorded in %s",
+                    crash_path)
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -583,6 +1113,38 @@ def main(argv: list[str] | None = None) -> int:
         log_path = log_dir / "localflow.log"
         logging.basicConfig(level=logging.INFO, format="%(asctime)s " + fmt,
                             filename=str(log_path), encoding="utf-8")
+
+    # Uncaught Python exceptions — main thread, any worker thread, or a
+    # __del__/finalizer — must land in the log; under pythonw they would
+    # otherwise vanish with the process.
+    sys.excepthook = lambda *exc: log.critical(
+        "uncaught exception", exc_info=exc)
+    threading.excepthook = lambda a: log.critical(
+        "uncaught exception in thread %s",
+        a.thread.name if a.thread else "?",
+        exc_info=(a.exc_type, a.exc_value, a.exc_traceback))
+    sys.unraisablehook = lambda a: log.error(
+        "unraisable exception in %r: %r", a.object, a.exc_value)
+
+    # A native crash (access violation) kills pythonw with NOTHING in the
+    # log — the three 13 Jul _ctypes.pyd crashes had to be guessed at from
+    # Windows Error Reporting. faulthandler catches the fault first and
+    # writes every thread's Python stack here, naming the guilty code path.
+    global _crash_log
+    try:
+        import faulthandler
+        crash_dir = (Path(os.environ.get("LOCALAPPDATA", str(Path.home())))
+                     / "LocalFlow")
+        crash_dir.mkdir(parents=True, exist_ok=True)
+        _report_previous_crash(crash_dir / "crash.log")
+        _crash_log = open(crash_dir / "crash.log", "a", encoding="utf-8")
+        _crash_log.write(f"--- LocalFlow start "
+                         f"{time.strftime('%Y-%m-%d %H:%M:%S')} ---\n")
+        _crash_log.flush()
+        faulthandler.enable(_crash_log, all_threads=True)
+        log.info("crash handler armed -> %s", crash_dir / "crash.log")
+    except Exception:
+        log.warning("faulthandler setup failed", exc_info=True)
 
     try:
         return _run(args)
@@ -649,37 +1211,16 @@ def _run(args: argparse.Namespace) -> int:
     if cfg.hot_words:
         initial_prompt = "Vocabulary: " + ", ".join(cfg.hot_words) + "."
 
-    # Build everything ONCE at startup, never per utterance (FR-14).
-    # M6: the SttEngine is the ONE thing dictation cannot start without, so
-    # it builds first and everything slow-but-optional (VadGate, warmup, the
-    # cleanup LLM preload) moves to a background thread. Hotkey target: live
-    # in <=8s instead of 14-19s.
-    print("Loading models (GPU warm load is ~1-3s)...", flush=True)
-    # The mic stream open costs ~1s of PortAudio/WASAPI work and touches
-    # nothing the engine build needs — overlap the two (M6). Opening now,
-    # not on key-down, also keeps the M3 fix: a per-keydown open ate the
-    # first spoken words. Idle audio is discarded after 0.3s.
-    recorder = StreamRecorder(input_device=input_device)
-    mic_open_err: list[BaseException] = []
-
-    def open_recorder() -> None:
-        # open_or_fallback returns an error ONLY when no mic on the machine
-        # opens; a wedged/unplugged configured mic falls back to a working one
-        # instead of killing startup (locked out of Settings otherwise).
-        err = recorder.open_or_fallback()
-        if err is not None:
-            mic_open_err.append(err)
-
-    mic_open = threading.Thread(target=open_recorder, daemon=True,
-                                name="localflow-mic-open")
-    mic_open.start()
-
-    t_engine0 = time.perf_counter()
-    engine = SttEngine(cfg.stt_model_dir, device=cfg.device,
-                       fallback_device=cfg.fallback_device,
-                       cache_dir=cfg.cache_dir,
-                       initial_prompt=initial_prompt)
-    engine_build_ms = int((time.perf_counter() - t_engine0) * 1000)
+    # Build everything on a BACKGROUND startup thread (M11, Jeremy's request:
+    # pill up immediately with a loading bar, only "loading" vs "usable" shown).
+    # The mic open (~1s), Whisper model load (~1.7s), VAD load (~2.4s) and warm
+    # pass all run in `startup_worker` below while the main thread goes straight
+    # to the tray loop — so the pill, tray and hotkey are all live in well under
+    # a second. The worker waits on app.warm, so engine/vad/preprocess are never
+    # used before they exist.
+    print("Starting LocalFlow (models load in the background)...", flush=True)
+    recorder = StreamRecorder(input_device=input_device,
+                              max_seconds=cfg.max_utterance_s)
 
     # Audio cleanup before STT (FR-13): high-pass + gentle spectral denoise
     # and loudness normalization. Helps the quiet/noisy built-in mic array
@@ -702,9 +1243,7 @@ def _run(args: argparse.Namespace) -> int:
                                  denoise_strength=cfg.denoise_strength,
                                  noise_floor=floor)
 
-    preprocess = build_preprocessor()
-    if preprocess is not None:
-        log.info("audio preprocessing: %s", preprocess.describe())
+    # (preprocess is built inside startup_worker, once the mic is open.)
 
     # Cleanup LLM: ~2-3GB of shared iGPU memory + seconds of load time, so it
     # is only loaded at startup when cleanup_enabled=true. Otherwise, if the
@@ -734,30 +1273,82 @@ def _run(args: argparse.Namespace) -> int:
         log.warning("cleanup_enabled=true but the model dir %s does not "
                     "exist — cleanup unavailable", cfg.cleanup_model_dir)
 
-    mic_open.join()
-    if mic_open_err:
-        raise mic_open_err[0]
-
-    # (The default-mic watcher starts AFTER the live-apply hooks exist -
-    # its on_switch rebuilds the preprocessor so a calibrated noise floor
-    # never outlives its mic. Nothing needs it in the first second.)
-
-    # vad=None: the VadGate arrives from the warmup thread below; the worker
-    # waits on app.warm before its first transcribe (never crashes or drops).
-    app = LocalFlowApp(engine, None, recorder, inject_mode=cfg.inject_mode,
+    # engine=None, vad=None, preprocess=None: all three arrive from
+    # startup_worker below; the worker waits on app.warm before its first
+    # transcribe, so it never sees them unset (never crashes or drops).
+    app = LocalFlowApp(None, None, recorder, inject_mode=cfg.inject_mode,
                        cleanup=cleanup, cleanup_loader=cleanup_loader,
                        restore_delay_s=cfg.restore_delay_ms / 1000.0,
-                       preprocess=preprocess)
+                       preprocess=None, suppress_keys=threading.Event())
+    app.filter_hallucinations = bool(cfg.filter_hallucinations)
+    app.auto_gain = bool(cfg.auto_gain)
+    app.set_live_typing(cfg.live_typing)
     # M10: dictionary + history from config (both live-appliable).
     app.replacements = dict(cfg.replacements)
     if cfg.history_enabled:
         from localflow.desktop.history import HistoryStore
         app.history = HistoryStore()
     app.start_worker()
+    # Tier 1 (VAD-segmented streaming): the segmenter cuts a long hold at
+    # silences DURING the hold so the end-of-dictation wait stays short. Its
+    # private VAD is built and the thread started from the warmup thread below;
+    # segment_seconds = 0 leaves it dormant.
+    from localflow.desktop.segmenter import Segmenter
+    app.segmenter = Segmenter(recorder, vad=None, emit=app.emit_segment,
+                              current_id=lambda: app._dictation_id,
+                              segment_seconds=cfg.segment_seconds)
+    # M12/M13: the preview loop commits words DURING the dictation and types
+    # each committed chunk into the focused app. is_dictating excludes the mic
+    # test / calibration (they also put the recorder in `recording` but are not
+    # speech to type) and live_typing=false (v1.1 mode: nothing streams).
+    from localflow.desktop.livetyper import LiveTyper
+    app.livetyper = LiveTyper(
+        recorder, engine_lock=app.engine_lock,
+        is_dictating=lambda: (recorder.recording and not app.mic_test_active
+                              and app.live_typing),
+        current_id=lambda: app._dictation_id,
+        on_commit=type_text)
     # Held in a ref so the settings window can rebuild it live (M8).
     hotkey_ref = {"listener": PushToTalkListener(
-        cfg.hotkey, app.on_hotkey_down, app.on_hotkey_up)}
+        cfg.hotkey, app.on_hotkey_down, app.on_hotkey_up,
+        suppress=app.suppress_keys, on_cancel=app.cancel_dictation)}
     hotkey_ref["listener"].start()
+
+    # Read-aloud (TTS): press read_aloud_hotkey to speak the SELECTED text, or
+    # "Narrate clipboard" from the tray. Fully local Piper voice, lazy-loaded
+    # on first use so startup stays lean. Off if the voice file is missing.
+    narrator = None
+    narrate_selection = None
+    narrate_ref: dict = {"listener": None}
+    if cfg.tts_enabled:
+        if Path(cfg.tts_voice).is_file():
+            from localflow.desktop.narrate import Narrator
+            narrator = Narrator(cfg.tts_voice, length_scale=cfg.tts_length_scale,
+                                volume=cfg.tts_volume)
+
+            def narrate_selection() -> None:
+                # Always OFF the caller's thread: toggle_selection copies the
+                # selection with a ~0.2s settle, which must never block the
+                # pynput hook thread (freezes the keyboard) or the Tk thread.
+                def work() -> None:
+                    try:
+                        narrator.toggle_selection()
+                    except Exception:
+                        log.exception("read-aloud failed - continuing")
+                threading.Thread(target=work, daemon=True,
+                                 name="localflow-narrate").start()
+
+            try:
+                narrate_ref["listener"] = keyboard.GlobalHotKeys(
+                    {to_pynput_combo(cfg.read_aloud_hotkey): narrate_selection})
+                narrate_ref["listener"].start()
+                log.info("read-aloud hotkey live -> %s", cfg.read_aloud_hotkey)
+            except Exception:
+                log.exception("read-aloud hotkey %r failed to register",
+                              cfg.read_aloud_hotkey)
+        else:
+            log.warning("tts_enabled but voice file %s not found - read-aloud "
+                        "off", cfg.tts_voice)
 
     # M7: pill visibility + position controls, live from the tray.
     vis_state = {"mode": overlay_visibility}
@@ -787,11 +1378,15 @@ def _run(args: argparse.Namespace) -> int:
         else:
             config.open_settings_editor(settings_path)
 
+    # Shown in the tray menu + settings header; startup_worker fills in the
+    # real device once the engine is loaded (pystray re-reads the callable).
+    status_holder = {"text": "LocalFlow - loading model..."}
+
     tray = None
     if not args.no_tray:
         try:
             from localflow.desktop.tray import TrayIcon
-            tray = TrayIcon(f"{engine.model_name} on {engine.device}", settings_path,
+            tray = TrayIcon(lambda item: status_holder["text"], settings_path,
                             cleanup_get=(lambda: app.cleanup_active)
                             if app.cleanup_available else None,
                             cleanup_toggle=app.toggle_cleanup,
@@ -801,7 +1396,8 @@ def _run(args: argparse.Namespace) -> int:
                             if overlay is not None else None,
                             reset_pill_position=reset_pill_position
                             if overlay is not None else None,
-                            open_settings=open_settings_entry)
+                            open_settings=open_settings_entry,
+                            narrate=narrate_selection)
         except Exception:
             log.exception("tray unavailable — falling back to console-only mode")
             tray = None
@@ -836,7 +1432,9 @@ def _run(args: argparse.Namespace) -> int:
     # -- M8: live-apply hooks (each owns ONE settings key's live path) ----
     def hook_hotkey(combo: str) -> None:
         old = hotkey_ref["listener"]
-        new = PushToTalkListener(combo, app.on_hotkey_down, app.on_hotkey_up)
+        new = PushToTalkListener(combo, app.on_hotkey_down, app.on_hotkey_up,
+                                 suppress=app.suppress_keys,
+                                 on_cancel=app.cancel_dictation)
         new.start()
         hotkey_ref["listener"] = new
         old.stop()
@@ -850,10 +1448,19 @@ def _run(args: argparse.Namespace) -> int:
     def hook_vad(value: float) -> None:
         # VadGate.trim reads self.threshold per call, so this is live. If
         # warmup hasn't built the gate yet, it constructs from cfg (already
-        # mutated by apply_settings) - either order lands the new value.
+        # mutated by apply_settings) - either order lands the new value. The
+        # segmenter's private gate tracks the same threshold.
         if app.vad is not None:
             app.vad.threshold = float(value)
+        if app.segmenter is not None and app.segmenter.vad is not None:
+            app.segmenter.vad.threshold = float(value)
         log.info("vad threshold -> %.2f", value)
+
+    def hook_segment_seconds(seconds: float) -> None:
+        if app.segmenter is not None:
+            app.segmenter.set_segment_seconds(seconds)
+        log.info("segment length -> %s",
+                 "off" if seconds <= 0 else f"{seconds:.0f}s")
 
     def hook_input_device(value) -> None:
         dev = value
@@ -861,7 +1468,12 @@ def _run(args: argparse.Namespace) -> int:
             dev = int(dev)
         recorder._configured_device = dev if dev != "" else None
         recorder.input_device = recorder._configured_device
-        recorder.refresh_default_device()
+        if not recorder.refresh_default_device():
+            log.warning("mic change saved while a recording was live - it "
+                        "takes effect on the next idle refresh or restart")
+        # Same rule as the micwatch on_switch: the calibrated noise floor
+        # belongs to ONE mic and must not survive a swap (M9).
+        hook_preprocess()
         log.info("mic %s", f"pinned to {dev!r}" if dev not in (None, "")
                  else "following the system default again")
 
@@ -880,6 +1492,18 @@ def _run(args: argparse.Namespace) -> int:
     def hook_restore_delay(seconds: float) -> None:
         app.restore_delay_s = seconds
 
+    def hook_live_typing(on: bool) -> None:
+        app.set_live_typing(on)
+        log.info("live typing %s", "on" if on
+                 else "off - hold to talk, paste on release (v1.1)")
+
+    def hook_max_utterance(seconds: float) -> None:
+        recorder.set_max_seconds(seconds)
+        log.info("max utterance -> %s",
+                 "unlimited" if seconds <= 0 else f"{seconds:.0f}s")
+
+    # (hook_segment_seconds defined above, next to hook_vad)
+
     def hook_history(enabled: bool) -> None:
         if enabled and app.history is None:
             from localflow.desktop.history import HistoryStore
@@ -895,36 +1519,44 @@ def _run(args: argparse.Namespace) -> int:
     def hook_inject_mode(mode: str) -> None:
         app.inject_mode = mode
 
-    # Follow the Windows default mic, live. Always runs (M8: the mic can be
-    # pinned/unpinned from the settings window without a restart);
-    # check_once() no-ops switches while pinned but keeps the heal tick.
-    # on_switch rebuilds the preprocessor: a calibrated noise floor belongs
-    # to ONE mic and must not survive a hot-swap (M9 review finding).
-    watcher = None
-    try:
-        from localflow.desktop.micwatch import DefaultMicWatcher
-        watcher = DefaultMicWatcher(recorder, on_switch=hook_preprocess)
-        watcher.start()
-        if input_device is None:
-            log.info("following the system default mic (pin one in "
-                     "Settings or localflow.toml to disable)")
-    except Exception:
-        log.exception("default-mic watcher unavailable — the mic is "
-                      "fixed for this session")
-        watcher = None
+    def hook_filter_hallucinations(enabled: bool) -> None:
+        app.filter_hallucinations = bool(enabled)
+        log.info("hallucination filter %s", "on" if enabled else "off")
+
+    def hook_tts_speed(length_scale: float) -> None:
+        if narrator is not None:
+            narrator.set_length_scale(float(length_scale))
+        log.info("read-aloud speed -> length_scale %.2f", length_scale)
+
+    def hook_tts_volume(volume: float) -> None:
+        if narrator is not None:
+            narrator.set_volume(float(volume))
+        log.info("read-aloud volume -> %.2f", volume)
+
+    # Follow the Windows default mic, live (M8). Started inside startup_worker
+    # once the mic is actually open; held in a ref so the teardown can stop it.
+    # on_switch rebuilds the preprocessor: a calibrated noise floor belongs to
+    # ONE mic and must not survive a hot-swap (M9 review finding).
+    watcher_ref: dict = {"w": None}
 
     live_hooks = {
         "hotkey": hook_hotkey,
         "preprocess": hook_preprocess,
         "vad": hook_vad,
         "restore_delay": hook_restore_delay,
+        "max_utterance": hook_max_utterance,
+        "segment": hook_segment_seconds,
         "inject_mode": hook_inject_mode,
+        "filter_hallucinations": hook_filter_hallucinations,
         "input_device": hook_input_device,
         "visibility": set_pill_visibility,
         "pill_size": hook_pill_size,
         "cleanup": hook_cleanup,
+        "live_typing": hook_live_typing,
         "history": hook_history,
         "replacements": hook_replacements,
+        "tts_speed": hook_tts_speed,
+        "tts_volume": hook_tts_volume,
     }
 
     def apply_from_ui(changes: dict) -> set[str]:
@@ -1118,68 +1750,139 @@ def _run(args: argparse.Namespace) -> int:
             suggestions=dictionary_suggestions,
             reset_pill_position=reset_pill_position,
             open_config_file=lambda: config.open_settings_editor(settings_path),
-            status_text=f"{engine.model_name} on {engine.device}",
+            status_text=lambda: status_holder["text"],
             cleanup_available=app.cleanup_available,
             cleanup_active=lambda: app.cleanup_active,
         )
         ov.settings_factory = lambda root: settings_ui.open_settings(root, ctx)
         ov.on_settings = ov.open_settings
 
+    def copy_last_text() -> str | None:
+        """Pill menu 'Copy last dictation': put the last transcript back on the
+        clipboard. Returns the text (for the pill's confirmation) or None when
+        there is nothing yet."""
+        text = app.last_text
+        if not text:
+            return None
+        try:
+            import pyperclip
+            pyperclip.copy(text)
+            log.info("copied last dictation to clipboard (%d chars)", len(text))
+            return text
+        except Exception:
+            log.exception("copy last dictation failed")
+            return None
+
     app.on_state = fan_out_state
     if overlay is not None:
+        app.on_no_output = overlay.flash
         level_sinks.append(overlay.push_level)
         overlay.settings_path = settings_path
         overlay.on_toggle = app.toggle_recording
+        overlay.on_copy_last = copy_last_text
+        overlay.on_narrate = narrate_selection   # None if TTS off/voice missing
         overlay.on_quit = request_quit
         wire_settings_ui(overlay)
-        overlay.set_state("warming")  # dictation works; warmup still running
+        overlay.set_progress(0.05, "Starting")  # loading bar from the first frame
 
-    hotkey_live_s = (_IMPORT_AGE_S or 0.0) + (time.perf_counter() - _T_MODULE)
+    ui_live_s = (_IMPORT_AGE_S or 0.0) + (time.perf_counter() - _T_MODULE)
     quit_hint = ("quit from the tray menu" if tray is not None
                  else "Ctrl+C here to quit")
-    print(f"\nLocalFlow ready on {engine.device} - hold {cfg.hotkey} and speak; "
-          f"release to paste into the focused app. {quit_hint}.\n"
-          f"(Warming up in the background - the first dictation may run a "
-          f"little slower.)\n"
+    print(f"\nLocalFlow starting - hold {cfg.hotkey} and speak once it's ready. "
+          f"{quit_hint}.\n"
           f"(Note: pasting into elevated/admin windows silently fails - FR-11.)",
           flush=True)
-    log.info("hotkey live on %s at %.1fs - hotkey %s, inject_mode %s "
-             "(warmup continues in the background)",
-             engine.device, hotkey_live_s, cfg.hotkey, cfg.inject_mode)
+    log.info("UI live at %.1fs — models loading in the background", ui_live_s)
 
-    def warm_in_background() -> None:
-        # VadGate build + warm pass off the critical path (M6). The worker
-        # waits on app.warm, so the engine is never used from two threads.
-        try:
-            app.vad = VadGate(threshold=cfg.vad_threshold)
-            warmup(engine, app.vad, app.cleanup, preprocess)
-        except Exception:
-            log.exception("background warmup failed — dictation continues "
-                          "unwarmed (first utterance runs slower)")
-        finally:
-            app.warm.set()
-        warm_s = (_IMPORT_AGE_S or 0.0) + (time.perf_counter() - _T_MODULE)
-        imports_note = (f"{_IMPORT_AGE_S:.1f}s" if _IMPORT_AGE_S is not None
-                        else "n/a")
-        log.info("startup breakdown: interpreter+imports %s, engine build "
-                 "%dms, hotkey live at %.1fs, fully warm at %.1fs",
-                 imports_note, engine_build_ms, hotkey_live_s, warm_s)
+    def _progress(frac: float, label: str) -> None:
         if overlay is not None:
-            # Unconditional: the overlay's own queue ordering decides — its
-            # apply() skips "ready" while rec/busy/menu is showing, so this
-            # can never clobber an in-flight dictation, and a queued-but-
-            # unprocessed "warming" can never strand the pill.
-            overlay.set_state("ready")  # flash the hint, then idle chip
+            overlay.set_progress(frac, label)
+
+    def startup_worker() -> None:
+        # Everything heavy, in order, with a loading bar (M11). The worker
+        # thread is gated on app.warm, so engine/vad/preprocess are never
+        # touched until this sets them and app.warm below.
+        engine_build_ms = 0
+        try:
+            _progress(0.12, "Opening mic")
+            # open_or_fallback errors ONLY when no mic on the machine opens; a
+            # wedged/pinned mic falls back to a working one instead.
+            err = recorder.open_or_fallback()
+            if err is not None:
+                log.error("no usable microphone: %s", err)
+                _alert("LocalFlow could not open any microphone.\n"
+                       "Plug one in and restart LocalFlow.")
+                _progress(0.12, "No mic found")
+            app.preprocess = build_preprocessor()
+            if app.preprocess is not None:
+                log.info("audio preprocessing: %s", app.preprocess.describe())
+            try:                              # default-mic watcher, mic now open
+                from localflow.desktop import micgain
+                from localflow.desktop.micwatch import DefaultMicWatcher
+
+                def on_mic_switch() -> None:
+                    # auto-gain's cached level belongs to the OLD endpoint.
+                    micgain.invalidate_cache()
+                    hook_preprocess()
+
+                w = DefaultMicWatcher(recorder, on_switch=on_mic_switch)
+                w.start()
+                watcher_ref["w"] = w
+            except Exception:
+                log.exception("default-mic watcher unavailable")
+
+            _progress(0.30, "Loading model")
+            t0 = time.perf_counter()
+            engine = SttEngine(cfg.stt_model_dir, device=cfg.device,
+                               fallback_device=cfg.fallback_device,
+                               cache_dir=cfg.cache_dir,
+                               language=to_language_token(cfg.stt_language),
+                               initial_prompt=initial_prompt)
+            engine_build_ms = int((time.perf_counter() - t0) * 1000)
+            app.engine = engine
+            status_holder["text"] = f"{engine.model_name} on {engine.device}"
+
+            _progress(0.60, "Loading voice")
+            app.vad = VadGate(threshold=cfg.vad_threshold)
+
+            _progress(0.82, "Warming up")
+            warmup(engine, app.vad, app.cleanup, app.preprocess)
+        except Exception:
+            log.exception("startup failed — dictation unavailable this session")
+            _alert("LocalFlow failed to load the speech model.\n"
+                   "See the log and restart LocalFlow.")
+            _progress(1.0, "Load failed")
+            app.warm.set()   # don't hang a queued dictation; it fails cleanly
+            return
+        app.warm.set()
+        # Tier 1: arm the segmenter with its OWN gate (get_speech_timestamps
+        # mutates Silero state, so it must never share the worker's app.vad).
+        if app.segmenter is not None:
+            try:
+                app.segmenter.vad = VadGate(threshold=cfg.vad_threshold)
+                app.segmenter.start()
+            except Exception:
+                log.exception("segmenter unavailable — long dictations run "
+                              "in one shot on release")
+        if app.livetyper is not None:
+            app.livetyper.engine = app.engine
+            app.livetyper.start()
+        warm_s = (_IMPORT_AGE_S or 0.0) + (time.perf_counter() - _T_MODULE)
+        log.info("startup breakdown: interpreter+imports %s, UI live at %.1fs, "
+                 "engine build %dms, usable at %.1fs",
+                 f"{_IMPORT_AGE_S:.1f}s" if _IMPORT_AGE_S is not None else "n/a",
+                 ui_live_s, engine_build_ms, warm_s)
+        print(f"LocalFlow ready on {app.engine.device} - hold {cfg.hotkey} "
+              f"and speak.", flush=True)
+        _progress(1.0, "Ready")
+        if overlay is not None:
+            overlay.set_state("idle")   # loading -> usable (the only two states)
         if cfg.cleanup_enabled and cleanup_loader is not None:
-            # cleanup_enabled=true preloads the LLM here, AFTER warm is set,
-            # so the multi-second load never delays dictation readiness.
-            # Same lock as the tray toggle - no double load, and a user
-            # toggle during warmup always wins over the config preload.
             print("Loading cleanup model (slower, cleaner mode)...", flush=True)
             app.preload_cleanup()
 
-    threading.Thread(target=warm_in_background, daemon=True,
-                     name="localflow-warmup").start()
+    threading.Thread(target=startup_worker, daemon=True,
+                     name="localflow-startup").start()
 
     try:
         if tray is not None:
@@ -1194,18 +1897,36 @@ def _run(args: argparse.Namespace) -> int:
         if tray is not None:
             tray.stop()
     finally:
-        hotkey_ref["listener"].stop()
-        if watcher is not None:
-            watcher.stop()
-        recorder.close()
-        if overlay is not None:
-            overlay.close()
-
-    summary = app.latency_summary()
-    if summary:
-        print(summary, flush=True)
-        log.info("%s", summary)
-    print("bye")
+        # Immediate, clean shutdown (Jeremy: quit must release EVERYTHING at
+        # once so relaunching straight away never hits the single-instance
+        # guard). Do the essential releases, flush the log, then hard-exit —
+        # a normal return would wait on the overlay-thread join, OpenVINO's
+        # GPU teardown and interpreter GC, any of which can keep the process
+        # (and its named mutex) alive for a second or more.
+        def _try(fn):
+            try:
+                fn()
+            except Exception:
+                pass
+        _try(hotkey_ref["listener"].stop)
+        if narrate_ref["listener"] is not None:
+            _try(narrate_ref["listener"].stop)
+        if narrator is not None:
+            _try(narrator.stop)
+        w = watcher_ref.get("w")
+        if w is not None:
+            _try(w.stop)
+        if app.segmenter is not None:
+            _try(app.segmenter.stop)
+        if app.livetyper is not None:
+            _try(app.livetyper.stop)
+        _try(recorder.close)          # release the mic/PortAudio stream now
+        summary = app.latency_summary()
+        if summary:
+            log.info("%s", summary)
+        log.info("bye — exiting immediately")
+        logging.shutdown()            # flush the log file before the hard exit
+        os._exit(0)                   # releases the mutex at once; no lingering
     return 0
 
 

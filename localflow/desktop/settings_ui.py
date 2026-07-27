@@ -41,6 +41,41 @@ _METER_BAR = "#57c785"          # same green family as the pill's run dot
 _VIS_LABELS = {"always": "Always", "dictating": "While dictating"}
 _VIS_BY_LABEL = {v: k for k, v in _VIS_LABELS.items()}
 
+# Advanced -> spoken language. A curated shortlist; any other Whisper code
+# still works if typed straight into localflow.toml (stt_language). "auto"
+# detects the language each utterance.
+_LANGUAGES: tuple[tuple[str, str], ...] = (
+    ("Auto-detect", "auto"),
+    ("English", "en"),
+    ("Spanish", "es"),
+    ("French", "fr"),
+    ("German", "de"),
+    ("Italian", "it"),
+    ("Portuguese", "pt"),
+    ("Dutch", "nl"),
+    ("Chinese", "zh"),
+    ("Japanese", "ja"),
+    ("Korean", "ko"),
+    ("Hindi", "hi"),
+    ("Arabic", "ar"),
+    ("Russian", "ru"),
+)
+
+
+def language_rows(code: str | None) -> tuple[list[tuple[str, str]], int]:
+    """(rows, preselect index) for the language combobox. A configured code
+    outside the shortlist gets its own 'Other (xx)' row so the setting stays
+    visible and round-trips. 'auto'/''/None select Auto-detect."""
+    c = str(code or "").strip().lower()
+    if c in ("", "auto", "detect", "none"):
+        c = "auto"
+    rows = list(_LANGUAGES)
+    for i, (_label, value) in enumerate(rows):
+        if value == c:
+            return rows, i
+    rows.append((f"Other ({code})", str(code)))
+    return rows, len(rows) - 1
+
 
 # -- pure helpers (unit-tested, no Tk) -----------------------------------
 
@@ -164,14 +199,21 @@ _COERCERS = {
     "denoise_strength": float,
     "vad_threshold": float,
     "restore_delay_ms": int,
+    "max_utterance_s": float,
+    "segment_seconds": float,
     "pill_size": float,
+    "tts_length_scale": float,
+    "tts_volume": float,
     "cleanup_enabled": bool,
+    "live_typing": bool,
     "denoise_enabled": bool,
     "normalize_audio": bool,
+    "filter_hallucinations": bool,
     "overlay_visibility": str,
     "inject_mode": str,
     "hotkey": str,
     "device": str,
+    "stt_language": str,
 }
 
 
@@ -218,6 +260,29 @@ def suggestion_rows(suggestions) -> list[str]:
     (source, target, count) tuples."""
     return [f"{source} -> {target}  (seen {count}x)"
             for source, target, count in suggestions]
+
+
+# "Reset all" (bottom bar) scope: the tuning + behaviour settings the window
+# controls, restored to their Config defaults. DELIBERATELY EXCLUDES the
+# user's data (the dictionary/replacements, history, room calibration) and
+# the restart-only advanced fields (device, model/cache dirs, hot_words) -
+# those keep their own Clear/edit controls. Reset flows through the same
+# live-apply path as a normal Apply.
+RESET_ALL_KEYS = (
+    "hotkey", "inject_mode", "restore_delay_ms", "max_utterance_s",
+    "segment_seconds", "overlay_visibility", "pill_size", "denoise_strength",
+    "denoise_enabled", "normalize_audio", "vad_threshold", "input_device",
+    "cleanup_enabled", "live_typing",
+)
+
+
+def default_tuning() -> dict:
+    """RESET_ALL_KEYS values from a fresh Config - the single source of truth
+    for what 'Reset all' restores. Pure (bar the import); unit-tested."""
+    from localflow.desktop import config
+
+    defaults = config.Config()
+    return {key: getattr(defaults, key) for key in RESET_ALL_KEYS}
 
 
 # -- context handed over from app._run() ---------------------------------
@@ -374,6 +439,7 @@ class _SettingsWindow:
         self._build_audio(main)
         self._build_hotkey(main)
         self._build_behaviour(main)
+        self._build_readaloud(main)
         self._build_cleanup(main)
         self._build_history(main)
         self._build_dictionary(main)
@@ -399,7 +465,14 @@ class _SettingsWindow:
     def _build_status(self, parent) -> None:
         cfg_box = ttk.Frame(parent)
         cfg_box.pack(fill="x", pady=(0, 6))
-        ttk.Label(cfg_box, text=str(self.ctx.status_text)).pack(anchor="w")
+        # status_text may be a plain string or a callable (the device is filled
+        # in once the model finishes loading in the background).
+        st = self.ctx.status_text
+        try:
+            status = str(st() if callable(st) else st)
+        except Exception:
+            status = "LocalFlow"
+        ttk.Label(cfg_box, text=status).pack(anchor="w")
         self.mic_line = ttk.Label(cfg_box, text="Mic: ...", foreground=_DIM)
         self.mic_line.pack(anchor="w")
         self.fb_line = ttk.Label(cfg_box, text="", foreground=_WARN)
@@ -526,6 +599,18 @@ class _SettingsWindow:
         box = ttk.LabelFrame(parent, text="Behaviour", padding=8)
         box.pack(fill="x", pady=(0, 6))
 
+        self.live_typing_var = tk.BooleanVar(
+            value=bool(self.ctx.cfg.live_typing))
+        ttk.Checkbutton(box, text="Type words live while dictating",
+                        variable=self.live_typing_var).pack(anchor="w")
+        ttk.Label(box, text="words appear as you speak and the ending is "
+                            "corrected when you stop; also lets you TAP the "
+                            "hotkey to start/stop (Esc cancels) and blanks the "
+                            "keyboard while dictating. Off = hold to talk, one "
+                            "paste on release.",
+                  foreground=_DIM, wraplength=_WRAP).pack(anchor="w",
+                                                          pady=(0, 6))
+
         row = ttk.Frame(box)
         row.pack(fill="x")
         ttk.Label(row, text="Show pill", width=18).pack(side="left")
@@ -548,7 +633,12 @@ class _SettingsWindow:
         self.pill_val = ttk.Label(row, text=f"{self.pill_var.get():.2f}",
                                   width=5)
         self.pill_val.pack(side="left", padx=(6, 0))
-        ttk.Label(box, text="applies live - the pill restarts itself",
+        # Snap the size back to the 1.0 default. Deferred to Apply, same as
+        # dragging the slider (the pill rescales when Apply commits pill_size).
+        ttk.Button(row, text="Reset", width=6,
+                   command=self._safe(self._on_reset_pill_size)
+                   ).pack(side="left", padx=(6, 0))
+        ttk.Label(box, text="pill rescales live on Apply (default size 1.0)",
                   foreground=_DIM).pack(anchor="w")
 
         ttk.Button(box, text="Reset pill position",
@@ -571,6 +661,75 @@ class _SettingsWindow:
             value=str(int(self.ctx.cfg.restore_delay_ms)))
         ttk.Spinbox(row, from_=100, to=2000, increment=50, width=7,
                     textvariable=self.delay_var).pack(side="left")
+
+        row = ttk.Frame(box)
+        row.pack(fill="x", pady=(4, 0))
+        ttk.Label(row, text="Max recording length (s)",
+                  width=24).pack(side="left")
+        self.maxutt_var = tk.StringVar(
+            value=str(int(float(self.ctx.cfg.max_utterance_s))))
+        ttk.Spinbox(row, from_=0, to=3600, increment=30, width=7,
+                    textvariable=self.maxutt_var).pack(side="left")
+        ttk.Label(box, text="how long one hold-to-talk can run "
+                            "(0 = no limit)", foreground=_DIM).pack(anchor="w")
+
+        row = ttk.Frame(box)
+        row.pack(fill="x", pady=(4, 0))
+        ttk.Label(row, text="Segment length (s)", width=24).pack(side="left")
+        self.segment_var = tk.StringVar(
+            value=str(int(float(self.ctx.cfg.segment_seconds))))
+        ttk.Spinbox(row, from_=0, to=600, increment=15, width=7,
+                    textvariable=self.segment_var).pack(side="left")
+        ttk.Label(box, text="past this, a long hold is cut at a silence and "
+                            "transcribed as you talk (0 = off)",
+                  foreground=_DIM, wraplength=_WRAP).pack(anchor="w")
+
+        self.filter_halluc_var = tk.BooleanVar(
+            value=bool(self.ctx.cfg.filter_hallucinations))
+        ttk.Checkbutton(box, text="Filter trailing hallucinated words",
+                        variable=self.filter_halluc_var).pack(anchor="w",
+                                                              pady=(6, 0))
+        ttk.Label(box, text="drops the stray word Whisper adds on silence "
+                            "(also keeps your real last word); ~2x slower STT",
+                  foreground=_DIM, wraplength=_WRAP).pack(anchor="w")
+
+    def _build_readaloud(self, parent) -> None:
+        box = ttk.LabelFrame(parent, text="Read aloud", padding=8)
+        box.pack(fill="x", pady=(0, 6))
+        row = ttk.Frame(box)
+        row.pack(fill="x")
+        ttk.Label(row, text="Speech speed", width=18).pack(side="left")
+        self.tts_speed_var = tk.DoubleVar(
+            value=round(float(self.ctx.cfg.tts_length_scale), 2))
+        ttk.Scale(row, from_=0.4, to=1.5, variable=self.tts_speed_var,
+                  length=180,
+                  command=self._safe(self._on_tts_speed_moved)).pack(side="left")
+        self.tts_speed_val = ttk.Label(
+            row, text=f"{self.tts_speed_var.get():.2f}", width=5)
+        self.tts_speed_val.pack(side="left", padx=(6, 0))
+        ttk.Label(box, text="lower = faster (0.8 is ~25% faster than normal)",
+                  foreground=_DIM, wraplength=_WRAP).pack(anchor="w")
+
+        row = ttk.Frame(box)
+        row.pack(fill="x", pady=(4, 0))
+        ttk.Label(row, text="Volume", width=18).pack(side="left")
+        self.tts_vol_var = tk.DoubleVar(
+            value=round(float(self.ctx.cfg.tts_volume), 2))
+        ttk.Scale(row, from_=0.1, to=2.0, variable=self.tts_vol_var,
+                  length=180,
+                  command=self._safe(self._on_tts_vol_moved)).pack(side="left")
+        self.tts_vol_val = ttk.Label(
+            row, text=f"{self.tts_vol_var.get():.2f}", width=5)
+        self.tts_vol_val.pack(side="left", padx=(6, 0))
+        ttk.Label(box, text="1.0 = normal; press the read-aloud hotkey to "
+                            "speak the selection",
+                  foreground=_DIM, wraplength=_WRAP).pack(anchor="w")
+
+    def _on_tts_speed_moved(self) -> None:
+        self.tts_speed_val.config(text=f"{self.tts_speed_var.get():.2f}")
+
+    def _on_tts_vol_moved(self) -> None:
+        self.tts_vol_val.config(text=f"{self.tts_vol_var.get():.2f}")
 
     def _build_cleanup(self, parent) -> None:
         box = ttk.LabelFrame(parent, text="Cleanup", padding=8)
@@ -724,11 +883,26 @@ class _SettingsWindow:
         ttk.Combobox(row, state="readonly", width=6,
                      textvariable=self.device_var,
                      values=["GPU", "NPU", "CPU"]).pack(side="left")
+
+        row = ttk.Frame(box)
+        row.pack(fill="x", pady=(4, 0))
+        ttk.Label(row, text="Language", width=18).pack(side="left")
+        self._lang_rows, lang_idx = language_rows(self.ctx.cfg.stt_language)
+        self.language_combo = ttk.Combobox(
+            row, state="readonly", width=14,
+            values=[label for label, _c in self._lang_rows])
+        self.language_combo.current(lang_idx)
+        self.language_combo.pack(side="left")
+        ttk.Label(box, text="\"English\" is most reliable for English; "
+                            "\"Auto-detect\" handles other languages",
+                  foreground=_DIM, wraplength=_WRAP).pack(anchor="w",
+                                                          pady=(2, 0))
+
         ttk.Button(box, text="Open settings file",
                    command=self._safe(self._on_open_config)
                    ).pack(anchor="w", pady=(4, 0))
-        ttk.Label(box, text="Restart needed for: compute device, model "
-                            "folders, cache folder, hot words",
+        ttk.Label(box, text="Restart needed for: compute device, language, "
+                            "model folders, cache folder, hot words",
                   foreground=_DIM, wraplength=_WRAP).pack(anchor="w",
                                                           pady=(4, 0))
 
@@ -741,6 +915,9 @@ class _SettingsWindow:
         ttk.Button(bar, text="Close",
                    command=self._safe(self._on_close)).pack(side="left",
                                                             padx=(6, 0))
+        self.reset_all_btn = ttk.Button(bar, text="Reset all",
+                                        command=self._safe(self._on_reset_all))
+        self.reset_all_btn.pack(side="left", padx=(6, 0))
         self.bottom_status = ttk.Label(parent, text="", wraplength=_WRAP)
         self.bottom_status.pack(anchor="w", pady=(4, 0))
 
@@ -882,6 +1059,11 @@ class _SettingsWindow:
 
     def _on_pill_moved(self) -> None:
         self.pill_val.config(text=f"{self.pill_var.get():.2f}")
+
+    def _on_reset_pill_size(self) -> None:
+        self.pill_var.set(1.0)
+        self.pill_val.config(text="1.00")
+        self._set_status("Pill size reset to 1.00 - press Apply to rescale.")
 
     # -- room-noise calibration (M9) ---------------------------------------
 
@@ -1254,7 +1436,26 @@ class _SettingsWindow:
         except ValueError:
             raise ValueError(
                 "Clipboard restore delay must be a whole number of ms.")
+        try:
+            values["max_utterance_s"] = float(int(self.maxutt_var.get().strip()))
+        except ValueError:
+            raise ValueError(
+                "Max recording length must be a whole number of seconds "
+                "(0 = no limit).")
+        try:
+            values["segment_seconds"] = float(int(self.segment_var.get().strip()))
+        except ValueError:
+            raise ValueError(
+                "Segment length must be a whole number of seconds (0 = off).")
         values["device"] = self.device_var.get()
+        lang_idx = self.language_combo.current()
+        if lang_idx < 0:
+            lang_idx = 0
+        values["stt_language"] = self._lang_rows[lang_idx][1]
+        values["filter_hallucinations"] = bool(self.filter_halluc_var.get())
+        values["live_typing"] = bool(self.live_typing_var.get())
+        values["tts_length_scale"] = round(float(self.tts_speed_var.get()), 2)
+        values["tts_volume"] = round(float(self.tts_vol_var.get()), 2)
         if self._has_cleanup:
             values["cleanup_enabled"] = bool(self.cleanup_var.get())
         return values
@@ -1298,6 +1499,80 @@ class _SettingsWindow:
     def _apply_failed(self, message: str) -> None:
         self._set_status(" ".join(message.split())[:300], error=True)
         self.apply_btn.state(["!disabled"])
+
+    # -- reset all ----------------------------------------------------------
+
+    def _on_reset_all(self) -> None:
+        from tkinter import messagebox
+        ok = messagebox.askyesno(
+            "Reset all settings",
+            "Reset audio tuning, hotkey, pill, and behaviour settings to "
+            "their defaults?\n\nYour dictionary, history, and room "
+            "calibration are NOT touched - each has its own Clear button.",
+            parent=self.top)
+        if not ok:
+            return
+        changes = default_tuning()
+        # Reflect the defaults in every widget now (instant visual) and update
+        # the snapshot so a later manual Apply won't resend the same values.
+        self._reset_widgets_to(changes)
+        self._initial.update(changes)
+        self._initial["denoise_enabled"] = bool(changes["denoise_enabled"])
+        # Pill position is an overlay command, not a config-diff key.
+        try:
+            self.ctx.reset_pill_position()
+        except Exception:
+            log.exception("reset pill position failed")
+        self.reset_all_btn.state(["disabled"])
+        self.apply_btn.state(["disabled"])
+        self._set_status("Resetting all settings...")
+
+        def work() -> None:
+            # ctx.apply may take seconds (input_device -> default triggers a
+            # PortAudio refresh; cleanup off may unload) - keep it off Tk.
+            try:
+                self.ctx.apply(changes)
+            except Exception as e:
+                log.exception("reset all failed")
+                self._post(self._reset_all_done,
+                           " ".join(str(e).split())[:200], True)
+                return
+            self._post(self._reset_all_done,
+                       "All settings reset to defaults.", False)
+
+        threading.Thread(target=work, daemon=True,
+                         name="localflow-reset-all").start()
+
+    def _reset_widgets_to(self, d: dict) -> None:
+        self.hotkey_var.set(d["hotkey"])
+        self.hotkey_note.config(text="", foreground=_DIM)
+        self.inject_var.set(d["inject_mode"])
+        self.live_typing_var.set(bool(d["live_typing"]))
+        self.delay_var.set(str(int(d["restore_delay_ms"])))
+        self.maxutt_var.set(str(int(float(d["max_utterance_s"]))))
+        self.segment_var.set(str(int(float(d["segment_seconds"]))))
+        self.visibility_var.set(
+            _VIS_LABELS.get(d["overlay_visibility"], "Always"))
+        pill = round(float(d["pill_size"]), 2)
+        self.pill_var.set(pill)
+        self.pill_val.config(text=f"{pill:.2f}")
+        denoise = round(float(d["denoise_strength"]), 2)
+        sens = round(float(d["vad_threshold"]), 2)
+        self.denoise_var.set(denoise)
+        self.denoise_val.config(text=f"{denoise:.2f}")
+        self.sens_var.set(sens)
+        self.sens_val.config(text=f"{sens:.2f}")
+        self.normalize_var.set(bool(d["normalize_audio"]))
+        self.preset_var.set(preset_name_for(denoise, sens,
+                                            bool(d["normalize_audio"])))
+        self.mic_combo.current(0)          # input_device None = system default
+        if self._has_cleanup and hasattr(self, "cleanup_var"):
+            self.cleanup_var.set(bool(d["cleanup_enabled"]))
+
+    def _reset_all_done(self, message: str, error: bool) -> None:
+        self.reset_all_btn.state(["!disabled"])
+        self.apply_btn.state(["!disabled"])
+        self._set_status(message, error=error)
 
     # -- teardown -------------------------------------------------------------
 

@@ -137,6 +137,37 @@ def test_mic_selection_unknown_pin_gets_explicit_row():
     assert idx == len(rows) - 1
 
 
+# -- language combobox rows --------------------------------------------------
+
+def test_language_rows_default_english():
+    rows, idx = ui.language_rows("en")
+    assert rows[idx] == ("English", "en")
+
+
+def test_language_rows_auto_and_blank_select_auto_detect():
+    for code in ("auto", "", None):
+        rows, idx = ui.language_rows(code)
+        assert rows[idx] == ("Auto-detect", "auto")
+
+
+def test_language_rows_known_code():
+    rows, idx = ui.language_rows("fr")
+    assert rows[idx] == ("French", "fr")
+
+
+def test_language_rows_unknown_code_gets_explicit_row():
+    rows, idx = ui.language_rows("sv")
+    assert rows[idx] == ("Other (sv)", "sv")
+    assert idx == len(rows) - 1
+
+
+def test_coerce_changes_pins_new_keys():
+    out = ui.coerce_changes({"stt_language": "fr",
+                             "filter_hallucinations": 0})
+    assert out["stt_language"] == "fr"
+    assert out["filter_hallucinations"] is False
+
+
 # -- dirty collection and type coercion --------------------------------------
 
 def test_collect_changes_empty_when_untouched():
@@ -197,6 +228,49 @@ def test_coerce_changes_passes_input_device_through():
     assert ui.coerce_changes({"input_device": None}) == {"input_device": None}
     assert ui.coerce_changes({"input_device": 7}) == {"input_device": 7}
     assert ui.coerce_changes({"input_device": "Samsung"}) == {"input_device": "Samsung"}
+
+
+def test_coerce_changes_pins_max_utterance_float():
+    out = ui.coerce_changes({"max_utterance_s": "120"})
+    assert out["max_utterance_s"] == pytest.approx(120.0)
+    assert isinstance(out["max_utterance_s"], float)
+
+
+def test_coerce_changes_pins_segment_seconds_float():
+    out = ui.coerce_changes({"segment_seconds": "45"})
+    assert out["segment_seconds"] == pytest.approx(45.0)
+    assert isinstance(out["segment_seconds"], float)
+
+
+# -- "Reset all" defaults ----------------------------------------------------
+
+def test_default_tuning_matches_config_defaults():
+    from localflow.desktop import config
+
+    defaults = config.Config()
+    tuning = ui.default_tuning()
+    # every reset key mirrors a fresh Config, exactly
+    for key in ui.RESET_ALL_KEYS:
+        assert tuning[key] == getattr(defaults, key)
+
+
+def test_default_tuning_restores_expected_values():
+    tuning = ui.default_tuning()
+    assert tuning["pill_size"] == 1.0
+    assert tuning["max_utterance_s"] == 300.0
+    assert tuning["segment_seconds"] == 30.0
+    assert tuning["overlay_visibility"] == "always"
+    assert tuning["input_device"] is None       # follow the system default
+    assert tuning["cleanup_enabled"] is False
+    assert tuning["denoise_strength"] == 0.6
+    assert tuning["vad_threshold"] == 0.5
+
+
+def test_default_tuning_leaves_user_data_alone():
+    # the dictionary, history, and calibration have their own controls and
+    # must NOT be in the reset-all scope
+    for key in ("replacements", "history_enabled"):
+        assert key not in ui.RESET_ALL_KEYS
 
 
 # -- history row labels (M10) ------------------------------------------------

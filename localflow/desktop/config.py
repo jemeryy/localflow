@@ -31,12 +31,32 @@ DEFAULT_CONFIG_TOML = """\
 
 hotkey = "alt+`"          # hold-to-talk combo, e.g. "alt+`", "ctrl+space", "f9"
 stt_model_dir = "models/whisper-turbo-ov"
+stt_language = "en"       # spoken language: "en", "auto" (detect each time),
+                          # or a Whisper code like "fr", "es", "de", "zh",
+                          # "ja". "en" is most reliable if you dictate English;
+                          # "auto" handles other languages. Restart to apply.
 device = "GPU"            # GPU | NPU | CPU
 fallback_device = "CPU"
 cache_dir = "models/ov_cache"
 inject_mode = "paste"     # paste (clipboard+Ctrl+V) | type (keystrokes, slower)
 restore_delay_ms = 500    # clipboard restore delay; raise it if a slow app
                           # ever pastes your OLD clipboard instead of speech
+max_utterance_s = 300     # longest single hold-to-talk capture (seconds).
+                          # Whisper stitches long audio internally, so you can
+                          # talk for minutes; 0 = no limit (a stuck key then
+                          # grows memory ~0.7MB/s until release). 300 = 5 min.
+segment_seconds = 30      # Tier 1: past this many seconds of a single hold,
+                          # cut at a silence and transcribe that piece WHILE you
+                          # keep talking, so the wait on release stays short.
+                          # Pieces join back cleanly. 0 = off (one shot on
+                          # release). Applied live from Settings.
+live_typing = true        # type words into the focused app ~1-2s behind your
+                          # voice, then patch the ending to the final text.
+                          # Also enables tap-to-toggle (tap the hotkey to start,
+                          # tap again to stop, Esc cancels) and blanks the
+                          # physical keyboard while dictating. false = the v1.1
+                          # way: hold to talk, one paste on release, no
+                          # suppression. Applied live from Settings.
 overlay_enabled = true    # Wispr-style waveform pill while recording (FR-2)
 overlay_visibility = "always"  # always | dictating (show only while dictating)
 pill_size = 1.0           # pill scale: 0.5 small ... 2.0 huge
@@ -52,8 +72,17 @@ denoise_enabled = true    # high-pass + gentle spectral noise reduction
 normalize_audio = true    # boost quiet mics toward a consistent loudness
 denoise_strength = 0.6    # 0 = off, ~0.6 gentle, ~0.9 aggressive (can eat
                           # quiet speech — dial DOWN if accuracy regresses)
+auto_gain = true          # nudge the Windows mic input level up when real
+                          # dictations arrive too quiet (down on clipping),
+                          # like meeting apps do; default-mic mode only
 vad_threshold = 0.5       # speech sensitivity: lower = quiet speech accepted,
                           # higher = background noise gated (slider 0.3-0.7)
+filter_hallucinations = true  # drop the stray word/phrase Whisper appends to
+                          # the end on trailing silence (a "you", "thanks for
+                          # watching", ...). Uses timestamps to spot the fake
+                          # tail, which also stops the real last word being
+                          # dropped, but roughly doubles STT time. false = off
+                          # (faster, but the artifacts come back).
 
 # Mic: sounddevice index or name substring; omit to follow the system
 # default (LocalFlow auto-switches when the Windows default mic changes).
@@ -66,13 +95,24 @@ history_enabled = true    # keep the last 200 dictations for the History
                           # panel in Settings (fully local); false = never
                           # write anything to disk
 
+# Read-aloud (text-to-speech). Press the hotkey to speak the SELECTED text in
+# any app; "Narrate clipboard" in the tray speaks whatever is copied. Fully
+# local (Piper neural voice, nothing leaves the machine). Press again to stop.
+tts_enabled = true
+read_aloud_hotkey = "ctrl+alt+r"  # press (not hold) to read selection; again = stop
+tts_voice = "models/piper/en_US-hfc_male-medium.onnx"  # path to the .onnx voice
+tts_length_scale = 0.8    # speech speed: lower = faster (0.8 ~ 25% faster),
+                          # 1.0 = normal. Live from the Settings slider.
+tts_volume = 1.0          # narration loudness multiplier: 1.0 = normal, lower
+                          # = quieter, up to 2.0 louder. Live from Settings.
+
 # Personal dictionary: deterministic fixes applied AFTER transcription
 # (safe, unlike hot_words). Edit in Settings, or add rows here like:
 #   "code x" = "Codex"
 [replacements]
 """
 
-_PATH_FIELDS = ("stt_model_dir", "cache_dir", "cleanup_model_dir")
+_PATH_FIELDS = ("stt_model_dir", "cache_dir", "cleanup_model_dir", "tts_voice")
 
 
 class Config(BaseModel):
@@ -83,6 +123,11 @@ class Config(BaseModel):
 
     hotkey: str = "alt+`"
     stt_model_dir: str = "models/whisper-turbo-ov"
+    # Spoken language. "en" forces English (most reliable when you dictate
+    # English), "auto" detects the language per utterance, or a Whisper code
+    # ("fr", "es", "de", "zh", "ja", ...) forces that language. Restart to
+    # apply (the STT config is built once at startup, like device/model).
+    stt_language: str = "en"
     device: str = "GPU"
     fallback_device: str = "CPU"
     cache_dir: str = "models/ov_cache"
@@ -91,6 +136,41 @@ class Config(BaseModel):
     # clipboard is restored. Too short races slow apps: they end up pasting
     # your OLD clipboard instead of your words. Raise if that ever recurs.
     restore_delay_ms: int = 500
+    # Longest single push-to-talk capture, in seconds. Whisper transcribes
+    # arbitrarily long audio (it chunks + stitches internally at ~50x realtime
+    # on GPU), so this is only a memory safety valve for a stuck key, not a
+    # model limit. 0 = unlimited. Applied live from the settings window.
+    max_utterance_s: float = 300.0
+
+    @field_validator("max_utterance_s")
+    @classmethod
+    def _max_utterance_sane(cls, v: float) -> float:
+        if v < 0 or v > 3600:
+            raise ValueError("max_utterance_s must be between 0 (unlimited) "
+                             "and 3600")
+        return v
+    # Tier 1 (VAD-segmented streaming): once a hold passes this many seconds,
+    # a background segmenter cuts the buffer at a recent silence and transcribes
+    # that piece DURING the hold, so the wait on release stays short no matter
+    # how long you talk. The per-segment texts join back cleanly. 0 = off
+    # (transcribe the whole hold in one shot on release). Applied live.
+    segment_seconds: float = 30.0
+
+    @field_validator("segment_seconds")
+    @classmethod
+    def _segment_seconds_sane(cls, v: float) -> float:
+        if v < 0 or v > 600:
+            raise ValueError("segment_seconds must be 0 (off) or up to 600")
+        if 0 < v < 10:
+            raise ValueError("segment_seconds must be 0 (off) or at least 10 "
+                             "(shorter segments would be too choppy)")
+        return v
+    # M13: type committed words into the focused app DURING the dictation
+    # (~1-2s behind speech), then patch the difference against the final
+    # pass. Also turns on tap-to-toggle and keyboard suppression (M11) and
+    # the preview decode loop (M12). false bypasses all three: v1.1
+    # hold-to-talk with a single paste on release. Applied live.
+    live_typing: bool = True
     overlay_enabled: bool = True
     # Pill visibility (M7): "always" keeps the idle chip on screen,
     # "dictating" shows the pill only around a dictation, "never" hides it
@@ -126,6 +206,11 @@ class Config(BaseModel):
     denoise_enabled: bool = True
     normalize_audio: bool = True
     denoise_strength: float = 0.6
+    # Auto mic gain (11 Jul): after a dictation that decoded speech but
+    # peaked too quiet (or clipped), nudge the WINDOWS mic input level one
+    # step - what meeting apps' auto-sensitivity does. Digital normalize
+    # can't fix SNR; the capture level can. Default-mic mode only.
+    auto_gain: bool = True
     # M9: Silero VAD speech-probability threshold. Lower accepts quiet
     # speech; higher gates background noise. The settings slider exposes
     # 0.3-0.7; the config tolerates a little more headroom.
@@ -137,6 +222,11 @@ class Config(BaseModel):
         if not 0.1 <= v <= 0.9:
             raise ValueError("vad_threshold must be between 0.1 and 0.9")
         return v
+    # Drop Whisper's trailing-silence hallucinations (a stray word/phrase
+    # appended to the end). When on, STT runs with timestamps so the fake tail
+    # is spotted by its timing (and the real final word is no longer dropped),
+    # at ~2x decode cost. Applied live. false = fast path, no filtering.
+    filter_hallucinations: bool = True
     input_device: int | str | None = None
     # Jargon Whisper mishears — biases transcription toward these spellings.
     # Takes effect on restart.
@@ -147,6 +237,32 @@ class Config(BaseModel):
     # M10: personal dictionary, applied AFTER STT and cleanup by
     # core/dictionary.py — zero STT-accuracy risk, unlike hot_words.
     replacements: dict[str, str] = {}
+    # Read-aloud (TTS). Fully local Piper voice. read_aloud_hotkey is a PRESS
+    # (not hold): press to speak the selection, press again to stop.
+    tts_enabled: bool = True
+    read_aloud_hotkey: str = "ctrl+alt+r"
+    tts_voice: str = "models/piper/en_US-hfc_male-medium.onnx"
+    # Speech speed as Piper's length_scale: lower is faster (0.8 ~ 25% faster
+    # than the 1.0 baseline). Applied live from the Settings slider.
+    tts_length_scale: float = 0.8
+
+    @field_validator("tts_length_scale")
+    @classmethod
+    def _tts_length_scale_sane(cls, v: float) -> float:
+        if not 0.4 <= v <= 2.0:
+            raise ValueError("tts_length_scale must be between 0.4 (fast) "
+                             "and 2.0 (slow)")
+        return v
+    # Narration loudness multiplier (Piper volume): 1.0 = as synthesized,
+    # lower = quieter, above 1.0 louder (can clip). Applied live from Settings.
+    tts_volume: float = 1.0
+
+    @field_validator("tts_volume")
+    @classmethod
+    def _tts_volume_sane(cls, v: float) -> float:
+        if not 0.1 <= v <= 2.0:
+            raise ValueError("tts_volume must be between 0.1 and 2.0")
+        return v
 
 
 def find_config(explicit: str | None = None) -> Path | None:

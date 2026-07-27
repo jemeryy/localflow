@@ -11,7 +11,9 @@ import sounddevice as sd
 
 log = logging.getLogger("localflow.desktop.capture")
 
-MAX_UTTERANCE_S = 60.0  # FR-3 safety cap
+MAX_UTTERANCE_S = 300.0  # default push-to-talk cap (config max_utterance_s);
+                         # 0 = unlimited. Whisper stitches long audio itself,
+                         # so this is a memory safety valve, not a model limit.
 
 
 def _find_live_input(exclude_name: str, listen_s: float = 1.5):
@@ -143,6 +145,13 @@ class StreamRecorder:
         # open stream goes silent for seconds, heal_if_stale() reopens it.
         self._last_frame = 0.0
         self._last_heal = 0.0
+        # Input-overflow bookkeeping. PortAudio raises "input overflow" when the
+        # callback can't keep up and DROPS samples — that punches a gap into the
+        # buffer, and Whisper decodes a discontinuous clip as repetitive garbage
+        # ("you you you", seen live 11 Jul). Counted here (a cheap int bump) and
+        # reported from stop(); NEVER logged from the callback — file I/O on the
+        # real-time audio thread only stalls it further and causes MORE overflow.
+        self._overflows = 0
         # Optional UI hook: called with the chunk RMS (float) while recording
         # only — feeds the waveform overlay. Set it before recording starts.
         self.on_level = None
@@ -151,8 +160,19 @@ class StreamRecorder:
         info = sd.query_devices(self.input_device, kind="input")
         self.device_name = str(info["name"])
         self.rate = int(info["default_samplerate"])
-        self._max_frames = int(self.max_seconds * self.rate)
+        # max_seconds <= 0 means "no cap" (talk as long as the key is held):
+        # _max_frames is None and the callback never discards.
+        self._max_frames = (int(self.max_seconds * self.rate)
+                            if self.max_seconds > 0 else None)
         self._preroll_frames = int(self.preroll_s * self.rate)
+
+    def set_max_seconds(self, max_seconds: float) -> None:
+        """Live-update the per-utterance cap (settings 'Apply'). Recomputes the
+        frame limit against the current rate; 0 = unlimited. Takes effect on the
+        next dictation - it never truncates one already in progress."""
+        self.max_seconds = float(max_seconds)
+        self._max_frames = (int(self.max_seconds * self.rate)
+                            if self.max_seconds > 0 else None)
 
     @property
     def recording(self) -> bool:
@@ -197,9 +217,14 @@ class StreamRecorder:
                 return
             self._stream.close()
             self._stream = None
+        # latency="high" asks PortAudio for a larger internal buffer, so a
+        # busy moment (GPU doing STT, the overlay redrawing, a heavy background
+        # process) can't as easily starve the callback into an input overflow.
+        # The extra buffering is a few tens of ms — irrelevant for push-to-talk.
         self._stream = sd.InputStream(
             samplerate=self.rate, channels=1, dtype="float32",
             device=self.input_device, callback=self._on_chunk,
+            latency="high",
         )
         self._stream.start()
         self._last_frame = time.monotonic()  # fresh stream is not yet stale
@@ -351,14 +376,17 @@ class StreamRecorder:
             self._chunks = list(self._preroll)
             self._frames = sum(len(c) for c in self._chunks)
             self._capped = False
+            self._overflows = 0
             self._recording = True
         log.info("recording started")
 
     def _on_chunk(self, indata, frames, time_info, status) -> None:
-        # Runs on the PortAudio thread — keep it tiny.
+        # Runs on the PortAudio thread — keep it tiny. Do NOT log here: writing
+        # to the log file on the audio thread stalls the callback and CAUSES the
+        # next overflow. Just count it; stop() reports the total per recording.
         self._last_frame = time.monotonic()
-        if status:
-            log.warning("capture status: %s", status)
+        if status and status.input_overflow:
+            self._overflows += 1
         chunk = None
         with self._lock:
             if not self._recording:
@@ -367,13 +395,14 @@ class StreamRecorder:
                 while self._preroll and kept - len(self._preroll[0]) >= self._preroll_frames:
                     kept -= len(self._preroll.pop(0))
                 return
-            if self._frames >= self._max_frames:
-                if not self._capped:
-                    self._capped = True
-                    log.warning("hit the %.0fs cap — discarding further audio (FR-3)",
-                                self.max_seconds)
+            if self._max_frames is None:            # unlimited (max_seconds<=0)
+                take = frames
+            elif self._frames >= self._max_frames:
+                # No log here either — stop() reports the cap off this thread.
+                self._capped = True
                 return
-            take = min(frames, self._max_frames - self._frames)
+            else:
+                take = min(frames, self._max_frames - self._frames)
             chunk = indata[:take, 0].copy()
             self._chunks.append(chunk)
             self._frames += take
@@ -383,6 +412,46 @@ class StreamRecorder:
             except Exception:
                 log.debug("on_level callback failed", exc_info=True)
 
+    def buffered_frames(self) -> int:
+        """Frames captured in the CURRENT (undrained) buffer. The Tier 1
+        segmenter polls this to decide when a hold is long enough to cut."""
+        with self._lock:
+            return self._frames
+
+    def snapshot(self) -> np.ndarray:
+        """A copy of the current buffer without stopping — the segmenter runs
+        its VAD scan on this. The list of chunks is copied under the lock (fast,
+        pointer-only) and concatenated outside it, so the audio callback is
+        never blocked for the length of a big concatenate."""
+        with self._lock:
+            chunks = list(self._chunks)
+        return (np.concatenate(chunks) if chunks
+                else np.zeros(0, dtype=np.float32))
+
+    def drain_segment(self, up_to_frame: int) -> np.ndarray:
+        """Tier 1: hand back audio[:up_to_frame] and KEEP the rest as the
+        ongoing buffer (the next segment's start), so consecutive segments are
+        contiguous. Only drains while recording — a returned empty array means
+        the dictation ended (a stop() raced this) and nothing should be emitted.
+        """
+        with self._lock:
+            if not self._recording or not self._chunks:
+                return np.zeros(0, dtype=np.float32)
+            buf = np.concatenate(self._chunks)
+            cut = max(0, min(int(up_to_frame), len(buf)))
+            if cut == 0:
+                return np.zeros(0, dtype=np.float32)
+            segment = buf[:cut]
+            remainder = buf[cut:].copy()
+            self._chunks = [remainder] if len(remainder) else []
+            self._frames = len(remainder)
+            # Draining drops back below a finite cap, so re-open the gate a
+            # prior _on_chunk cap may have closed (only matters with a small
+            # max_utterance_s AND segmentation both on).
+            self._capped = (self._max_frames is not None
+                            and self._frames >= self._max_frames)
+        return segment
+
     def stop(self) -> tuple[np.ndarray, int]:
         """Stop accumulating (the stream stays open) and return
         (float32 mono audio, sample_rate). Safe to call when not recording."""
@@ -391,7 +460,19 @@ class StreamRecorder:
             chunks, self._chunks = self._chunks, []
             self._frames = 0
             self._preroll = []
+            overflows = self._overflows
+            capped = self._capped
         audio = (np.concatenate(chunks) if chunks
                  else np.zeros(0, dtype=np.float32))
-        log.info("recording stopped: %.2fs captured", len(audio) / self.rate)
+        # Peak/overflow diagnostics (11 Jul): a peak near the rail = clipping;
+        # a peak near 0 = a wedged/silent endpoint; overflows > 0 = a gapped
+        # buffer that can make Whisper hallucinate. All three surface here so a
+        # bad decode can be traced to the audio it came from.
+        peak = float(np.abs(audio).max()) if len(audio) else 0.0
+        overflow_note = f", {overflows} input-overflow(s)" if overflows else ""
+        log.info("recording stopped: %.2fs captured, peak %.3f%s",
+                 len(audio) / self.rate, peak, overflow_note)
+        if capped:
+            log.warning("hit the %.0fs cap - audio past it was discarded "
+                        "(raise max_utterance_s in Settings)", self.max_seconds)
         return audio, self.rate

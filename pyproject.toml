@@ -26,15 +26,17 @@ dependencies = [
     "pillow",
     "pycaw",
     "tomlkit",
+    "piper-tts",
 ]
 
 [project.scripts]
-localflow = "localflow.desktop.app:main"
+localflow = "localflow.desktop.boot:main"
 
 [project.gui-scripts]
 # Windowless launcher (no console) for shortcuts/startup — same app;
 # logs go to %LOCALAPPDATA%/LocalFlow/localflow.log instead of a console.
-localflow-tray = "localflow.desktop.app:main"
+# boot:main catches import-time failures into crash.log (pythonw is silent).
+localflow-tray = "localflow.desktop.boot:main"
 
 [project.optional-dependencies]
 dev = ["pytest"]

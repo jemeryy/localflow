@@ -39,6 +39,12 @@ _BOTTOM_MARGIN = 90           # gap above the screen bottom
 _BARS = 36                    # waveform bars
 _TICK_MS = 33                 # ~30fps
 _READY_FLASH_MS = 2500
+_FLASH_MS = 1600              # transient confirmation (e.g. "Copied")
+# A topmost override-redirect tool window can be hidden by Windows after a
+# full-screen app, a lock/unlock, or a display change and NOT come back on its
+# own (Jeremy: "the pill disappeared, had to re-show it from the tray"). Re-
+# assert it on this cadence (ticks) so it self-heals without user action.
+_HEAL_TICKS = 60              # ~2s at 33ms
 _DRAG_SLOP_LOG = 6            # logical px of wiggle still counted as a click
 _MENU_W = 190                 # right-click menu panel width (logical)
 _MENU_ROW_H = 32              # logical height of one right-click menu row
@@ -192,6 +198,8 @@ class WaveformOverlay:
         self.settings_path = settings_path
         self.on_toggle = on_toggle    # click: start/stop dictation
         self.on_quit = on_quit        # menu Quit: ask the app to shut down
+        self.on_copy_last = None      # menu Copy: returns the copied text|None
+        self.on_narrate = None        # menu Narrate: speak the selection aloud
         self.on_position_change = None  # called with [x, y] on drag, None on reset
         self.on_settings = None       # menu Settings row; None -> open the toml
         # M8: app-provided factory building the settings window on THIS
@@ -204,6 +212,10 @@ class WaveformOverlay:
         self._cmd: queue.Queue = queue.Queue()
         self._levels: collections.deque = collections.deque(maxlen=_BARS)
         self._state = "idle"
+        # Startup loading bar (0..1) + its label. Only two states are ever
+        # shown to the user: "loading" (this bar) and the usable idle chip.
+        self._progress = 0.0
+        self._progress_label = "Starting..."
         self._thread = threading.Thread(
             target=self._ui_thread, daemon=True, name="localflow-overlay")
         self._thread.start()
@@ -215,6 +227,13 @@ class WaveformOverlay:
 
     def set_state(self, state: str) -> None:
         self._cmd.put(state)
+
+    def set_progress(self, fraction: float, label: str = "") -> None:
+        """Startup loading bar: fraction 0..1 with an optional label. Puts the
+        pill in the 'loading' state (the bar eases toward the fraction). The app
+        calls this as each startup stage completes; set_state('idle') ends it."""
+        frac = max(0.0, min(1.0, float(fraction)))
+        self._cmd.put(("progress", (frac, str(label))))
 
     def set_visibility(self, mode: str) -> None:
         """'always' | 'dictating' | 'never' — takes effect immediately."""
@@ -231,6 +250,13 @@ class WaveformOverlay:
         settings window is open over the pill."""
         self._cmd.put(("rescale", size))
 
+    def flash(self, message: str) -> None:
+        """Transient message in the pill from any thread (e.g. 'Nothing
+        heard' after a dictation produced no text - Jeremy 11 Jul: a silent
+        failure was invisible). Ignored while recording or in a menu so it
+        can never stomp a live dictation's display."""
+        self._cmd.put(("flash", str(message)))
+
     def open_settings(self) -> None:
         """Open the settings window on the UI thread (tray + pill menu)."""
         self._cmd.put(("open_settings", None))
@@ -242,6 +268,17 @@ class WaveformOverlay:
     # -- UI thread only ----------------------------------------------------
 
     def _ui_thread(self) -> None:
+        # Initialize COM on this thread and never uninitialize it (the app
+        # hard-exits with os._exit). Without this, when Python's cyclic GC
+        # happens to finalize a pycaw/comtypes object (from micwatch/micgain)
+        # ON this Tk thread, comtypes' Release runs with no COM context and
+        # access-violates in _ctypes (the 13-14 Jul native crash, caught mid
+        # menu-hover). A COM-initialized thread makes that Release safe.
+        try:
+            import comtypes
+            comtypes.CoInitialize()
+        except Exception:
+            log.debug("overlay CoInitialize failed", exc_info=True)
         try:
             self._run_ui()
         except Exception:
@@ -277,6 +314,8 @@ class WaveformOverlay:
         disp: list[float] = []               # displayed bar heights (eased)
         frame = {"n": 0}
         hover = {"on": False}
+        heal = {"n": 0}                      # visibility self-heal countdown
+        prog = {"v": 0.0}                    # eased loading-bar fill
 
         # UI element sizes scale with DPI x pill_size; SCREEN coordinates
         # (the saved anchor) scale with DPI only. Held in a mutable cell so a
@@ -376,7 +415,12 @@ class WaveformOverlay:
         # "unlock" toggles: while unlocked the pill drags freely (multiple
         # drags) until "Lock position" is picked (Jeremy, round 3).
         def menu_items() -> tuple[tuple[str, str], ...]:
-            return (("unlock", "Lock position" if drag_ui["unlocked"]
+            # Narrate row appears only when read-aloud is wired (on_narrate set).
+            narrate = (("narrate", "Narrate selection"),) \
+                if self.on_narrate is not None else ()
+            return (("copy", "Copy last dictation"),
+                    *narrate,
+                    ("unlock", "Lock position" if drag_ui["unlocked"]
                      else "Unlock position"),
                     ("reset", "Reset position"),
                     ("settings", "Settings"),
@@ -461,15 +505,39 @@ class WaveformOverlay:
                 canvas.create_oval(cx - r, mid - r, cx + r, mid + r,
                                    fill=_DOT_REC, outline=_DOT_REC, tags="wave")
 
+        def draw_loading() -> None:
+            # Startup loading bar (Jeremy: pill up immediately, a bar showing how
+            # close to usable, only "loading" vs "usable" shown). Rendered in the
+            # SAME chip footprint as the final idle pill so there is no size jump
+            # when it becomes usable. prog["v"] eases toward self._progress each
+            # tick so the fill glides. Labels are kept short to fit the chip.
+            canvas.delete("load")
+            w, h = size["w"], size["h"]
+            label = self._progress_label or "Loading..."
+            canvas.create_text(w // 2, int(h * 0.34), text=label, fill=_TEXT_DIM,
+                               font=fnt(9), tags="load")
+            bx0, bx1 = px(14), w - px(14)
+            by, bh = int(h * 0.66), px(3)
+            canvas.create_rectangle(bx0, by - bh, bx1, by + bh, fill=_MENU_BTN,
+                                    outline=_MENU_BTN, tags="load")
+            fx = bx0 + int((bx1 - bx0) * max(0.0, min(1.0, prog["v"])))
+            if fx > bx0:
+                canvas.create_rectangle(bx0, by - bh, fx, by + bh, fill=_DOT_RUN,
+                                        outline=_DOT_RUN, tags="load")
+
         def apply(state: str) -> None:
             if state == "ready" and self._state in ("rec", "busy", "menu"):
                 # The post-warmup "ready" flash (M6) arrives from the warmup
                 # thread; if a dictation or the menu is on screen, it loses.
                 return
+            if state == "idle" and self._state == "flash":
+                # The worker sends "idle" right behind a no-output flash —
+                # the flash must survive it (end_flash lands idle itself).
+                return
             self._state = state
             if state == "loading":
-                layout(_EXP_W, _EXP_H)
-                center_text("LocalFlow - loading...")
+                layout(_CHIP_W, _CHIP_H)     # same size as the final idle chip
+                draw_loading()
             elif state == "warming":
                 layout(_EXP_W, _EXP_H)
                 center_text(f"Warming up - {self._hotkey} works", _TEXT_DIM)
@@ -491,6 +559,23 @@ class WaveformOverlay:
                 layout(_CHIP_W, _CHIP_H)
                 draw_chip()
             sync_visibility()
+
+        def end_flash() -> None:
+            if self._state == "flash":
+                self._state = "idle"    # leave "flash" so apply's guard
+                apply("idle")           # doesn't swallow this idle
+
+        def show_flash(message: str, fill: str = _TEXT) -> None:
+            # Transient confirmation (e.g. after "Copy last dictation"): the
+            # expanded capsule with a message, then back to idle. Not a real
+            # state-machine entry — a genuine state command from the queue
+            # overrides it (except "idle", which the flash outlives), and
+            # clicks are ignored while it shows.
+            self._state = "flash"
+            layout(_EXP_W, _EXP_H)
+            center_text(message, fill)
+            sync_visibility()
+            root.after(_FLASH_MS, end_flash)
 
         def call_safely(cb, what: str) -> None:
             if cb is None:
@@ -569,7 +654,22 @@ class WaveformOverlay:
             st = self._state
             if st == "menu":
                 hit = menu_hit(event.x, event.y)
-                if hit == "unlock":
+                if hit == "copy":
+                    copied = None
+                    if self.on_copy_last is not None:
+                        try:
+                            copied = self.on_copy_last()
+                        except Exception:
+                            log.exception("overlay copy callback failed")
+                    show_flash("Copied last dictation" if copied
+                               else "No dictation yet",
+                               _TEXT if copied else _TEXT_DIM)
+                elif hit == "narrate":
+                    # Pill never takes focus (WS_EX_NOACTIVATE), so the source
+                    # app keeps its selection - Ctrl+C in on_narrate copies it.
+                    apply("idle")
+                    call_safely(self.on_narrate, "narrate")
+                elif hit == "unlock":
                     # Toggle: unlock -> drag freely (green tint) until
                     # "Lock position" is picked here again.
                     drag_ui["unlocked"] = not drag_ui["unlocked"]
@@ -590,7 +690,7 @@ class WaveformOverlay:
                     call_safely(self.on_quit, "quit")
                 else:                        # off any row -> dismiss
                     apply("idle")
-            elif st in ("idle", "ready", "warming", "rec"):
+            elif st in ("idle", "ready", "warming", "rec", "flash"):
                 # toggle dictation; focus stays on the paste target thanks
                 # to WS_EX_NOACTIVATE
                 call_safely(self.on_toggle, "toggle")
@@ -599,7 +699,7 @@ class WaveformOverlay:
         def on_rclick(_event) -> None:
             if self._state == "menu":        # right-click again = close
                 apply("idle")
-            elif self._state in ("idle", "ready", "warming", "busy"):
+            elif self._state in ("idle", "ready", "warming", "busy", "flash"):
                 apply("menu")
 
         def on_motion(event) -> None:
@@ -657,49 +757,108 @@ class WaveformOverlay:
             except Exception:
                 log.exception("outside-click poll failed")
 
+        def should_be_visible() -> bool:
+            """Whether the window is meant to be on screen right now — the same
+            decision sync_visibility() makes, factored out for the self-heal."""
+            if drag_ui["unlocked"]:
+                return True
+            mode = self._visibility
+            if mode == "never":
+                return False
+            if mode == "dictating" and self._state == "idle":
+                return False
+            return True
+
+        def heal_visibility() -> None:
+            # Windows can quietly hide a topmost tool window (full-screen app,
+            # lock/unlock, display change) and it never returns on its own —
+            # the fix Jeremy used, re-picking "Always" from the tray, re-runs
+            # deiconify+lift+topmost. Do that here on a slow heartbeat:
+            #  - unmapped (winfo_viewable 0): re-apply the state (re-place + show)
+            #  - mapped but possibly buried: reclaim the topmost band
+            # This matches the always-on-top guarantee and is the same
+            # re-assert already done on every state change.
+            if not should_be_visible():
+                return
+            try:
+                if not root.winfo_viewable():
+                    log.info("pill was hidden by the OS — re-showing it")
+                    apply(self._state)
+                else:
+                    root.attributes("-topmost", True)
+            except Exception:
+                log.debug("overlay visibility heal failed", exc_info=True)
+
         def tick() -> None:
             try:
-                while True:
-                    cmd = self._cmd.get_nowait()
-                    if cmd == "quit":
-                        root.destroy()
-                        return
-                    if isinstance(cmd, tuple):     # M7 ops, not states
-                        op, arg = cmd
-                        if op == "visibility":
-                            self._visibility = arg
-                            sync_visibility()
-                        elif op == "rescale":
-                            # Live pill_size change (M8), on the overlay's own
-                            # thread: update the scale cell and re-layout the
-                            # current state. Replaces the old tear-down-the-
-                            # whole-root rebuild, which crashed natively when a
-                            # settings window was open over it.
-                            self._pill_size = max(0.5, min(2.0, float(arg)))
-                            scale["U"] = S * self._pill_size
-                            arbiter.slop = px(_DRAG_SLOP_LOG)
-                            size["w"] = size["h"] = 0   # force geometry resize
-                            apply(self._state)
-                        elif op == "reset_pos":
-                            self._pos = None
-                            apply(self._state)     # snap to bottom-center
-                            notify_position(None)
-                        elif op == "open_settings":
-                            if self.settings_factory is not None:
-                                try:
-                                    self.settings_factory(root)
-                                except Exception:
-                                    log.exception("settings window failed")
-                            else:
-                                open_settings()    # escape hatch: the toml
-                        continue
-                    apply(cmd)
-            except queue.Empty:
-                pass
-            if self._state == "rec":
-                draw_wave()
-            elif self._state == "menu":
-                poll_outside_click()
+                try:
+                    while True:
+                        cmd = self._cmd.get_nowait()
+                        if cmd == "quit":
+                            root.destroy()
+                            return
+                        if isinstance(cmd, tuple):     # M7 ops, not states
+                            op, arg = cmd
+                            if op == "visibility":
+                                self._visibility = arg
+                                sync_visibility()
+                            elif op == "rescale":
+                                # Live pill_size change (M8), on the overlay's
+                                # own thread: update the scale cell and re-layout
+                                # the current state. Replaces the old tear-down-
+                                # the-whole-root rebuild, which crashed natively
+                                # when a settings window was open over it.
+                                self._pill_size = max(0.5, min(2.0, float(arg)))
+                                scale["U"] = S * self._pill_size
+                                arbiter.slop = px(_DRAG_SLOP_LOG)
+                                size["w"] = size["h"] = 0   # force resize
+                                apply(self._state)
+                            elif op == "reset_pos":
+                                self._pos = None
+                                apply(self._state)     # snap to bottom-center
+                                notify_position(None)
+                            elif op == "flash":
+                                # Never over a live dictation, a menu, or the
+                                # startup bar - those displays win.
+                                if self._state not in ("rec", "menu",
+                                                       "loading"):
+                                    show_flash(arg, _TEXT_DIM)
+                            elif op == "open_settings":
+                                if self.settings_factory is not None:
+                                    try:
+                                        self.settings_factory(root)
+                                    except Exception:
+                                        log.exception("settings window failed")
+                                else:
+                                    open_settings()    # escape hatch: the toml
+                            elif op == "progress":
+                                self._progress, self._progress_label = arg
+                                # Never clobber an active dictation/menu with the
+                                # loading bar (a late startup tick during a first
+                                # dictation); just record it.
+                                if self._state not in ("rec", "busy", "menu",
+                                                       "loading"):
+                                    prog["v"] = 0.0    # start empty on entry
+                                    apply("loading")
+                            continue
+                        apply(cmd)
+                except queue.Empty:
+                    pass
+                if self._state == "rec":
+                    draw_wave()
+                elif self._state == "loading":
+                    prog["v"] += (self._progress - prog["v"]) * 0.25  # ease fill
+                    draw_loading()
+                elif self._state == "menu":
+                    poll_outside_click()
+                heal["n"] += 1
+                if heal["n"] >= _HEAL_TICKS:
+                    heal["n"] = 0
+                    heal_visibility()
+            except Exception:
+                # A draw/command error must never stop the loop — that would
+                # freeze the pill until restart. Log and keep ticking.
+                log.exception("overlay tick failed — recovering")
             root.after(_TICK_MS, tick)
 
         apply("idle")                        # visible from the first moment
