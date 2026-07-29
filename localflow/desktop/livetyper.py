@@ -4,11 +4,13 @@ While a dictation runs, this thread re-decodes the recorder's uncommitted
 buffer about once a second and TYPES newly committed words into the target
 app. A word is committed once two consecutive decodes agree on it
 (LocalAgreement-2, `core.live.commit_prefix`) — and committed means FINAL:
-nothing typed is ever revised, backspaced or rewritten, mid-dictation or
+no WORD typed is ever revised, backspaced or rewritten, mid-dictation or
 after (Jeremy 27 Jul: "the streaming is fine, no correction — just no
 duplicates or extra words when I stop"). A word Whisper later changes its
 mind about simply stays as first typed; the trade for a perfectly calm
-stream.
+stream. The ONE sanctioned edit is punctuation-only (Jeremy 30 Jul):
+a trailing . ! ? at a pause is provisional, and a lowercase continuation
+backspaces exactly that mark — see `_append`.
 
 The only typing after the hotkey is released is the TAIL: the authoritative
 decode of each drained window appends the words the preview had not typed
@@ -43,7 +45,7 @@ log = logging.getLogger("localflow.desktop.livetyper")
 
 POLL_INTERVAL_S = 0.7
 MIN_WINDOW_S = 1.5      # a shorter window decodes to noise; wait for audio
-_SENTENCE_END = ".!?"   # held at the live edge, see _append
+_SENTENCE_END = ".!?"   # provisional at the live edge, see _append
 
 
 def _first_alpha(word: str) -> str:
@@ -59,10 +61,10 @@ class LiveTyper:
     `is_dictating() -> bool` and `current_id() -> int` are supplied by the app
     (a mic test also puts the recorder in `recording`, and that audio is not a
     dictation); `engine` is set after warmup, like the Segmenter's VAD.
-    `on_patch(n_backspaces, text)` types into the target app; append-only, so
-    n_backspaces is always 0 here (the signature is shared with the final
-    silence take-back). Always called under `_lock`, so the screen is mutated
-    in exactly the order this class accounts for it.
+    `on_patch(n_backspaces, text)` types into the target app; n_backspaces is
+    non-zero ONLY for the punctuation-only pause edit (see `_append`) — words
+    are never backspaced. Always called under `_lock`, so the screen is
+    mutated in exactly the order this class accounts for it.
     """
 
     def __init__(self, recorder, engine_lock, is_dictating, current_id,
@@ -90,7 +92,7 @@ class LiveTyper:
         self._committed = 0
         self._pending_counts: list[int] = []
         self._screen = ""
-        self._held = ""               # trailing .!? awaiting the next words
+        self._prov = ""               # provisional trailing .!? on screen
         self._flushed = False
         self._closed = False          # dictation ended: no more previews
         self._discard = False         # Esc: segment tails must not type either
@@ -246,39 +248,40 @@ class LiveTyper:
         Pause punctuation (live 29 Jul: "in the future. and I'm okay"):
         Whisper ends every pause-bounded hypothesis like a sentence, so a
         trailing . ! ? at the live edge usually marks where the AUDIO
-        stopped, not a real sentence end. Append-only forbids taking it
-        back later, so it is HELD instead of typed; the next words decide
-        it. A capitalised next word = Whisper really did start a new
-        sentence (type the held mark first); lowercase = the sentence
-        continued (drop it - the final pass drops it too). The final
-        authoritative tail (`final=True`) types verbatim and flushes any
-        hold, so a dictation's real closing punctuation always lands.
-        ponytail: case heuristic; if it misfires, upgrade to re-checking
-        the held word's surface in the newer hypothesis / segment text."""
+        stopped, not a real sentence end. It types immediately (it is
+        right there in the hypothesis) but stays PROVISIONAL; the next
+        words decide it. A capitalised next word = Whisper really did
+        start a new sentence (the mark stays, no edit at all); a
+        lowercase one = the sentence continued, and exactly that mark is
+        backspaced away — the one sanctioned edit (Jeremy 30 Jul:
+        punctuation only, never words). Dropping beats converting to a
+        comma: the final pass dropped every one in the 29 Jul log.
+        The final authoritative tail (`final=True`) types verbatim and
+        confirms whatever mark it ends with."""
         words = list(words)
+        n_back = 0
+        if words or final:              # only new words (or the final tail)
+            if words and self._prov:    # may resolve a provisional mark
+                first = _first_alpha(words[0])
+                if first and first.islower():
+                    n_back = len(self._prov)
+                    self._screen = self._screen[:-n_back]
+            self._prov = ""
         out = ""
-        if words and self._held:
-            first = _first_alpha(words[0])
-            if not (first and first.islower()):
-                out = self._held
-            self._held = ""
-        if words and not final:
-            bare = words[-1].rstrip(_SENTENCE_END)
-            if bare and bare != words[-1]:
-                self._held = words[-1][len(bare):]
-                words[-1] = bare
         if words:
-            out += (" " if self._screen else "") + " ".join(words)
-        elif final and self._held:
-            out, self._held = self._held, ""
-        if not out:
+            out = (" " if self._screen else "") + " ".join(words)
+            if not final:
+                bare = words[-1].rstrip(_SENTENCE_END)
+                if bare and bare != words[-1]:
+                    self._prov = words[-1][len(bare):]
+        if not out and not n_back:
             return
         self._screen += out
-        log.info("live type (+%r)", out)
+        log.info("live type (%s+%r)", f"-{n_back} " if n_back else "", out)
         if self.on_patch is None:
             return
         try:
-            self.on_patch(0, out)
+            self.on_patch(n_back, out)
         except Exception:
             log.exception("live typing failed - dictation continues")
 
@@ -289,7 +292,7 @@ class LiveTyper:
             self._committed = 0
             self._pending_counts = []
             self._screen = ""
-            self._held = ""
+            self._prov = ""
             self._flushed = False
             self._closed = False
             self._discard = False

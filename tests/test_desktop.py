@@ -1501,9 +1501,9 @@ def test_livetyper_strips_silence_hallucinations_at_the_live_edge():
     lt = _livetyper(["okay done. Thank you.", "okay done. Thank you."])
     lt._tick()
     lt._tick()
-    assert lt.text() == "okay done"           # stock tail never types; the
-    lt.on_segment_text(1, "okay done.")       # "." is held (pause rule) and
-    assert lt.text() == "okay done."          # the final drain flushes it
+    assert lt.text() == "okay done."          # the stock tail never types
+    lt.on_segment_text(1, "okay done.")       # final drain: the provisional
+    assert lt.text() == "okay done."          # "." is simply confirmed
 
     lt = _livetyper(["You.", "You."])         # a silent window decodes to
     lt._tick()                                # ONLY the artifact
@@ -1511,33 +1511,53 @@ def test_livetyper_strips_silence_hallucinations_at_the_live_edge():
     assert lt.text() == ""
 
 
-def test_livetyper_pause_period_drops_when_the_sentence_continues():
+def test_livetyper_pause_period_is_edited_away_when_the_sentence_continues():
     """Whisper punctuates a mid-sentence pause like a sentence end (live
-    29 Jul: "in the future. and I'm okay"). The trailing mark is HELD, and
-    a lowercase continuation drops it - matching what the final pass does."""
+    29 Jul: "in the future. and I'm okay"). The mark types immediately but
+    stays provisional: a lowercase continuation backspaces exactly that
+    one character - the sole sanctioned edit (Jeremy 30 Jul: punctuation
+    only, never words)."""
+    screen = [""]
     lt = _livetyper(["I like it.",
                      "I like it.",
                      "I like it and more",
-                     "I like it and more"])
+                     "I like it and more"], screen=screen)
     lt._tick()
     lt._tick()
-    assert lt.text() == "I like it"           # "." held, not typed
+    assert screen[0] == "I like it."          # typed at once, provisional
     lt._tick()
-    lt._tick()
-    assert lt.text() == "I like it and more"  # lowercase "and": "." dropped
+    lt._tick()                                # lowercase "and": one backspace
+    assert screen[0] == "I like it and more"
+    assert screen[0] == lt.text()             # accounting matches the app
 
 
 def test_livetyper_pause_period_stays_for_a_real_sentence_end():
+    screen = [""]
     lt = _livetyper(["I like it.",
                      "I like it.",
                      "I like it. Then we left",
-                     "I like it. Then we left"])
+                     "I like it. Then we left"], screen=screen)
     lt._tick()
     lt._tick()
-    assert lt.text() == "I like it"
+    assert screen[0] == "I like it."
     lt._tick()
     lt._tick()                                # capitalised "Then": a real
-    assert lt.text() == "I like it. Then we left"   # sentence boundary
+    assert screen[0] == "I like it. Then we left"   # boundary, no edit
+    assert screen[0] == lt.text()
+
+
+def test_livetyper_final_tail_resolves_the_provisional_mark_too():
+    """The authoritative final drain applies the same rule: a lowercase
+    tail removes the pause mark it continues past."""
+    screen = [""]
+    lt = _livetyper(["a google sheet.", "a google sheet."], screen=screen)
+    lt._tick()
+    lt._tick()
+    assert screen[0] == "a google sheet."
+    lt.close(1)
+    lt.on_segment_text(1, "a google sheet for me")
+    assert screen[0] == "a google sheet for me"
+    assert lt.typed_for(1) == "a google sheet for me"
 
 
 def test_livetyper_one_empty_decode_never_erases_typed_words():
@@ -1594,10 +1614,10 @@ def test_livetyper_cut_pauses_until_the_segment_tail_lands():
     lt._tick()                                # paused: no decode, no typing
     assert lt.engine.calls == 2 and screen[0] == "hello there my"
     lt.on_segment_text(1, "Hello there, my friend.")
-    assert screen[0] == "hello there my friend"    # only the missing tail;
-    lt._tick()                                # the cut-edge "." is held and
+    assert screen[0] == "hello there my friend."   # only the missing tail
     lt._tick()                                # the lowercase next window
-    assert screen[0] == "hello there my friend second part"   # drops it
+    lt._tick()                                # backspaces the provisional
+    assert screen[0] == "hello there my friend second part"   # cut-edge "."
     assert screen[0] == lt.text()
 
 
