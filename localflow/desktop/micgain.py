@@ -111,7 +111,7 @@ def _endpoint_volume():
     same role micwatch tracks). COM wants per-thread init; initializing an
     already-initialized thread is harmless."""
     import comtypes
-    from ctypes import POINTER, cast
+    from ctypes import POINTER, byref, cast, memset, sizeof
 
     from pycaw.pycaw import AudioUtilities, IAudioEndpointVolume
 
@@ -125,6 +125,15 @@ def _endpoint_volume():
         device = enumerator.GetDefaultAudioEndpoint(1, 0)   # eCapture, eConsole
         iface = device.Activate(IAudioEndpointVolume._iid_,
                                 comtypes.CLSCTX_ALL, None)
-        return cast(iface, POINTER(IAudioEndpointVolume))
+        volume = cast(iface, POINTER(IAudioEndpointVolume))
+        # ctypes.cast copies the pointer WITHOUT AddRef, so `iface` and
+        # `volume` each carry a Release-on-__del__ for the SAME single COM
+        # reference. Zero `iface` so only `volume` (com_release'd by the
+        # caller) ever releases it. The leftover wrapper's GC-time second
+        # Release on the already-freed object was the 29 Jul access
+        # violation that killed the tray mid pill-drag (crash.log names
+        # this exact stack), and the best fit for the 13 Jul crashes too.
+        memset(byref(iface), 0, sizeof(iface))
+        return volume
     finally:
         com_release(device, enumerator)
