@@ -1501,12 +1501,43 @@ def test_livetyper_strips_silence_hallucinations_at_the_live_edge():
     lt = _livetyper(["okay done. Thank you.", "okay done. Thank you."])
     lt._tick()
     lt._tick()
-    assert lt.text() == "okay done."          # the stock tail never types
+    assert lt.text() == "okay done"           # stock tail never types; the
+    lt.on_segment_text(1, "okay done.")       # "." is held (pause rule) and
+    assert lt.text() == "okay done."          # the final drain flushes it
 
     lt = _livetyper(["You.", "You."])         # a silent window decodes to
     lt._tick()                                # ONLY the artifact
     lt._tick()
     assert lt.text() == ""
+
+
+def test_livetyper_pause_period_drops_when_the_sentence_continues():
+    """Whisper punctuates a mid-sentence pause like a sentence end (live
+    29 Jul: "in the future. and I'm okay"). The trailing mark is HELD, and
+    a lowercase continuation drops it - matching what the final pass does."""
+    lt = _livetyper(["I like it.",
+                     "I like it.",
+                     "I like it and more",
+                     "I like it and more"])
+    lt._tick()
+    lt._tick()
+    assert lt.text() == "I like it"           # "." held, not typed
+    lt._tick()
+    lt._tick()
+    assert lt.text() == "I like it and more"  # lowercase "and": "." dropped
+
+
+def test_livetyper_pause_period_stays_for_a_real_sentence_end():
+    lt = _livetyper(["I like it.",
+                     "I like it.",
+                     "I like it. Then we left",
+                     "I like it. Then we left"])
+    lt._tick()
+    lt._tick()
+    assert lt.text() == "I like it"
+    lt._tick()
+    lt._tick()                                # capitalised "Then": a real
+    assert lt.text() == "I like it. Then we left"   # sentence boundary
 
 
 def test_livetyper_one_empty_decode_never_erases_typed_words():
@@ -1563,10 +1594,10 @@ def test_livetyper_cut_pauses_until_the_segment_tail_lands():
     lt._tick()                                # paused: no decode, no typing
     assert lt.engine.calls == 2 and screen[0] == "hello there my"
     lt.on_segment_text(1, "Hello there, my friend.")
-    assert screen[0] == "hello there my friend."   # only the missing tail
-    lt._tick()
-    lt._tick()                                # the new window streams on
-    assert screen[0] == "hello there my friend. second part"
+    assert screen[0] == "hello there my friend"    # only the missing tail;
+    lt._tick()                                # the cut-edge "." is held and
+    lt._tick()                                # the lowercase next window
+    assert screen[0] == "hello there my friend second part"   # drops it
     assert screen[0] == lt.text()
 
 

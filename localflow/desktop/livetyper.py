@@ -43,6 +43,14 @@ log = logging.getLogger("localflow.desktop.livetyper")
 
 POLL_INTERVAL_S = 0.7
 MIN_WINDOW_S = 1.5      # a shorter window decodes to noise; wait for audio
+_SENTENCE_END = ".!?"   # held at the live edge, see _append
+
+
+def _first_alpha(word: str) -> str:
+    for ch in word:
+        if ch.isalpha():
+            return ch
+    return ""
 
 
 class LiveTyper:
@@ -82,6 +90,7 @@ class LiveTyper:
         self._committed = 0
         self._pending_counts: list[int] = []
         self._screen = ""
+        self._held = ""               # trailing .!? awaiting the next words
         self._flushed = False
         self._closed = False          # dictation ended: no more previews
         self._discard = False         # Esc: segment tails must not type either
@@ -138,10 +147,12 @@ class LiveTyper:
         with self._lock:
             if dictation_id != self._id or self._discard:
                 return
+            final = False
             if self._pending_counts:
                 count = self._pending_counts.pop(0)
             else:
-                count = self._committed       # the final, uncut window
+                final = True                  # the final, uncut window
+                count = self._committed
                 self._committed = 0
                 self._prev = []
             tail = text.split()[count:]
@@ -152,7 +163,7 @@ class LiveTyper:
             screen_words = self._screen.split()
             if tail and screen_words and _norm(tail[0]) == _norm(screen_words[-1]):
                 tail = tail[1:]
-            self._append(tail)
+            self._append(tail, final=final)
 
     # -- the loop ---------------------------------------------------------
 
@@ -229,17 +240,45 @@ class LiveTyper:
             self._committed = committed
             self._append(fresh)
 
-    def _append(self, words: list[str]) -> None:
-        """Type `words` after everything already typed (under _lock)."""
-        if not words:
+    def _append(self, words: list[str], final: bool = False) -> None:
+        """Type `words` after everything already typed (under _lock).
+
+        Pause punctuation (live 29 Jul: "in the future. and I'm okay"):
+        Whisper ends every pause-bounded hypothesis like a sentence, so a
+        trailing . ! ? at the live edge usually marks where the AUDIO
+        stopped, not a real sentence end. Append-only forbids taking it
+        back later, so it is HELD instead of typed; the next words decide
+        it. A capitalised next word = Whisper really did start a new
+        sentence (type the held mark first); lowercase = the sentence
+        continued (drop it - the final pass drops it too). The final
+        authoritative tail (`final=True`) types verbatim and flushes any
+        hold, so a dictation's real closing punctuation always lands.
+        ponytail: case heuristic; if it misfires, upgrade to re-checking
+        the held word's surface in the newer hypothesis / segment text."""
+        words = list(words)
+        out = ""
+        if words and self._held:
+            first = _first_alpha(words[0])
+            if not (first and first.islower()):
+                out = self._held
+            self._held = ""
+        if words and not final:
+            bare = words[-1].rstrip(_SENTENCE_END)
+            if bare and bare != words[-1]:
+                self._held = words[-1][len(bare):]
+                words[-1] = bare
+        if words:
+            out += (" " if self._screen else "") + " ".join(words)
+        elif final and self._held:
+            out, self._held = self._held, ""
+        if not out:
             return
-        text = (" " if self._screen else "") + " ".join(words)
-        self._screen += text
-        log.info("live type (+%r)", text)
+        self._screen += out
+        log.info("live type (+%r)", out)
         if self.on_patch is None:
             return
         try:
-            self.on_patch(0, text)
+            self.on_patch(0, out)
         except Exception:
             log.exception("live typing failed - dictation continues")
 
@@ -250,6 +289,7 @@ class LiveTyper:
             self._committed = 0
             self._pending_counts = []
             self._screen = ""
+            self._held = ""
             self._flushed = False
             self._closed = False
             self._discard = False
