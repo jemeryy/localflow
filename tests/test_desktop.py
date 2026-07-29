@@ -1546,6 +1546,40 @@ def test_livetyper_pause_period_stays_for_a_real_sentence_end():
     assert screen[0] == lt.text()
 
 
+def test_livetyper_late_mark_is_added_at_the_boundary():
+    """A mark the fuller decode discovers AFTER the word was typed bare
+    still lands (live 30 Jul: "think about What" should have gained the
+    "?"). Add is a pure append - no backspace at all."""
+    screen = [""]
+    lt = _livetyper(["so think about",
+                     "so think about",
+                     "so think about? What else",
+                     "so think about? What else"], screen=screen)
+    lt._tick()
+    lt._tick()
+    assert screen[0] == "so think about"
+    lt._tick()
+    lt._tick()
+    assert screen[0] == "so think about? What else"
+    assert screen[0] == lt.text()
+
+
+def test_livetyper_pause_mark_is_replaced_when_whisper_rethinks_it():
+    """"." becomes "," when the decode across the pause says so."""
+    screen = [""]
+    lt = _livetyper(["we have mods.",
+                     "we have mods.",
+                     "we have mods, I just want",
+                     "we have mods, I just want"], screen=screen)
+    lt._tick()
+    lt._tick()
+    assert screen[0] == "we have mods."
+    lt._tick()
+    lt._tick()
+    assert screen[0] == "we have mods, I just want"
+    assert screen[0] == lt.text()
+
+
 def test_livetyper_final_tail_resolves_the_provisional_mark_too():
     """The authoritative final drain applies the same rule: a lowercase
     tail removes the pause mark it continues past."""

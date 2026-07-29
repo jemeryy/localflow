@@ -8,9 +8,11 @@ no WORD typed is ever revised, backspaced or rewritten, mid-dictation or
 after (Jeremy 27 Jul: "the streaming is fine, no correction — just no
 duplicates or extra words when I stop"). A word Whisper later changes its
 mind about simply stays as first typed; the trade for a perfectly calm
-stream. The ONE sanctioned edit is punctuation-only (Jeremy 30 Jul):
-a trailing . ! ? at a pause is provisional, and a lowercase continuation
-backspaces exactly that mark — see `_append`.
+stream. The ONE sanctioned edit is punctuation-only (Jeremy 30 Jul): the
+trailing mark of the last typed word (any of . , ! ? ; :) stays
+provisional until the next words arrive, then is added, replaced or
+removed to match what Whisper decided with audio across the pause — see
+`_append`.
 
 The only typing after the hotkey is released is the TAIL: the authoritative
 decode of each drained window appends the words the preview had not typed
@@ -45,7 +47,8 @@ log = logging.getLogger("localflow.desktop.livetyper")
 
 POLL_INTERVAL_S = 0.7
 MIN_WINDOW_S = 1.5      # a shorter window decodes to noise; wait for audio
-_SENTENCE_END = ".!?"   # provisional at the live edge, see _append
+_SENTENCE_END = ".!?"   # pause artifacts the fallback heuristic may drop
+_PUNCT = ".,!?;:"       # marks the boundary rule may add/replace/remove
 
 
 def _first_alpha(word: str) -> str:
@@ -53,6 +56,12 @@ def _first_alpha(word: str) -> str:
         if ch.isalpha():
             return ch
     return ""
+
+
+def _split_punct(word: str) -> tuple[str, str]:
+    """"about?" -> ("about", "?"); "don't" -> ("don't", "")."""
+    bare = word.rstrip(_PUNCT)
+    return bare, word[len(bare):]
 
 
 class LiveTyper:
@@ -92,7 +101,6 @@ class LiveTyper:
         self._committed = 0
         self._pending_counts: list[int] = []
         self._screen = ""
-        self._prov = ""               # provisional trailing .!? on screen
         self._flushed = False
         self._closed = False          # dictation ended: no more previews
         self._discard = False         # Esc: segment tails must not type either
@@ -157,15 +165,19 @@ class LiveTyper:
                 count = self._committed
                 self._committed = 0
                 self._prev = []
-            tail = text.split()[count:]
+            all_words = text.split()
+            tail = all_words[count:]
+            boundary = all_words[count - 1] if 1 <= count <= len(all_words) \
+                else None
             # One-word overlap guard: a word-count drift between the preview
             # and the authoritative decode ("I'm" typed vs "I am" decoded)
             # would re-type the last word. Dropping a genuine immediate
             # repeat is the cheaper mistake (Jeremy 27 Jul: no duplicates).
             screen_words = self._screen.split()
             if tail and screen_words and _norm(tail[0]) == _norm(screen_words[-1]):
+                boundary = tail[0]    # its authoritative surface still counts
                 tail = tail[1:]
-            self._append(tail, final=final)
+            self._append(tail, final=final, boundary=boundary)
 
     # -- the loop ---------------------------------------------------------
 
@@ -237,43 +249,55 @@ class LiveTyper:
             if not words:
                 return          # a flaky empty decode changes nothing
             committed = commit_prefix(self._prev, words, self._committed)
-            fresh = words[self._committed:committed]
+            old = self._committed
+            fresh = words[old:committed]
             self._prev = words
             self._committed = committed
-            self._append(fresh)
+            # The newer hypothesis re-heard the boundary: its surface of
+            # the last ALREADY-typed word resolves that word's punctuation.
+            boundary = words[old - 1] if 1 <= old <= len(words) else None
+            self._append(fresh, boundary=boundary)
 
-    def _append(self, words: list[str], final: bool = False) -> None:
+    def _append(self, words: list[str], final: bool = False,
+                boundary: str | None = None) -> None:
         """Type `words` after everything already typed (under _lock).
 
-        Pause punctuation (live 29 Jul: "in the future. and I'm okay"):
-        Whisper ends every pause-bounded hypothesis like a sentence, so a
-        trailing . ! ? at the live edge usually marks where the AUDIO
-        stopped, not a real sentence end. It types immediately (it is
-        right there in the hypothesis) but stays PROVISIONAL; the next
-        words decide it. A capitalised next word = Whisper really did
-        start a new sentence (the mark stays, no edit at all); a
-        lowercase one = the sentence continued, and exactly that mark is
-        backspaced away — the one sanctioned edit (Jeremy 30 Jul:
-        punctuation only, never words). Dropping beats converting to a
-        comma: the final pass dropped every one in the 29 Jul log.
-        The final authoritative tail (`final=True`) types verbatim and
-        confirms whatever mark it ends with."""
+        Boundary punctuation (live 29/30 Jul): Whisper punctuates a pause
+        like a sentence end, and only a LATER decode — hearing across the
+        pause — knows whether a mark really belongs there. So the trailing
+        punctuation of the last typed word stays PROVISIONAL until the
+        next words arrive, and is then edited to match `boundary`: that
+        same word's surface in the resolving source (the newer hypothesis,
+        or the authoritative segment/final text). The edit may REMOVE a
+        mark ("Who said? that" -> "Who said that"), REPLACE it ("mods.
+        I" -> "mods, I"), or ADD one that arrived late ("about What" ->
+        "about? What"). Punctuation only, ever — Jeremy 30 Jul — and only
+        when the boundary word matches the typed word (normalised); on a
+        mismatch, or across a Tier 1 cut where no later decode re-hears
+        the boundary, the fallback drops a trailing . ! ? before a
+        lowercase continuation and otherwise leaves the screen alone."""
         words = list(words)
         n_back = 0
-        if words or final:              # only new words (or the final tail)
-            if words and self._prov:    # may resolve a provisional mark
+        prefix = ""
+        screen_words = self._screen.split()
+        if (words or final) and screen_words:
+            bare, cur = _split_punct(screen_words[-1])
+            want = cur
+            if (boundary is not None and bare
+                    and _norm(boundary) == _norm(screen_words[-1])):
+                want = _split_punct(boundary)[1]
+            elif words and cur and any(c in _SENTENCE_END for c in cur):
                 first = _first_alpha(words[0])
                 if first and first.islower():
-                    n_back = len(self._prov)
+                    want = ""       # pause artifact: the sentence continued
+            if bare and want != cur:
+                n_back = len(cur)
+                if n_back:
                     self._screen = self._screen[:-n_back]
-            self._prov = ""
-        out = ""
+                prefix = want
+        out = prefix
         if words:
-            out = (" " if self._screen else "") + " ".join(words)
-            if not final:
-                bare = words[-1].rstrip(_SENTENCE_END)
-                if bare and bare != words[-1]:
-                    self._prov = words[-1][len(bare):]
+            out += (" " if self._screen else "") + " ".join(words)
         if not out and not n_back:
             return
         self._screen += out
@@ -292,7 +316,6 @@ class LiveTyper:
             self._committed = 0
             self._pending_counts = []
             self._screen = ""
-            self._prov = ""
             self._flushed = False
             self._closed = False
             self._discard = False
