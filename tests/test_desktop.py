@@ -1758,6 +1758,20 @@ def test_live_patch_uses_key_backspaces_on_chromium(monkeypatch):
         (0x0100, 0x08), (0x0101, 0x08), (0x0102, ord("x"))]
 
 
+def test_live_patch_key_backspaces_on_electrons_outer_window(monkeypatch):
+    """Electron (VS Code, Claude desktop) can hand focus to the OUTER
+    Chrome_WidgetWin_* window, not the renderer child. It is still
+    Chromium: 0x08 chars are silently ignored (live 30 Jul: full stops
+    survived their removal), so the class sniff matches by prefix."""
+    from localflow.desktop import inject
+
+    posted = _fake_user32(monkeypatch, alive_hwnd=42,
+                          wnd_class="Chrome_WidgetWin_1")
+    inject.live_patch(1, "x", target=42)
+    assert [(p[1], p[2]) for p in posted] == [
+        (0x0100, 0x08), (0x0101, 0x08), (0x0102, ord("x"))]
+
+
 def test_patches_to_a_dead_target_are_dropped(monkeypatch):
     """The target window closed mid-dictation: dropping the patch beats
     spilling backspaces + text into whatever the user is doing now."""

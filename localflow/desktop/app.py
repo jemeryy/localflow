@@ -51,6 +51,7 @@ from localflow.desktop.inject import (
     inject_text,
     live_patch,
     patch_text,
+    window_class,
 )
 
 log = logging.getLogger("localflow.desktop.app")
@@ -528,6 +529,11 @@ class LocalFlowApp:
         # goes afterwards. Only meaningful with live typing; the v1.1 paste
         # path stays focus-follows.
         self._live_target = focused_control() if self.live_typing else None
+        if self._live_target:
+            # The class decides the backspace style (inject._keydown_deletes)
+            # — log it so a "backspaces ignored" report names the app at once.
+            log.info("live target hwnd=0x%X class=%s", self._live_target,
+                     window_class(self._live_target))
         self._grab_keyboard()
         self._set_state("rec")
         # FR-2 indicator (tray dot; console line kept for --no-tray). ASCII

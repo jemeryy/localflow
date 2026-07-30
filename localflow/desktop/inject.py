@@ -64,16 +64,22 @@ _VK_BACK = 0x08
 _BACK_DOWN_LP = 1 | (0x0E << 16)             # repeat 1, backspace scancode
 _BACK_UP_LP = _BACK_DOWN_LP | (0x3 << 30)    # previous-state + transition
 
-# Window classes whose text surface deletes on the KEY-DOWN itself and
-# ignores a 0x08 char: Chromium (Chrome/Edge/VS Code/Electron) and Gecko.
-# ponytail: class sniff — extend the tuple when some app deletes on neither.
-_KEYDOWN_DELETE_CLASSES = ("Chrome_RenderWidgetHostHWND", "MozillaWindowClass")
+# Window-class PREFIXES whose text surface deletes on the KEY-DOWN itself
+# and ignores a 0x08 char: Chromium (Chrome/Edge/VS Code/Electron — focus can
+# sit on Chrome_RenderWidgetHostHWND or the outer Chrome_WidgetWin_*, seen
+# live 30 Jul: words typed, backspaces silently ignored) and Gecko.
+# ponytail: class sniff — extend when some app deletes on neither style.
+_KEYDOWN_DELETE_PREFIXES = ("Chrome_", "Mozilla")
+
+
+def window_class(hwnd: int) -> str:
+    buf = ctypes.create_unicode_buffer(64)
+    _user32.GetClassNameW(hwnd, buf, 64)
+    return buf.value
 
 
 def _keydown_deletes(hwnd: int) -> bool:
-    buf = ctypes.create_unicode_buffer(64)
-    _user32.GetClassNameW(hwnd, buf, 64)
-    return any(c in buf.value for c in _KEYDOWN_DELETE_CLASSES)
+    return window_class(hwnd).startswith(_KEYDOWN_DELETE_PREFIXES)
 
 
 def _post_backspaces(hwnd: int, n: int) -> None:
