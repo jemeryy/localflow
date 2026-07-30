@@ -1546,6 +1546,26 @@ def test_livetyper_pause_period_stays_for_a_real_sentence_end():
     assert screen[0] == lt.text()
 
 
+def test_livetyper_preview_overlap_drift_does_not_duplicate_a_word():
+    """A hypothesis that grows a word behind the committed prefix shifts the
+    alignment, so the fresh words start with the word already on screen -
+    live 30 Jul this typed "retire retire". The overlap guard drops the
+    repeat on the PREVIEW path too, and its surface still resolves the
+    boundary mark ("retire." -> "retire")."""
+    screen = [""]
+    lt = _livetyper(["amounts needed to retire.",
+                     "amounts needed to retire.",
+                     "amounts needed to a retire to be",
+                     "amounts needed to a retire to be"], screen=screen)
+    lt._tick()
+    lt._tick()
+    assert screen[0] == "amounts needed to retire."
+    lt._tick()
+    lt._tick()
+    assert screen[0] == "amounts needed to retire to be"
+    assert screen[0] == lt.text()
+
+
 def test_livetyper_late_mark_is_added_at_the_boundary():
     """A mark the fuller decode discovers AFTER the word was typed bare
     still lands (live 30 Jul: "think about What" should have gained the
@@ -1842,6 +1862,19 @@ def test_finish_takes_back_typed_text_the_final_pass_threw_away(monkeypatch):
     app._finish_dictation([], 0, "GPU", _time.perf_counter(), had_audio=True,
                           dictation_id=5)
     assert sent["patch"] == (3, "")
+
+
+def test_finish_keeps_long_streamed_text_when_the_final_decode_is_empty(
+        monkeypatch):
+    """An empty final over audio the preview committed 4+ words from is a
+    decode failure, not silence (live 30 Jul: the take-back erased a whole
+    15-word dictation). The screen keeps the typed text and it becomes the
+    dictation's result."""
+    app, sent = _patching_app(monkeypatch, "i want the lines to be horizontal")
+    app._finish_dictation([], 0, "GPU", _time.perf_counter(), had_audio=True,
+                          dictation_id=5)
+    assert sent == {"patch": None, "paste": None}
+    assert app.last_text == "i want the lines to be horizontal"
 
 
 def test_finish_pastes_when_live_typing_never_ran(monkeypatch):

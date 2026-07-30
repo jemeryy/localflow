@@ -832,12 +832,21 @@ class LocalFlowApp:
             # Per-segment collapse ran in the pipeline; this catches a repeat
             # straddling a Tier 1 segment join.
             raw_joined = collapse_repeats(raw_joined)
+        if not raw_joined and len(typed.split()) > 3:
+            # A final decode that returns NOTHING for audio the preview
+            # committed real words from (two agreeing decodes each) is a
+            # decode failure, not silence — the take-back erased a whole
+            # 15-word dictation over one empty final (live 30 Jul). Trust
+            # the screen: keep the typed text as this dictation's result.
+            log.warning("final decode empty but %d live words typed — "
+                        "keeping the typed text", len(typed.split()))
+            raw_joined = typed
         if not raw_joined:
             total_ms = int((time.perf_counter() - t_release) * 1000)
             # The preview may have typed something the final pass then threw
             # away (a hallucinated tail, a VAD-gated window). Take it back —
             # leaving it would put words in the document that no dictation
-            # ever produced.
+            # ever produced. Only a SHORT stream qualifies (see above).
             self._patch_typed(typed, "")
             if not had_audio:
                 # Zero frames the whole hold = wedged mic endpoint (seen live
@@ -1435,10 +1444,16 @@ def _run(args: argparse.Namespace) -> int:
     status_holder = {"text": "LocalFlow - loading model..."}
 
     tray = None
+    restart_ref = {"want": False}
     if not args.no_tray:
         try:
             from localflow.desktop.tray import TrayIcon
+
+            def request_restart() -> None:
+                restart_ref["want"] = True
+
             tray = TrayIcon(lambda item: status_holder["text"], settings_path,
+                            restart=request_restart,
                             cleanup_get=(lambda: app.cleanup_active)
                             if app.cleanup_available else None,
                             cleanup_toggle=app.toggle_cleanup,
@@ -1977,6 +1992,16 @@ def _run(args: argparse.Namespace) -> int:
         summary = app.latency_summary()
         if summary:
             log.info("%s", summary)
+        if restart_ref["want"]:
+            # Tray "Restart": spawn the new instance, then die. Imports take
+            # the child seconds to reach the single-instance check; our
+            # os._exit releases the mutex in milliseconds — no race.
+            import subprocess
+            _try(lambda: subprocess.Popen(
+                [sys.executable, "-c",
+                 "from localflow.desktop.boot import main; main()"]
+                + sys.argv[1:], close_fds=True))
+            log.info("restarting — new instance spawned")
         log.info("bye — exiting immediately")
         logging.shutdown()            # flush the log file before the hard exit
         os._exit(0)                   # releases the mutex at once; no lingering

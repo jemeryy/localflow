@@ -169,14 +169,6 @@ class LiveTyper:
             tail = all_words[count:]
             boundary = all_words[count - 1] if 1 <= count <= len(all_words) \
                 else None
-            # One-word overlap guard: a word-count drift between the preview
-            # and the authoritative decode ("I'm" typed vs "I am" decoded)
-            # would re-type the last word. Dropping a genuine immediate
-            # repeat is the cheaper mistake (Jeremy 27 Jul: no duplicates).
-            screen_words = self._screen.split()
-            if tail and screen_words and _norm(tail[0]) == _norm(screen_words[-1]):
-                boundary = tail[0]    # its authoritative surface still counts
-                tail = tail[1:]
             self._append(tail, final=final, boundary=boundary)
 
     # -- the loop ---------------------------------------------------------
@@ -280,6 +272,18 @@ class LiveTyper:
         n_back = 0
         prefix = ""
         screen_words = self._screen.split()
+        # One-word overlap guard: alignment drift between the screen and the
+        # resolving decode ("I'm" typed vs "I am" heard, or a hypothesis that
+        # grew a word mid-sentence) would re-type the last word — seen live
+        # 30 Jul as "retire retire" on the PREVIEW path, so the guard lives
+        # here where both paths (_revise and on_segment_text) converge. The
+        # dropped word's newer surface still resolves the boundary mark.
+        # Dropping a genuine immediate repeat is the cheaper mistake
+        # (Jeremy 27 Jul: no duplicates).
+        if (words and screen_words
+                and _norm(words[0])
+                and _norm(words[0]) == _norm(screen_words[-1])):
+            boundary = words.pop(0)
         if (words or final) and screen_words:
             bare, cur = _split_punct(screen_words[-1])
             want = cur

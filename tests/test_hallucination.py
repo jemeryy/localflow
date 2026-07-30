@@ -111,6 +111,21 @@ def test_normal_text_passes_through_unchanged():
     assert strip_hallucinations(text) == text
 
 
+def test_trailing_ellipsis_is_stripped():
+    # Whisper trails off into dots when speech fades (live 30 Jul: "for
+    # the......", "that is all or..."). Never dictated - drop the run.
+    assert strip_hallucinations("i want the bounce for the......") == \
+        "i want the bounce for the"
+    assert strip_hallucinations("accurate that is all or...") == \
+        "accurate that is all or"
+    assert strip_hallucinations("wait…") == "wait"
+    assert strip_hallucinations("...") == ""
+
+
+def test_single_full_stop_is_kept():
+    assert strip_hallucinations("Meeting at three.") == "Meeting at three."
+
+
 def test_idempotent():
     once = strip_hallucinations("Meeting at three. You.")
     assert strip_hallucinations(once) == once == "Meeting at three."

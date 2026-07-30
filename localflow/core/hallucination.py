@@ -158,6 +158,9 @@ _TRAILING_STOCK = re.compile(
 # said). Case-sensitive on purpose: lowercase is real speech ("Like thank
 # you."), and the \s+ means a bare whole-utterance "Thank you." is untouched.
 _DETACHED_THANKS = re.compile(r"\s+Thank\s+you\b[\s.!?]*$")
+# Whisper trails off into an ellipsis when speech fades mid-thought ("that is
+# all or...", "for the......"). Never dictated speech — drop a trailing run.
+_TRAILING_ELLIPSIS = re.compile(r"\s*(?:\.{2,}|…+)$")
 
 
 def _drop_trailing_double(text: str) -> str:
@@ -203,6 +206,7 @@ def strip_hallucinations(text: str) -> str:
         if peeled == result:
             break
         result = peeled
+    result = _TRAILING_ELLIPSIS.sub("", result).strip()
     result = _drop_trailing_double(result)
     norm = _normalize(result)
     if not norm or norm in _WHOLE_UTTERANCE:   # only-punctuation counts as empty

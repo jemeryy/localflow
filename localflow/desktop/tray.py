@@ -55,8 +55,9 @@ class TrayIcon:
                  cleanup_get=None, cleanup_toggle=None,
                  visibility_get=None, visibility_set=None,
                  reset_pill_position=None, open_settings=None,
-                 narrate=None):
+                 narrate=None, restart=None):
         self._config_path = config_path
+        self._restart_cb = restart
         self._images = make_state_images()
         if cleanup_get is not None:
             # FR-14 toggle: checkmark reflects app.cleanup_active live.
@@ -101,11 +102,14 @@ class TrayIcon:
             # M8: the real settings window (built on the overlay UI thread).
             extra.append(pystray.MenuItem(
                 "Settings...", lambda icon, item: open_settings()))
+        restart_item = ([pystray.MenuItem("Restart LocalFlow", self._do_restart)]
+                        if restart is not None else [])
         menu = pystray.Menu(
             pystray.MenuItem(status, None, enabled=False),
             cleanup_item,
             *extra,
             pystray.MenuItem("Open settings file", self._open_settings),
+            *restart_item,
             pystray.MenuItem("Quit LocalFlow", self._quit),
         )
         self._icon = pystray.Icon(
@@ -131,6 +135,16 @@ class TrayIcon:
             log.exception("could not open settings file %s", self._config_path)
 
     def _quit(self, icon, item) -> None:
+        icon.stop()
+
+    def _do_restart(self, icon, item) -> None:
+        """Fresh process, fresh GPU/memory state — the fix for a long session
+        gone sluggish. The callback flags the relaunch; quitting the icon
+        loop drives the normal teardown, which spawns the new instance."""
+        try:
+            self._restart_cb()
+        except Exception:
+            log.exception("restart request failed — quitting instead")
         icon.stop()
 
     def run(self) -> None:
