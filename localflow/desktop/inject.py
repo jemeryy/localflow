@@ -92,10 +92,18 @@ def _post_backspaces(hwnd: int, n: int) -> None:
     controls therefore get the WM_CHAR 0x08 they would have been handed
     anyway; Chromium/Gecko surfaces delete on the key-down itself (and
     ignore the 0x08 char), so they get the key pair. Both stay FIFO with
-    the WM_CHAR text that follows."""
+    the WM_CHAR text that follows.
+
+    The key-down style posts the FULL hardware sequence — down, char 0x08,
+    up — not just the key pair: Chromium pairs a key-down with the next
+    char message it sees, and without our own 0x08 in between it consumed
+    the first char of the retype instead (live 30 Jul: the leading space
+    vanished, "though. go" came out "thoughgo"). Chromium ignores a 0x08
+    char as an insert, so the extra message is inert beyond the pairing."""
     if _keydown_deletes(hwnd):
         for _ in range(n):
             _user32.PostMessageW(hwnd, _WM_KEYDOWN, _VK_BACK, _BACK_DOWN_LP)
+            _user32.PostMessageW(hwnd, _WM_CHAR, _VK_BACK, 1)
             _user32.PostMessageW(hwnd, _WM_KEYUP, _VK_BACK, _BACK_UP_LP)
     else:
         for _ in range(n):

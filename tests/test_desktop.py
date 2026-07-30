@@ -1754,8 +1754,11 @@ def test_live_patch_uses_key_backspaces_on_chromium(monkeypatch):
     posted = _fake_user32(monkeypatch, alive_hwnd=42,
                           wnd_class="Chrome_RenderWidgetHostHWND")
     inject.live_patch(1, "x", target=42)
+    # Full hardware sequence per backspace (down, char, up): Chromium pairs
+    # a key-down with the NEXT char message, and must pair our 0x08 - not
+    # the first char of the retype (live 30 Jul: "thoughgo").
     assert [(p[1], p[2]) for p in posted] == [
-        (0x0100, 0x08), (0x0101, 0x08), (0x0102, ord("x"))]
+        (0x0100, 0x08), (0x0102, 0x08), (0x0101, 0x08), (0x0102, ord("x"))]
 
 
 def test_live_patch_key_backspaces_on_electrons_outer_window(monkeypatch):
@@ -1769,7 +1772,7 @@ def test_live_patch_key_backspaces_on_electrons_outer_window(monkeypatch):
                           wnd_class="Chrome_WidgetWin_1")
     inject.live_patch(1, "x", target=42)
     assert [(p[1], p[2]) for p in posted] == [
-        (0x0100, 0x08), (0x0101, 0x08), (0x0102, ord("x"))]
+        (0x0100, 0x08), (0x0102, 0x08), (0x0101, 0x08), (0x0102, ord("x"))]
 
 
 def test_patches_to_a_dead_target_are_dropped(monkeypatch):
