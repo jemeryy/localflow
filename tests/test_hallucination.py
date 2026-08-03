@@ -218,6 +218,26 @@ def test_collapse_doubled_whole_sentence():
     ) == "It's a very flat all the way at the FIH level."
 
 
+def test_collapse_gapped_phrase_repeat():
+    # Live 3 Aug: the preview hypothesis looped a 10-word phrase with one
+    # stray joiner between the copies, so the adjacent rule missed it and
+    # the loop reached the screen.
+    assert collapse_repeats(
+        "modeled out in excel so for example the fi calculators the needs "
+        "analysis the excel so for example the fi calculators the needs "
+        "analysis. What else"
+    ) == ("modeled out in excel so for example the fi calculators the needs "
+          "analysis. What else")
+
+
+def test_collapse_gapped_needs_a_long_phrase():
+    # Short phrases repeat with a word between in real English all the time.
+    for text in ("I like this and I like that",
+                 "we go up and we go down",
+                 "the plan beats the plan we had"):
+        assert collapse_repeats(text) == text
+
+
 def test_collapse_keeps_genuine_english():
     # A single doubled word is real English - never collapsed.
     for text in ("I had had enough of that that day",

@@ -99,15 +99,24 @@ def drop_trailing_hallucinated_chunks(
 _REPEAT_MAX_PHRASE_WORDS = 24
 _REPEAT_MIN_WORD_RUN = 3
 _REPEAT_STRIP = ".,!?;:…\"'"
+# The loop is not always verbatim-adjacent: live 3 Aug a hypothesis repeated
+# a 10-word phrase with one stray joiner between the copies ("...needs
+# analysis THE excel so for..."). A long phrase repeated across a 1-2 token
+# gap is still the model looping - no dictation says 4+ identical words
+# twice with one word between. The joiner is loop junk and is dropped too.
+_REPEAT_MIN_GAPPED_PHRASE = 4
+_REPEAT_MAX_GAP = 2
 
 
 def collapse_repeats(text: str) -> str:
-    """Collapse immediate repetitions to ONE instance: a single word run of
-    3+ ("you you you you"), or a phrase up to a whole sentence repeated back
-    to back ("do anything do anything"). Comparison ignores case and edge
-    punctuation; the first occurrence's text is kept. A single doubled word
-    is deliberately left alone - "had had" is real English, and the LLM
-    cleanup already fixes genuine stumbles when it is on."""
+    """Collapse repetitions to ONE instance: a single word run of 3+
+    ("you you you you"), a phrase up to a whole sentence repeated back to
+    back ("do anything do anything"), or a 4+ word phrase repeated across a
+    1-2 token gap (the gap is dropped with the copy). Comparison ignores
+    case and edge punctuation; the first occurrence's text is kept. A
+    single doubled word is deliberately left alone - "had had" is real
+    English, and the LLM cleanup already fixes genuine stumbles when it is
+    on."""
     tokens = text.split()
     if len(tokens) < 2:
         return text
@@ -141,6 +150,26 @@ def collapse_repeats(text: str) -> str:
                 i += reps * length
                 matched = True
                 break
+        if not matched:
+            # Near-adjacent repeat: a 4+ word phrase again after a tiny gap.
+            for length in range(_REPEAT_MAX_PHRASE_WORDS,
+                                _REPEAT_MIN_GAPPED_PHRASE - 1, -1):
+                for gap in range(1, _REPEAT_MAX_GAP + 1):
+                    j = i + length + gap
+                    if j + length > n:
+                        continue
+                    phrase = [norm(t) for t in tokens[i:i + length]]
+                    if not all(phrase):
+                        continue
+                    if [norm(t) for t in tokens[j:j + length]] == phrase:
+                        # Keep the SECOND copy - its last token carries the
+                        # boundary punctuation; copy one + the gap are junk.
+                        out.extend(tokens[j:j + length])
+                        i = j + length
+                        matched = True
+                        break
+                if matched:
+                    break
         if not matched:
             out.append(tokens[i])
             i += 1
