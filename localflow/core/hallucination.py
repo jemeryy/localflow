@@ -106,9 +106,23 @@ _REPEAT_STRIP = ".,!?;:…\"'"
 # twice with one word between. The joiner is loop junk and is dropped too.
 _REPEAT_MIN_GAPPED_PHRASE = 4
 _REPEAT_MAX_GAP = 2
+# Fastest plausible dictation rate. When the caller supplies the speech
+# duration, a big phrase run keeps as many copies as actually FIT the audio
+# instead of collapsing to one - "I like it" said 3x in 2.9s decoded as x33
+# (live 4 Aug): 33 copies cannot fit, 3 can.
+_REPEAT_MAX_WPS = 3.5
 
 
-def collapse_repeats(text: str, gapped: bool = False) -> str:
+def _min_period(phrase: list[str]) -> int:
+    """Length of the smallest repeating unit ("i like it i like it" -> 3)."""
+    for p in range(1, len(phrase)):
+        if all(phrase[k] == phrase[k - p] for k in range(p, len(phrase))):
+            return p
+    return len(phrase)
+
+
+def collapse_repeats(text: str, gapped: bool = False,
+                     speech_s: float | None = None) -> str:
     """Collapse repetitions to ONE instance: a single word run of 3+
     ("you you you you"), a phrase up to a whole sentence repeated back to
     back ("do anything do anything"), and - only with `gapped=True` - a 4+
@@ -123,7 +137,13 @@ def collapse_repeats(text: str, gapped: bool = False) -> str:
     there a committed loop is permanent (append-only, no correction pass)
     and Jeremy ranked duplicates as the worse failure. The final text that
     feeds paste mode, history and "Copy last dictation" never uses it, so
-    the genuine words always survive somewhere recoverable."""
+    the genuine words always survive somewhere recoverable.
+
+    `speech_s` (the speech duration) turns collapse-to-one into
+    reconstruction for a BIG phrase run (4+ reps, certainly the model
+    looping): keep as many copies as fit the audio at a fast speaking
+    rate, words outside the run claiming time first. Text alone cannot
+    tell "said it 3x" from "said it once, model looped" - the clock can."""
     tokens = text.split()
     if len(tokens) < 2:
         return text
@@ -142,9 +162,11 @@ def collapse_repeats(text: str, gapped: bool = False) -> str:
             phrase = [norm(t) for t in tokens[i:i + length]]
             if not all(phrase):          # pure-punctuation token: no phrase
                 continue
-            if length > 1 and len(set(phrase)) == 1:
-                continue    # a uniform run is the single-word rule's case -
-                            # as a "phrase" it would collapse only half of it
+            if length > 1 and _min_period(phrase) < length:
+                continue    # the phrase is itself periodic ("i like it i
+                            # like it"): let the smallest unit's iteration
+                            # collapse the run fully - matching the big
+                            # block first left 11 of 33 copies (live 4 Aug)
             reps = 1
             while (i + (reps + 1) * length <= n
                    and [norm(t) for t in
@@ -153,7 +175,14 @@ def collapse_repeats(text: str, gapped: bool = False) -> str:
                 reps += 1
             needed = _REPEAT_MIN_WORD_RUN if length == 1 else 2
             if reps >= needed:
-                out.extend(tokens[i:i + length])
+                keep = 1
+                if speech_s is not None and length > 1 and reps >= 4:
+                    # Certainly a loop, but the true count is not 1 either:
+                    # keep the copies that FIT the speech time.
+                    other = n - reps * length
+                    budget = int(speech_s * _REPEAT_MAX_WPS) - other
+                    keep = max(1, min(reps, budget // length))
+                out.extend(tokens[i:i + keep * length])
                 i += reps * length
                 matched = True
                 break
@@ -166,7 +195,7 @@ def collapse_repeats(text: str, gapped: bool = False) -> str:
                     if j + length > n:
                         continue
                     phrase = [norm(t) for t in tokens[i:i + length]]
-                    if not all(phrase):
+                    if not all(phrase) or _min_period(phrase) < length:
                         continue
                     if [norm(t) for t in tokens[j:j + length]] == phrase:
                         # Keep the SECOND copy - its last token carries the

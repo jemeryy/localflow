@@ -79,7 +79,9 @@ def transcribe_audio(
         chunks = meta.get("chunks")
         if chunks:
             raw_text = drop_trailing_hallucinated_chunks(chunks, duration_s)
-        raw_text = collapse_repeats(raw_text)       # decode-loop repeats
+        # speech_s: a big loop keeps the copies that fit the audio, so a
+        # deliberately repeated phrase survives with a plausible count.
+        raw_text = collapse_repeats(raw_text, speech_s=duration_s)
         raw_text = strip_hallucinations(raw_text)   # whole-utterance backstop
         if raw_text != original:
             log.info("hallucination filter: %r -> %r", original, raw_text)

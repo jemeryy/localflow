@@ -218,6 +218,32 @@ def test_collapse_doubled_whole_sentence():
     ) == "It's a very flat all the way at the FIH level."
 
 
+def test_collapse_periodic_run_collapses_fully():
+    # Live 4 Aug: "I like it" x33 - longest-first matched a 24-token block
+    # (itself 8 copies) and left 11 copies. A periodic phrase must defer to
+    # its smallest unit.
+    assert collapse_repeats("I like it " * 33) == "I like it"
+
+
+def test_collapse_big_run_keeps_the_copies_that_fit_the_audio():
+    # He SAID it three times in 2.9s; the decode looped it to 33. Text
+    # alone cannot recover the count - the clock can: 3 copies fit, 33
+    # cannot.
+    assert collapse_repeats("I like it " * 33, speech_s=2.9) == \
+        "I like it I like it I like it"
+    # Words outside the run claim speech time first.
+    assert collapse_repeats("please stop " + "I like it " * 20,
+                            speech_s=2.9) == "please stop I like it I like it"
+    # Single-word runs stay collapse-to-one - "you you you" is never speech.
+    assert collapse_repeats("you you you you", speech_s=5.0) == "you"
+    # Small runs (2-3 reps) stay collapse-to-one even with time to spare:
+    # every confirmed doubled-phrase loop had exactly 2 reps.
+    assert collapse_repeats("It's a very flat all the way at the FIH level. "
+                            "It's a very flat all the way at the FIH level.",
+                            speech_s=6.9) == \
+        "It's a very flat all the way at the FIH level."
+
+
 def test_collapse_gapped_phrase_repeat():
     # Live 3 Aug: the preview hypothesis looped a 10-word phrase with one
     # stray joiner between the copies, so the adjacent rule missed it and
