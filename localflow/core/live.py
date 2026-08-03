@@ -9,6 +9,7 @@ rule testable without a mic or a GPU.
 
 from __future__ import annotations
 
+import difflib
 import re
 
 _WORD = re.compile(r"\S+")
@@ -39,6 +40,40 @@ def commit_prefix(prev_words: list[str], new_words: list[str],
             break
         agreed += 1
     return max(agreed, committed_len)
+
+
+def append_tail(screen: list[str], newer: list[str],
+                fallback: int) -> tuple[list[str], str | None]:
+    """Which words of `newer` still need typing after `screen`, by CONTENT.
+
+    `screen` is what the current window already typed (final - append-only);
+    `newer` is a later text for the same audio (an agreed hypothesis prefix,
+    or the authoritative segment text). Positional slicing (newer[count:])
+    breaks the moment the newer decode merges, splits or inserts a word
+    behind the screen's edge - every later index shifts, and the slice
+    re-types words already on screen ("retire retire", live 30 Jul) or
+    silently skips real ones. Aligning normalised words finds where the
+    screen's text actually ends inside `newer`; everything after that is
+    the tail. Also returns the boundary - the newer surface of the screen's
+    last word - for the punctuation rule.
+
+    When the screen's edge cannot be found in `newer` (the decode rewrote
+    that word; append-only means it stays as typed), `fallback` - the
+    positional count - restores the old slice behaviour.
+    """
+    if not screen:
+        return list(newer), None
+    a = [_norm(w) for w in screen]
+    b = [_norm(w) for w in newer]
+    end = None
+    for a0, b0, size in difflib.SequenceMatcher(
+            a=a, b=b, autojunk=False).get_matching_blocks():
+        if size and a0 + size == len(a):    # this block covers the edge
+            end = b0 + size
+    if end is None:
+        end = min(fallback, len(newer))
+    boundary = newer[end - 1] if end else None
+    return list(newer[end:]), boundary
 
 
 def patch_plan(typed: str, final: str, loose: bool = False) -> tuple[int, str]:

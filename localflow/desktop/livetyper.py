@@ -42,7 +42,7 @@ import time
 
 from localflow.core import collapse_repeats, ensure_16k_mono, \
     strip_hallucinations
-from localflow.core.live import _norm, commit_prefix
+from localflow.core.live import _norm, append_tail, commit_prefix
 
 log = logging.getLogger("localflow.desktop.livetyper")
 
@@ -94,13 +94,19 @@ class LiveTyper:
                                         name="localflow-livetyper")
         # `_screen` is exactly what this dictation has typed into the app.
         # `_prev`/`_committed` track the LIVE window: last raw hypothesis and
-        # how many of its words are typed. `_pending_counts` holds the typed
-        # word count of each cut window (FIFO), consumed when its
-        # authoritative segment text arrives to append the missing tail.
+        # how many of its words have AGREED (an index into that hypothesis).
+        # `_typed` is how many words the live window actually put on screen -
+        # kept separate because a newer hypothesis can shift its indices
+        # (merge/split/insert behind the commit), so the two counts drift
+        # apart; conflating them was the root cause of the 30 Jul
+        # duplications. `_pending_counts` holds the typed word count of each
+        # cut window (FIFO), consumed when its authoritative segment text
+        # arrives to append the missing tail.
         self._lock = threading.Lock()
         self._id: int | None = None
         self._prev: list[str] = []
         self._committed = 0
+        self._typed = 0
         self._pending_counts: list[int] = []
         self._screen = ""
         self._flushed = False
@@ -147,9 +153,10 @@ class LiveTyper:
         with self._lock:
             if dictation_id != self._id:
                 return
-            self._pending_counts.append(self._committed)
+            self._pending_counts.append(self._typed)
             self._prev = []
             self._committed = 0
+            self._typed = 0
 
     def on_segment_text(self, dictation_id: int, text: str) -> None:
         """Authoritative text for the OLDEST unreconciled window — every mid
@@ -164,13 +171,18 @@ class LiveTyper:
                 count = self._pending_counts.pop(0)
             else:
                 final = True                  # the final, uncut window
-                count = self._committed
+                count = self._typed
+                self._typed = 0
                 self._committed = 0
                 self._prev = []
             all_words = text.split()
-            tail = all_words[count:]
-            boundary = all_words[count - 1] if 1 <= count <= len(all_words) \
-                else None
+            # By FIFO order the screen's last `count` words are exactly this
+            # window's typed words (typing pauses while a cut awaits its
+            # text), so the tail is found by aligning them into the
+            # authoritative text - content, not position.
+            screen_words = self._screen.split()
+            window = screen_words[-count:] if count else []
+            tail, boundary = append_tail(window, all_words, count)
             self._append(tail, final=final, boundary=boundary)
 
     # -- the loop ---------------------------------------------------------
@@ -247,16 +259,20 @@ class LiveTyper:
                 return          # a flaky empty decode changes nothing
             committed = commit_prefix(self._prev, words, self._committed)
             old = self._committed
-            fresh = words[old:committed]
             self._prev = words
             self._committed = committed
-            # The newer hypothesis re-heard the boundary: its surface of
-            # the last ALREADY-typed word resolves that word's punctuation.
-            boundary = words[old - 1] if 1 <= old <= len(words) else None
-            self._append(fresh, boundary=boundary)
+            # Type the agreed words the screen doesn't have yet - found by
+            # aligning the window's typed words into the agreed prefix
+            # (content, not position: index drift between hypotheses was
+            # the 30 Jul duplication bug). The boundary - the newer surface
+            # of the last typed word - resolves its punctuation.
+            screen_words = self._screen.split()
+            window = screen_words[-self._typed:] if self._typed else []
+            fresh, boundary = append_tail(window, words[:committed], old)
+            self._typed += self._append(fresh, boundary=boundary)
 
     def _append(self, words: list[str], final: bool = False,
-                boundary: str | None = None) -> None:
+                boundary: str | None = None) -> int:
         """Type `words` after everything already typed (under _lock).
 
         Boundary punctuation (live 29/30 Jul): Whisper punctuates a pause
@@ -311,21 +327,22 @@ class LiveTyper:
         if words:
             out += (" " if self._screen else "") + " ".join(words)
         if not out and not n_back:
-            return
+            return 0
         self._screen += out
         log.info("live type (%s+%r)", f"-{n_back} " if n_back else "", out)
-        if self.on_patch is None:
-            return
-        try:
-            self.on_patch(n_back, out)
-        except Exception:
-            log.exception("live typing failed - dictation continues")
+        if self.on_patch is not None:
+            try:
+                self.on_patch(n_back, out)
+            except Exception:
+                log.exception("live typing failed - dictation continues")
+        return len(words)     # words now on screen (the caller's accounting)
 
     def _reset(self, dictation_id: int | None) -> None:
         with self._lock:
             self._id = dictation_id
             self._prev = []
             self._committed = 0
+            self._typed = 0
             self._pending_counts = []
             self._screen = ""
             self._flushed = False

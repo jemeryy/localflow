@@ -5,11 +5,57 @@ word safe to type yet" decision is testable without a GPU.
 
 from __future__ import annotations
 
-from localflow.core.live import commit_prefix, patch_plan
+from localflow.core.live import append_tail, commit_prefix, patch_plan
 
 
 def _w(text: str) -> list[str]:
     return text.split()
+
+
+# ---- append_tail (content-anchored tail) --------------------------------
+
+
+def test_append_tail_simple_growth():
+    tail, boundary = append_tail(_w("hello there"), _w("hello there my"), 2)
+    assert tail == ["my"] and boundary == "there"
+
+
+def test_append_tail_empty_screen_types_everything():
+    assert append_tail([], _w("hello there"), 0) == (_w("hello there"), None)
+
+
+def test_append_tail_survives_an_inserted_word():
+    # The newer decode grew a word BEHIND the screen's edge: positional
+    # slicing (newer[4:]) would re-type "retire" (live 30 Jul "retire
+    # retire"); content alignment finds the real edge.
+    tail, boundary = append_tail(
+        _w("amounts needed to retire."),
+        _w("amounts needed to a retire to be"), 4)
+    assert tail == ["to", "be"] and boundary == "retire"
+
+
+def test_append_tail_survives_multi_word_drift():
+    tail, boundary = append_tail(
+        _w("we are coming up with"),
+        _w("we are now really coming up with lessons"), 5)
+    assert tail == ["lessons"] and boundary == "with"
+
+
+def test_append_tail_does_not_skip_words_when_the_edge_shifts_back():
+    # The newer decode MERGED two words before the edge: positional slicing
+    # (newer[5:]) would silently drop "on" - the mirror bug of re-typing.
+    tail, boundary = append_tail(
+        _w("I want to go on"),
+        _w("I wanna go on with it"), 5)
+    assert tail == ["with", "it"] and boundary == "on"
+
+
+def test_append_tail_falls_back_to_position_when_the_edge_is_rewritten():
+    # Append-only: the rewritten edge word stays as typed, and the old
+    # positional behaviour decides the tail.
+    tail, boundary = append_tail(
+        _w("i rode a bike"), _w("i wrote a book fast"), 4)
+    assert tail == ["fast"] and boundary == "book"
 
 
 # ---- commit_prefix (LocalAgreement-2) -----------------------------------
