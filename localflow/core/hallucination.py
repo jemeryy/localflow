@@ -108,15 +108,22 @@ _REPEAT_MIN_GAPPED_PHRASE = 4
 _REPEAT_MAX_GAP = 2
 
 
-def collapse_repeats(text: str) -> str:
+def collapse_repeats(text: str, gapped: bool = False) -> str:
     """Collapse repetitions to ONE instance: a single word run of 3+
     ("you you you you"), a phrase up to a whole sentence repeated back to
-    back ("do anything do anything"), or a 4+ word phrase repeated across a
-    1-2 token gap (the gap is dropped with the copy). Comparison ignores
-    case and edge punctuation; the first occurrence's text is kept. A
-    single doubled word is deliberately left alone - "had had" is real
-    English, and the LLM cleanup already fixes genuine stumbles when it is
-    on."""
+    back ("do anything do anything"), and - only with `gapped=True` - a 4+
+    word phrase repeated across a 1-2 token gap (the gap is dropped with
+    the copy). Comparison ignores case and edge punctuation; the first
+    occurrence's text is kept. A single doubled word is deliberately left
+    alone - "had had" is real English, and the LLM cleanup already fixes
+    genuine stumbles when it is on.
+
+    `gapped` is OPT-IN because it can eat a deliberate near-repeat ("I
+    want it done, and I want it done"). Only the live preview enables it -
+    there a committed loop is permanent (append-only, no correction pass)
+    and Jeremy ranked duplicates as the worse failure. The final text that
+    feeds paste mode, history and "Copy last dictation" never uses it, so
+    the genuine words always survive somewhere recoverable."""
     tokens = text.split()
     if len(tokens) < 2:
         return text
@@ -150,7 +157,7 @@ def collapse_repeats(text: str) -> str:
                 i += reps * length
                 matched = True
                 break
-        if not matched:
+        if not matched and gapped:
             # Near-adjacent repeat: a 4+ word phrase again after a tiny gap.
             for length in range(_REPEAT_MAX_PHRASE_WORDS,
                                 _REPEAT_MIN_GAPPED_PHRASE - 1, -1):

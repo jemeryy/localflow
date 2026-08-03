@@ -222,12 +222,15 @@ def test_collapse_gapped_phrase_repeat():
     # Live 3 Aug: the preview hypothesis looped a 10-word phrase with one
     # stray joiner between the copies, so the adjacent rule missed it and
     # the loop reached the screen.
-    assert collapse_repeats(
+    looped = ("modeled out in excel so for example the fi calculators the "
+              "needs analysis the excel so for example the fi calculators "
+              "the needs analysis. What else")
+    assert collapse_repeats(looped, gapped=True) == (
         "modeled out in excel so for example the fi calculators the needs "
-        "analysis the excel so for example the fi calculators the needs "
-        "analysis. What else"
-    ) == ("modeled out in excel so for example the fi calculators the needs "
-          "analysis. What else")
+        "analysis. What else")
+    # Opt-in only: the final/history text keeps genuine near-repeats, so a
+    # wrongly-collapsed phrase is always recoverable from history.
+    assert collapse_repeats(looped) == looped
 
 
 def test_collapse_gapped_needs_a_long_phrase():
@@ -235,7 +238,7 @@ def test_collapse_gapped_needs_a_long_phrase():
     for text in ("I like this and I like that",
                  "we go up and we go down",
                  "the plan beats the plan we had"):
-        assert collapse_repeats(text) == text
+        assert collapse_repeats(text, gapped=True) == text
 
 
 def test_collapse_keeps_genuine_english():

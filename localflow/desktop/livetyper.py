@@ -248,7 +248,10 @@ class LiveTyper:
         # never type "You." / "Thank you." (live 27 Jul), and a decode-loop
         # stutter in the hypothesis ("coming up with up with") must collapse
         # BEFORE two decodes can agree on it and commit (live 30 Jul).
-        self._revise(collapse_repeats(strip_hallucinations(text)).split(),
+        # gapped=True is preview-only: a committed loop is permanent here,
+        # while the final/history text keeps genuine near-repeats intact.
+        self._revise(collapse_repeats(strip_hallucinations(text),
+                                      gapped=True).split(),
                      dictation_id)
 
     def _revise(self, words: list[str], dictation_id: int) -> None:
