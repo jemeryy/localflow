@@ -209,6 +209,15 @@ def test_collapse_doubled_phrase():
     assert collapse_repeats("Thank you. Thank you. Thank you.") == "Thank you."
 
 
+def test_collapse_doubled_whole_sentence():
+    # Live 30 Jul: Whisper decoded 11- and 16-word sentences twice back to
+    # back; the old 6-word phrase cap let both through.
+    assert collapse_repeats(
+        "It's a very flat all the way at the FIH level. "
+        "It's a very flat all the way at the FIH level."
+    ) == "It's a very flat all the way at the FIH level."
+
+
 def test_collapse_keeps_genuine_english():
     # A single doubled word is real English - never collapsed.
     for text in ("I had had enough of that that day",

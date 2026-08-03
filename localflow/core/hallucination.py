@@ -93,16 +93,18 @@ def drop_trailing_hallucinated_chunks(
 # repeat mid-transcript ("for... for... for...", "do anything do anything",
 # seen live 11 Jul). Genuine dictation repeats a single word twice ("had
 # had", "that that"), so a lone double is kept; three-plus of one word, or
-# an immediate verbatim repeat of a short phrase, is the model looping.
-_REPEAT_MAX_PHRASE_WORDS = 6
+# an immediate verbatim repeat of a phrase, is the model looping. The cap
+# covers a whole doubled SENTENCE: live 30 Jul Whisper decoded 11- and
+# 16-word sentences twice back to back and the old cap of 6 let both through.
+_REPEAT_MAX_PHRASE_WORDS = 24
 _REPEAT_MIN_WORD_RUN = 3
 _REPEAT_STRIP = ".,!?;:…\"'"
 
 
 def collapse_repeats(text: str) -> str:
     """Collapse immediate repetitions to ONE instance: a single word run of
-    3+ ("you you you you"), or a 2-6 word phrase repeated back to back
-    ("do anything do anything"). Comparison ignores case and edge
+    3+ ("you you you you"), or a phrase up to a whole sentence repeated back
+    to back ("do anything do anything"). Comparison ignores case and edge
     punctuation; the first occurrence's text is kept. A single doubled word
     is deliberately left alone - "had had" is real English, and the LLM
     cleanup already fixes genuine stumbles when it is on."""

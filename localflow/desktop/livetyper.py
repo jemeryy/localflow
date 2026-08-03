@@ -40,7 +40,8 @@ import logging
 import threading
 import time
 
-from localflow.core import ensure_16k_mono, strip_hallucinations
+from localflow.core import collapse_repeats, ensure_16k_mono, \
+    strip_hallucinations
 from localflow.core.live import _norm, commit_prefix
 
 log = logging.getLogger("localflow.desktop.livetyper")
@@ -49,6 +50,7 @@ POLL_INTERVAL_S = 0.7
 MIN_WINDOW_S = 1.5      # a shorter window decodes to noise; wait for audio
 _SENTENCE_END = ".!?"   # pause artifacts the fallback heuristic may drop
 _PUNCT = ".,!?;:"       # marks the boundary rule may add/replace/remove
+_OVERLAP_MAX_WORDS = 8  # longest already-typed phrase the guard may drop
 
 
 def _first_alpha(word: str) -> str:
@@ -230,9 +232,12 @@ class LiveTyper:
             self.engine_lock.release()
         log.debug("preview: %.1fs window decoded in %dms -> %r",
                   len(snap) / rate, int((time.perf_counter() - t0) * 1000), text)
-        # The same silence-artifact filter the final pass uses: a pause must
-        # never type "You." / "Thank you." (live 27 Jul).
-        self._revise(strip_hallucinations(text).split(), dictation_id)
+        # The same silence-artifact filters the final pass uses: a pause must
+        # never type "You." / "Thank you." (live 27 Jul), and a decode-loop
+        # stutter in the hypothesis ("coming up with up with") must collapse
+        # BEFORE two decodes can agree on it and commit (live 30 Jul).
+        self._revise(collapse_repeats(strip_hallucinations(text)).split(),
+                     dictation_id)
 
     def _revise(self, words: list[str], dictation_id: int) -> None:
         with self._lock:
@@ -272,18 +277,21 @@ class LiveTyper:
         n_back = 0
         prefix = ""
         screen_words = self._screen.split()
-        # One-word overlap guard: alignment drift between the screen and the
-        # resolving decode ("I'm" typed vs "I am" heard, or a hypothesis that
-        # grew a word mid-sentence) would re-type the last word — seen live
-        # 30 Jul as "retire retire" on the PREVIEW path, so the guard lives
-        # here where both paths (_revise and on_segment_text) converge. The
-        # dropped word's newer surface still resolves the boundary mark.
-        # Dropping a genuine immediate repeat is the cheaper mistake
-        # (Jeremy 27 Jul: no duplicates).
-        if (words and screen_words
-                and _norm(words[0])
-                and _norm(words[0]) == _norm(screen_words[-1])):
-            boundary = words.pop(0)
+        # Overlap guard: alignment drift or a decode-loop stutter would
+        # re-type words already on screen — seen live 30 Jul as "retire
+        # retire" (one word, preview path) and "coming up with up with"
+        # (two words), so the guard lives here where both paths (_revise
+        # and on_segment_text) converge and matches the longest phrase, not
+        # just one word. The last dropped word's newer surface still
+        # resolves the boundary mark. Dropping a genuine immediate repeat
+        # is the cheaper mistake (Jeremy 27 Jul: no duplicates).
+        for k in range(min(len(words), len(screen_words), _OVERLAP_MAX_WORDS),
+                       0, -1):
+            head = [_norm(w) for w in words[:k]]
+            if all(head) and head == [_norm(w) for w in screen_words[-k:]]:
+                boundary = words[k - 1]
+                del words[:k]
+                break
         if (words or final) and screen_words:
             bare, cur = _split_punct(screen_words[-1])
             want = cur

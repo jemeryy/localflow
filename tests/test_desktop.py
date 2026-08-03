@@ -1566,6 +1566,37 @@ def test_livetyper_preview_overlap_drift_does_not_duplicate_a_word():
     assert screen[0] == lt.text()
 
 
+def test_livetyper_phrase_overlap_drift_does_not_duplicate_words():
+    """A hypothesis that re-grows words behind the commit can make the fresh
+    words start with a PHRASE already on screen, not just one word (live
+    30 Jul: "coming up with up with lessons"). The guard matches the
+    longest overlapping phrase."""
+    screen = [""]
+    lt = _livetyper(["we are coming up with",
+                     "we are coming up with",
+                     "we are now really coming up with lessons",
+                     "we are now really coming up with lessons"], screen=screen)
+    lt._tick()
+    lt._tick()
+    assert screen[0] == "we are coming up with"
+    lt._tick()
+    lt._tick()
+    assert screen[0] == "we are coming up with lessons"
+    assert screen[0] == lt.text()
+
+
+def test_livetyper_preview_collapses_decode_loop_stutter():
+    """A stuttered hypothesis ("up with up with") must collapse BEFORE two
+    decodes agree on it and commit the repeat (live 30 Jul)."""
+    screen = [""]
+    lt = _livetyper(["coming up with up with lessons",
+                     "coming up with up with lessons"], screen=screen)
+    lt._tick()
+    lt._tick()
+    assert screen[0] == "coming up with lessons"
+    assert screen[0] == lt.text()
+
+
 def test_livetyper_late_mark_is_added_at_the_boundary():
     """A mark the fuller decode discovers AFTER the word was typed bare
     still lands (live 30 Jul: "think about What" should have gained the
