@@ -24,6 +24,33 @@ def test_defaults_when_no_file():
     assert cfg.input_device is None
 
 
+def test_stt_model_defaults_to_whisper_and_validates():
+    cfg = config.load_config(None)
+    assert cfg.stt_model == "whisper"          # the v1.2 baseline, untouched
+    assert cfg.auto_calibrate_minutes == 0.0   # idle recalibration opt-in
+
+
+def test_stt_model_parakeet_and_auto_calibrate_load(tmp_path):
+    p = tmp_path / "localflow.toml"
+    p.write_text('stt_model = "parakeet"\nauto_calibrate_minutes = 120\n',
+                 encoding="utf-8")
+    cfg = config.load_config(p)
+    assert cfg.stt_model == "parakeet"
+    assert cfg.auto_calibrate_minutes == 120
+    # relative parakeet dir resolves against the config file's directory
+    assert Path(cfg.parakeet_model_dir) == \
+        tmp_path / "models" / "parakeet-tdt-0.6b-v2-onnx"
+
+
+def test_bad_stt_model_and_calibrate_interval_rejected(tmp_path):
+    for body in ('stt_model = "deepgram"\n', 'auto_calibrate_minutes = -5\n',
+                 'auto_calibrate_minutes = 9999\n'):
+        p = tmp_path / "localflow.toml"
+        p.write_text(body, encoding="utf-8")
+        with pytest.raises(ValueError):
+            config.load_config(p)
+
+
 def test_load_config_reads_values_and_resolves_paths(tmp_path):
     p = tmp_path / "localflow.toml"
     p.write_text(

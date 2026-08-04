@@ -30,7 +30,12 @@ DEFAULT_CONFIG_TOML = """\
 # Relative paths resolve against this file's directory.
 
 hotkey = "alt+`"          # hold-to-talk combo, e.g. "alt+`", "ctrl+space", "f9"
+stt_model = "whisper"     # whisper (GPU, the v1.2 baseline) | parakeet
+                          # (transducer on CPU: no decode loops, no silence
+                          # hallucinations, frees the GPU; English only).
+                          # Restart to apply. See docs/parakeet-spike.md.
 stt_model_dir = "models/whisper-turbo-ov"
+parakeet_model_dir = "models/parakeet-tdt-0.6b-v2-onnx"
 stt_language = "en"       # spoken language: "en", "auto" (detect each time),
                           # or a Whisper code like "fr", "es", "de", "zh",
                           # "ja". "en" is most reliable if you dictate English;
@@ -77,6 +82,11 @@ auto_gain = true          # nudge the Windows mic input level up when real
                           # like meeting apps do; default-mic mode only
 vad_threshold = 0.5       # speech sensitivity: lower = quiet speech accepted,
                           # higher = background noise gated (slider 0.3-0.7)
+auto_calibrate_minutes = 0  # re-measure the room-noise floor this often while
+                          # idle (the mic-in-use light blinks for ~2s; a sample
+                          # with speech in it is discarded). Refreshes the
+                          # denoise profile only - it never moves your sliders.
+                          # 0 = off (calibrate manually from Settings).
 filter_hallucinations = true  # drop the stray word/phrase Whisper appends to
                           # the end on trailing silence (a "you", "thanks for
                           # watching", ...). Uses timestamps to spot the fake
@@ -112,7 +122,8 @@ tts_volume = 1.0          # narration loudness multiplier: 1.0 = normal, lower
 [replacements]
 """
 
-_PATH_FIELDS = ("stt_model_dir", "cache_dir", "cleanup_model_dir", "tts_voice")
+_PATH_FIELDS = ("stt_model_dir", "parakeet_model_dir", "cache_dir",
+                "cleanup_model_dir", "tts_voice")
 
 
 class Config(BaseModel):
@@ -122,7 +133,13 @@ class Config(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     hotkey: str = "alt+`"
+    # Which speech model transcribes: "whisper" (OpenVINO on GPU, the v1.2
+    # baseline) or "parakeet" (TDT transducer on CPU - structurally immune to
+    # decode loops and silence hallucinations; docs/parakeet-spike.md).
+    # Restart to apply, like device/model-dir.
+    stt_model: Literal["whisper", "parakeet"] = "whisper"
     stt_model_dir: str = "models/whisper-turbo-ov"
+    parakeet_model_dir: str = "models/parakeet-tdt-0.6b-v2-onnx"
     # Spoken language. "en" forces English (most reliable when you dictate
     # English), "auto" detects the language per utterance, or a Whisper code
     # ("fr", "es", "de", "zh", "ja", ...) forces that language. Restart to
@@ -221,6 +238,18 @@ class Config(BaseModel):
     def _vad_threshold_sane(cls, v: float) -> float:
         if not 0.1 <= v <= 0.9:
             raise ValueError("vad_threshold must be between 0.1 and 0.9")
+        return v
+    # Re-measure the room-noise floor this often while idle (0 = off). Only
+    # refreshes the denoise profile; the user's sliders are never moved. A
+    # sample the VAD hears speech in is discarded and retried next cycle.
+    auto_calibrate_minutes: float = 0.0
+
+    @field_validator("auto_calibrate_minutes")
+    @classmethod
+    def _auto_calibrate_sane(cls, v: float) -> float:
+        if not 0 <= v <= 1440:
+            raise ValueError("auto_calibrate_minutes must be between 0 (off) "
+                             "and 1440 (daily)")
         return v
     # Drop Whisper's trailing-silence hallucinations (a stray word/phrase
     # appended to the end). When on, STT runs with timestamps so the fake tail

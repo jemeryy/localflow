@@ -2,7 +2,12 @@
 # Relative paths resolve against this file's directory.
 
 hotkey = "alt+`"          # hold-to-talk combo, e.g. "alt+`", "ctrl+space", "f9"
+stt_model = "parakeet"    # LIVE A/B (4 Aug): transducer on CPU - no decode
+                          # loops, no silence hallucinations, frees the GPU.
+                          # Flip back to "whisper" + Restart = exact v1.2
+                          # baseline. See docs/parakeet-spike.md.
 stt_model_dir = "models/whisper-turbo-ov"
+parakeet_model_dir = "models/parakeet-tdt-0.6b-v2-onnx"
 stt_language = "en"       # "en", "auto" (detect each time), or a Whisper code
                           # like "fr"/"es"/"de"/"zh"/"ja". Restart to apply.
 device = "GPU"            # GPU | NPU | CPU
@@ -48,6 +53,9 @@ hot_words = []
 overlay_visibility = "always"
 pill_size = 1.01
 vad_threshold = 0.42
+auto_calibrate_minutes = 120  # idle room-noise recalibration (profile only,
+                          # never moves the sliders; skips if you spoke or
+                          # dictated in the last 5 min). 0 = off.
 filter_hallucinations = true  # drop the stray word Whisper appends on trailing
                           # silence (uses timestamps; also stops the real last
                           # word dropping; ~2x STT time). false = faster, no fix

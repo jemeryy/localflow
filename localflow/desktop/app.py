@@ -406,6 +406,10 @@ class LocalFlowApp:
         # (found by review) - claim_mic_session() and on_hotkey_down both
         # decide under this lock, so exactly one owner wins.
         self.mic_session_lock = threading.Lock()
+        # When the mic last started a session (dictation, test or calibrate).
+        # Idle auto-calibration only samples well clear of this, so its 2s
+        # claim can practically never eat a hotkey press mid-flow.
+        self.last_mic_use = 0.0
         # M11: tap-to-toggle vs hold-to-talk, plus the keyboard suppression
         # that runs for the length of a dictation. The gate also swallows the
         # key-up of a refused key-down (the listener tracks the combo as
@@ -477,6 +481,7 @@ class LocalFlowApp:
             if self.mic_test_active or self.recorder.recording:
                 return False
             self.mic_test_active = True
+            self.last_mic_use = time.monotonic()
             return True
 
     def set_live_typing(self, on: bool) -> None:
@@ -523,6 +528,7 @@ class LocalFlowApp:
             # this hold's segments together (and a stale mid cut from a prior
             # hold can never attach to this one).
             self._dictation_id += 1
+            self.last_mic_use = time.monotonic()
             self.recorder.start()
         # The field under the caret RIGHT NOW is this dictation's target —
         # everything the dictation types is posted to it, wherever the user
@@ -543,6 +549,7 @@ class LocalFlowApp:
 
     def _stop_dictation(self) -> None:
         self._release_keyboard()
+        self.last_mic_use = time.monotonic()
         # Atomic with any in-flight segment cut (Tier 1): stop() drains the
         # whole remaining buffer as the FINAL segment while the produce lock is
         # held, so a segmenter cut either lands fully before this or is refused
@@ -1755,6 +1762,31 @@ def _run(args: argparse.Namespace) -> int:
                          name="localflow-calibrate").start()
         return True
 
+    def auto_calibrate_loop() -> None:
+        """Keep the room-noise floor current while idle (Jeremy 4 Aug).
+        Profile refresh ONLY - the tuning recommendation is logged, never
+        applied, so the sliders stay his. Safe by construction:
+        calibrate_noise claims the mic atomically (refused = skip), discards
+        any sample the VAD hears speech in, and the idle guard keeps the 2s
+        claim well clear of active dictation."""
+        interval_s = cfg.auto_calibrate_minutes * 60.0
+        idle_s = 300.0
+
+        def done(msg: str, _tuning) -> None:
+            log.info("auto-calibrate: %s", msg)
+
+        while not quit_event.wait(interval_s):
+            if time.monotonic() - app.last_mic_use < idle_s:
+                continue                      # recently dictating: not idle
+            if not calibrate_noise(done):
+                continue                      # mic busy right now: next cycle
+
+    if cfg.auto_calibrate_minutes > 0:
+        threading.Thread(target=auto_calibrate_loop, daemon=True,
+                         name="localflow-autocalibrate").start()
+        log.info("idle room-noise recalibration every %.0f min",
+                 cfg.auto_calibrate_minutes)
+
     def clear_noise_calibration() -> str:
         from localflow.desktop import noiseprofile
         removed = noiseprofile.clear_profile()
@@ -1901,11 +1933,24 @@ def _run(args: argparse.Namespace) -> int:
 
             _progress(0.30, "Loading model")
             t0 = time.perf_counter()
-            engine = SttEngine(cfg.stt_model_dir, device=cfg.device,
-                               fallback_device=cfg.fallback_device,
-                               cache_dir=cfg.cache_dir,
-                               language=to_language_token(cfg.stt_language),
-                               initial_prompt=initial_prompt)
+            engine = None
+            if cfg.stt_model == "parakeet":
+                # Transducer on CPU (docs/parakeet-spike.md): immune to
+                # decode loops / silence hallucinations, frees the iGPU.
+                # A load failure falls back to whisper - dictation must
+                # never be dead over a missing model dir.
+                try:
+                    from localflow.core.parakeet import ParakeetEngine
+                    engine = ParakeetEngine(cfg.parakeet_model_dir)
+                except Exception:
+                    log.exception("parakeet engine failed to load — "
+                                  "falling back to whisper")
+            if engine is None:
+                engine = SttEngine(cfg.stt_model_dir, device=cfg.device,
+                                   fallback_device=cfg.fallback_device,
+                                   cache_dir=cfg.cache_dir,
+                                   language=to_language_token(cfg.stt_language),
+                                   initial_prompt=initial_prompt)
             engine_build_ms = int((time.perf_counter() - t0) * 1000)
             app.engine = engine
             status_holder["text"] = f"{engine.model_name} on {engine.device}"

@@ -63,10 +63,13 @@ the whole set, including silence and repeat counts.
 - No timestamps used yet; the chunk-timing hallucination filter is
   Whisper-specific and simply would not be needed.
 
-## Integration plan (NOT done — needs Jeremy's go)
+## Integration (DONE 4 Aug, Jeremy's go — live A/B running)
 
-`stt_model = "whisper" | "parakeet"` in localflow.toml; a small
-`ParakeetEngine` implementing the same `transcribe(audio16k) -> (text, meta)`
-contract; whisper remains default + fallback. Live A/B: dictate normally for a
-day with parakeet on, compare feel + history quality; sign off before any
-default flip. No regression path: the flag OFF is exactly v1.2 behaviour.
+`stt_model = "whisper" | "parakeet"` in localflow.toml (restart to apply;
+code default stays "whisper" = exact v1.2). `localflow/core/parakeet.py`
+implements the `transcribe(audio16k) -> (text, meta)` contract (int8 model in
+`models/parakeet-tdt-0.6b-v2-onnx`, onnx-asr in the MAIN venv now — pip check
+clean, numpy untouched). A parakeet load failure logs and falls back to
+whisper, so dictation is never dead. Jeremy's localflow.toml is flipped to
+parakeet for the live A/B; sign-off decides the default. Flip back +
+tray Restart = the saved baseline.
