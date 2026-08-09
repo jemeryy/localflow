@@ -202,6 +202,7 @@ class WaveformOverlay:
         self.on_narrate = None        # menu Narrate: speak the selection aloud
         self.on_position_change = None  # called with [x, y] on drag, None on reset
         self.on_settings = None       # menu Settings row; None -> open the toml
+        self.on_restart = None        # menu Restart row; None -> row hidden
         # M8: app-provided factory building the settings window on THIS
         # overlay's UI thread (called with the Tk root). None -> toml.
         self.settings_factory = None
@@ -418,12 +419,15 @@ class WaveformOverlay:
             # Narrate row appears only when read-aloud is wired (on_narrate set).
             narrate = (("narrate", "Narrate selection"),) \
                 if self.on_narrate is not None else ()
+            restart = (("restart", "Restart"),) \
+                if self.on_restart is not None else ()
             return (("copy", "Copy last dictation"),
                     *narrate,
                     ("unlock", "Lock position" if drag_ui["unlocked"]
                      else "Unlock position"),
                     ("reset", "Reset position"),
                     ("settings", "Settings"),
+                    *restart,
                     ("quit", "Quit"))
 
         menu_geo: dict[str, tuple[int, int, int, int]] = {}
@@ -686,6 +690,10 @@ class WaveformOverlay:
                         call_safely(self.on_settings, "settings")
                     else:
                         open_settings()
+                elif hit == "restart":
+                    # Same as tray Restart: the teardown spawns the fresh
+                    # instance, so this just asks the app to shut down.
+                    call_safely(self.on_restart, "restart")
                 elif hit == "quit":
                     call_safely(self.on_quit, "quit")
                 else:                        # off any row -> dismiss

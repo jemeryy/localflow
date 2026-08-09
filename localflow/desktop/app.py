@@ -1906,6 +1906,15 @@ def _run(args: argparse.Namespace) -> int:
         overlay.on_copy_last = copy_last_text
         overlay.on_narrate = narrate_selection   # None if TTS off/voice missing
         overlay.on_quit = request_quit
+
+        def request_restart_from_pill() -> None:
+            # Pill "Restart" = tray "Restart": flag the relaunch, then run
+            # the normal quit teardown, which spawns the fresh instance.
+            log.info("restart requested from the overlay")
+            restart_ref["want"] = True
+            request_quit()
+
+        overlay.on_restart = request_restart_from_pill
         wire_settings_ui(overlay)
         overlay.set_progress(0.05, "Starting")  # loading bar from the first frame
 
