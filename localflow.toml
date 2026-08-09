@@ -19,9 +19,12 @@ restore_delay_ms = 500    # clipboard restore delay; raise it if a slow app
 max_utterance_s = 300     # longest single hold-to-talk (seconds). Whisper
                           # stitches long audio itself, so talk for minutes;
                           # 0 = no limit. Also editable in Settings.
-segment_seconds = 30      # Tier 1: past this many seconds of one hold, cut at
+segment_seconds = 15      # Tier 1: past this many seconds of one hold, cut at
                           # a silence and transcribe that piece while you keep
                           # talking (short wait on release). 0 = off.
+                          # 30 -> 15 (9 Aug): preview re-decodes the WHOLE
+                          # window every beat on CPU, so a shorter window
+                          # keeps the live stream close behind your voice.
 live_typing = true        # type words into the focused app ~1-2s behind your
                           # voice, then correct the ending when you stop. Also
                           # enables tap-to-toggle (tap to start, tap to stop,
