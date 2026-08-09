@@ -70,7 +70,7 @@ pill_size = 1.0           # pill scale: 0.5 small ... 2.0 huge
 cleanup_enabled = false   # LLM cleanup: removes filler, fixes punctuation.
                           # false = not loaded at startup (saves ~2-3GB memory);
                           # the tray toggle loads it on demand. true = always on.
-cleanup_model_dir = "models/qwen2.5-3b-ov"
+cleanup_model_dir = "models/gemma-3-4b-ov"
 
 # Audio cleanup BEFORE transcription (helps the quiet/noisy built-in mic most).
 denoise_enabled = true    # high-pass + gentle spectral noise reduction
@@ -219,7 +219,13 @@ class Config(BaseModel):
             raise ValueError("overlay_position must be [x, y]")
         return v
     cleanup_enabled: bool = False
-    cleanup_model_dir: str = "models/qwen2.5-3b-ov"
+    # 9 Aug Gemma spike: gemma-3-4b int4 beat qwen2.5-3b on every cleanup
+    # case (edits instead of answering; context-gated cloud->Claude fix)
+    # at similar size. qwen2.5-3b-ov stays on disk as the fallback.
+    cleanup_model_dir: str = "models/gemma-3-4b-ov"
+    # Jargon fed to the cleanup prompt (NOT a replacement dictionary): the
+    # model fixes a mishearing to one of these only when context agrees.
+    cleanup_terms: list[str] = []
     # Audio cleanup before STT. denoise = high-pass + gentle spectral gating;
     # normalize = boost quiet mics. denoise_strength is the safety valve: dial
     # it down (or set denoise_enabled=false) if denoising ever costs accuracy.

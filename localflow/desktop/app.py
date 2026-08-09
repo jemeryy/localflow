@@ -1342,7 +1342,8 @@ def _run(args: argparse.Namespace) -> int:
         def cleanup_loader():
             from localflow.core import CleanupEngine
             engine = CleanupEngine(cfg.cleanup_model_dir, device=cfg.device,
-                                   cache_dir=cfg.cache_dir)
+                                   cache_dir=cfg.cache_dir,
+                                   terms=cfg.cleanup_terms)
             try:
                 engine.clean("um hello there")  # warm the pipeline off-path
             except Exception:

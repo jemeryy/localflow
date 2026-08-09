@@ -205,3 +205,16 @@ def test_validate_cleanup_guardrails():
         validate_cleanup(raw, "   ")
     with pytest.raises(ValueError, match="long"):
         validate_cleanup("hi", "x" * 200)  # answered instead of edited
+
+
+def test_build_prompt_carries_text_and_terms():
+    """9 Aug Gemma spike: the few-shot prompt embeds the dictated line and
+    the configured jargon; no terms = the rule line simply ends."""
+    from localflow.core.cleanup import build_prompt
+
+    p = build_prompt("fix the thing", ["Claude", "Codex"])
+    assert "Dictated: fix the thing\nCorrected:" in p
+    assert "Claude, Codex" in p
+    bare = build_prompt("fix the thing")
+    assert "often says" not in bare
+    assert "Dictated: fix the thing\nCorrected:" in bare

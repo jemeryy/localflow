@@ -33,7 +33,13 @@ cleanup_enabled = false   # LLM cleanup: removes filler, fixes punctuation.
                           # false = NOT loaded at startup (saves ~2-3GB memory
                           # + seconds of load time); the tray toggle loads it
                           # on demand. true = always loaded and on.
-cleanup_model_dir = "models/qwen2.5-3b-ov"
+cleanup_model_dir = "models/gemma-3-4b-ov"  # Gemma 3 4B int4 (9 Aug spike):
+                          # fixes cloud->Claude from context, cleans filler,
+                          # never answers the text. Tray toggle loads it on
+                          # demand (~2.3GB GPU while on). Swap back to
+                          # "models/qwen2.5-3b-ov" if it ever misbehaves.
+cleanup_terms = ["Claude", "Claude Code", "CLAUDE.md", "Codex", "LocalFlow",
+                 "Parakeet", "Whisper", "OpenVINO", "Qwen", "Gemma"]
 
 # Audio cleanup BEFORE transcription (helps the quiet/noisy built-in mic most).
 denoise_enabled = true    # high-pass + gentle spectral noise reduction
