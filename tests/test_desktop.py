@@ -1477,6 +1477,92 @@ def test_livetyper_stable_hypothesis_commits_every_word():
     assert lt.text() == "hello there"
 
 
+def _sliding_livetyper(texts):
+    """LiveTyper over a recorder whose window length the test controls,
+    with an engine that records how much audio each preview decode saw."""
+    import threading
+
+    from localflow.desktop.livetyper import LiveTyper
+
+    class GrowingRecorder:
+        rate = 16_000
+        recording = True
+        window_s = 5.0
+
+        def snapshot(self):
+            return np.zeros(int(self.window_s * 16_000), dtype=np.float32)
+
+    class LenEngine:
+        calls = 0
+        seen_s: list[float] = []
+
+        def transcribe(self, audio, timestamps=False, rebuild_on_failure=True):
+            self.seen_s.append(len(audio) / 16_000)
+            text = texts[min(self.calls, len(texts) - 1)]
+            self.calls += 1
+            return text, {}
+
+    rec = GrowingRecorder()
+    eng = LenEngine()
+    lt = LiveTyper(rec, engine_lock=threading.Lock(),
+                   is_dictating=lambda: True, current_id=lambda: 1,
+                   engine=eng)
+    return lt, rec, eng
+
+
+def test_livetyper_preview_slice_caps_decode_cost():
+    """9 Aug: the preview decodes a bounded slice however long the hold -
+    a 40s window is decoded as the trailing PREVIEW_KEEP_S seconds."""
+    from localflow.desktop.livetyper import PREVIEW_KEEP_S
+
+    lt, rec, eng = _sliding_livetyper(["alpha beta"])
+    lt._tick()
+    assert eng.seen_s[-1] == 5.0              # small window: no slicing
+    rec.window_s = 40.0
+    lt._tick()
+    assert eng.seen_s[-1] == PREVIEW_KEEP_S   # sliced, not the full 40s
+
+
+def test_livetyper_slice_jump_never_retypes_or_duplicates():
+    """After a slice jump the stream continues without re-typing words the
+    screen already has (content anchoring across the jump)."""
+    lt, rec, eng = _sliding_livetyper(
+        ["one two three four", "one two three four",   # commit + type all
+         "three four five six", "three four five six"])  # post-jump slice
+    lt._tick()
+    lt._tick()
+    assert lt.text() == "one two three four"
+    rec.window_s = 40.0                        # forces the jump
+    lt._tick()                                 # agreement restarts: no type
+    assert lt.text() == "one two three four"
+    lt._tick()                                 # slice agrees: tail appended
+    assert lt.text() == "one two three four five six"
+
+
+def test_livetyper_slice_jump_content_miss_drops_not_duplicates():
+    """If the post-jump slice shares nothing with the screen, nothing types
+    (dropping a beat is the cheaper mistake - no duplicates ever)."""
+    lt, rec, eng = _sliding_livetyper(
+        ["one two three four", "one two three four",
+         "nine ten eleven twelve", "nine ten eleven twelve"])
+    lt._tick()
+    lt._tick()
+    rec.window_s = 40.0
+    lt._tick()
+    lt._tick()
+    assert lt.text() == "one two three four"
+
+
+def test_livetyper_cut_resets_the_slice():
+    """A Tier 1 cut drains the buffer, so the slice origin must reset."""
+    lt, rec, eng = _sliding_livetyper(["alpha beta"])
+    rec.window_s = 40.0
+    lt._tick()
+    assert lt._slice_frames > 0
+    lt.on_cut(1)
+    assert lt._slice_frames == 0
+
+
 def test_livetyper_transform_reaches_the_screen():
     """The shared post_stt transform (dictionary + spoken numbers) shapes
     BOTH live paths - preview decodes and authoritative segment texts - so

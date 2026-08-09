@@ -48,6 +48,15 @@ log = logging.getLogger("localflow.desktop.livetyper")
 
 POLL_INTERVAL_S = 0.7
 MIN_WINDOW_S = 1.5      # a shorter window decodes to noise; wait for audio
+# Sliding preview window (9 Aug): preview decode cost must not grow with the
+# hold — a 25s window took 2-6s per decode on CPU and the stream fell 10-20s
+# behind speech. Past PREVIEW_MAX_S the slice start jumps so the decode drops
+# back to PREVIEW_KEEP_S. Only the PREVIEW is sliced: every cut/final segment
+# still decodes its full audio, so the final text and history lose nothing;
+# at worst a word the preview never saw arrives at the cut instead of live.
+PREVIEW_MAX_S = 16.0
+PREVIEW_KEEP_S = 10.0   # post-jump lookback: ~2-5s of it is untyped speech,
+                        # the rest is left-context so the tail decodes clean
 _SENTENCE_END = ".!?"   # pause artifacts the fallback heuristic may drop
 _PUNCT = ".,!?;:"       # marks the boundary rule may add/replace/remove
 _OVERLAP_MAX_WORDS = 8  # longest already-typed phrase the guard may drop
@@ -115,6 +124,11 @@ class LiveTyper:
         self._typed = 0
         self._pending_counts: list[int] = []
         self._screen = ""
+        # Frames of the current cut-window's audio the preview skips (the
+        # sliding slice start). _slice_jumped marks the first beats after a
+        # jump, where the positional fallback in append_tail would be stale.
+        self._slice_frames = 0
+        self._slice_jumped = False
         self._flushed = False
         self._closed = False          # dictation ended: no more previews
         self._discard = False         # Esc: segment tails must not type either
@@ -163,6 +177,8 @@ class LiveTyper:
             self._prev = []
             self._committed = 0
             self._typed = 0
+            self._slice_frames = 0     # the drain moved the buffer origin
+            self._slice_jumped = False
 
     def on_segment_text(self, dictation_id: int, text: str) -> None:
         """Authoritative text for the OLDEST unreconciled window — every mid
@@ -233,6 +249,20 @@ class LiveTyper:
                           # decode too, it would be thrown away
         rate = self.recorder.rate
         snap = self.recorder.snapshot()
+        if len(snap) - self._slice_frames > PREVIEW_MAX_S * rate:
+            # Window outgrew the budget (continuous speech the segmenter
+            # found no silence to cut): jump the slice forward. Words behind
+            # the new start are committed or will arrive with the segment
+            # text; agreement restarts because word positions shifted.
+            self._slice_frames = int(len(snap) - PREVIEW_KEEP_S * rate)
+            with self._lock:
+                self._prev = []
+                self._committed = 0
+                self._slice_jumped = True
+        if self._slice_frames:
+            # A cut can drain the buffer between snapshot and reset; a stale
+            # slice past the end just skips this beat (on_cut zeroes it).
+            snap = snap[self._slice_frames:]
         if len(snap) < self.min_window_s * rate:
             return
         # Resample OUTSIDE the lock: a real decode must never wait on preview
@@ -289,7 +319,14 @@ class LiveTyper:
             # of the last typed word - resolves its punctuation.
             screen_words = self._screen.split()
             window = screen_words[-self._typed:] if self._typed else []
-            fresh, boundary = append_tail(window, words[:committed], old)
+            # After a slice jump the positional fallback (`old`) indexes the
+            # pre-jump word list; on a content miss it would re-type the
+            # whole slice. `committed` drops everything instead - skipping a
+            # beat is the cheaper mistake (no duplicates, Jeremy 27 Jul).
+            fallback = committed if self._slice_jumped else old
+            fresh, boundary = append_tail(window, words[:committed], fallback)
+            if committed:
+                self._slice_jumped = False
             self._typed += self._append(fresh, boundary=boundary)
 
     def _append(self, words: list[str], final: bool = False,
@@ -369,6 +406,8 @@ class LiveTyper:
             self._flushed = False
             self._closed = False
             self._discard = False
+            self._slice_frames = 0
+            self._slice_jumped = False
 
     def _flush(self) -> None:
         """Dictation over: log what was typed, once. The state is kept until
