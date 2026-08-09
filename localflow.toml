@@ -65,9 +65,5 @@ numbers_as_digits = true  # spoken numbers -> digits ("forty seven" -> "47",
                           # "one" stays a word. Restart to apply.
 
 # Dictionary rules now reach the SCREEN during live typing too (9 Aug),
-# not just history. "cloud" -> "Claude" fires on every standalone "cloud";
-# delete the rule if you ever dictate about actual cloud services a lot.
+# not just history.
 [replacements]
-"cloud code" = "Claude Code"
-"cloud.md" = "CLAUDE.md"
-cloud = "Claude"
