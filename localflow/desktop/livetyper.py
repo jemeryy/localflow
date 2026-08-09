@@ -2,8 +2,9 @@
 
 While a dictation runs, this thread re-decodes the recorder's uncommitted
 buffer about once a second and TYPES newly committed words into the target
-app. A word is committed once two consecutive decodes agree on it
-(LocalAgreement-2, `core.live.commit_prefix`) — and committed means FINAL:
+app. A word near the live edge is committed once two consecutive decodes
+agree on it (LocalAgreement-2, `core.live.commit_prefix`); a word older
+than EDGE_GUARD_WORDS commits after one (10 Aug) — and committed means FINAL:
 no WORD typed is ever revised, backspaced or rewritten, mid-dictation or
 after (Jeremy 27 Jul: "the streaming is fine, no correction — just no
 duplicates or extra words when I stop"). A word Whisper later changes its
@@ -46,8 +47,15 @@ from localflow.core.live import _norm, append_tail, commit_prefix
 
 log = logging.getLogger("localflow.desktop.livetyper")
 
-POLL_INTERVAL_S = 0.7
+POLL_INTERVAL_S = 0.4   # cadence when decodes are cheap; the half-wall-clock
+                        # rule in _loop still caps engine duty at 50% when
+                        # decodes get expensive (was 0.7; 10 Aug latency pass)
 MIN_WINDOW_S = 1.5      # a shorter window decodes to noise; wait for audio
+# Aged-word commit (10 Aug): only the words nearest the live edge waver
+# between decodes, so words older than the last EDGE_GUARD_WORDS of a
+# hypothesis type after ONE decode instead of two agreeing ones (saves a
+# full beat of felt lag). ~5 words is ~2s of speech - the wavering zone.
+EDGE_GUARD_WORDS = 5
 # Sliding preview window (9 Aug): preview decode cost must not grow with the
 # hold — a 25s window took 2-6s per decode on CPU and the stream fell 10-20s
 # behind speech. Past PREVIEW_MAX_S the slice start jumps so the decode drops
@@ -308,7 +316,8 @@ class LiveTyper:
                 return          # the dictation ended while we were decoding
             if not words:
                 return          # a flaky empty decode changes nothing
-            committed = commit_prefix(self._prev, words, self._committed)
+            committed = commit_prefix(self._prev, words, self._committed,
+                                      edge_guard=EDGE_GUARD_WORDS)
             old = self._committed
             self._prev = words
             self._committed = committed

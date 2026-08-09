@@ -25,7 +25,7 @@ def _norm(word: str) -> str:
 
 
 def commit_prefix(prev_words: list[str], new_words: list[str],
-                  committed_len: int) -> int:
+                  committed_len: int, edge_guard: int = 0) -> int:
     """LocalAgreement-2: how many leading words of `new_words` are final.
 
     Two consecutive decodes of the same growing audio agreeing on a prefix is
@@ -33,13 +33,20 @@ def commit_prefix(prev_words: list[str], new_words: list[str],
     docs/stt-streaming-research.md). The result never drops below
     `committed_len` - a committed word has already been typed, so a commit can
     only grow.
+
+    `edge_guard` > 0 relaxes the rule for AGED words (10 Aug): the model only
+    wavers on the words nearest the live edge of the audio, so everything
+    except the last `edge_guard` words of `new_words` commits after ONE
+    decode. The newest `edge_guard` words still need two agreeing looks.
+    0 keeps pure LocalAgreement-2.
     """
     agreed = 0
     for a, b in zip(prev_words, new_words):
         if _norm(a) != _norm(b):
             break
         agreed += 1
-    return max(agreed, committed_len)
+    aged = len(new_words) - edge_guard if edge_guard else 0
+    return max(agreed, aged, committed_len)
 
 
 def append_tail(screen: list[str], newer: list[str],

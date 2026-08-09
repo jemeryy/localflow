@@ -87,6 +87,33 @@ def test_agreement_ignores_punctuation_and_case():
     assert commit_prefix(_w("hello there"), _w("Hello, there!"), 0) == 2
 
 
+# ---- edge_guard: aged words commit after one decode (10 Aug) -------------
+
+
+def test_aged_words_commit_on_first_decode():
+    # everything except the last `edge_guard` words is old enough to trust
+    words = _w("one two three four five six seven")
+    assert commit_prefix([], words, 0, edge_guard=5) == 2
+
+
+def test_edge_guard_still_needs_agreement_at_the_edge():
+    # the newest words only commit via two agreeing decodes
+    prev = _w("one two three four five six seven")
+    assert commit_prefix(prev, prev, 0, edge_guard=5) == 7
+
+
+def test_edge_guard_shorter_hypothesis_commits_nothing_aged():
+    assert commit_prefix([], _w("one two three"), 0, edge_guard=5) == 0
+
+
+def test_edge_guard_never_retreats_below_committed():
+    assert commit_prefix([], _w("one two"), 4, edge_guard=5) == 4
+
+
+def test_edge_guard_zero_is_pure_localagreement():
+    assert commit_prefix([], _w("one two three four five six"), 0) == 0
+
+
 # ---- patch_plan (M13's final patch) -------------------------------------
 
 
