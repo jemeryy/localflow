@@ -60,5 +60,14 @@ filter_hallucinations = true  # drop the stray word Whisper appends on trailing
                           # silence (uses timestamps; also stops the real last
                           # word dropping; ~2x STT time). false = faster, no fix
 tts_volume = 0.8
+numbers_as_digits = true  # spoken numbers -> digits ("forty seven" -> "47",
+                          # "twenty six point two seven" -> "26.27"). Bare
+                          # "one" stays a word. Restart to apply.
 
+# Dictionary rules now reach the SCREEN during live typing too (9 Aug),
+# not just history. "cloud" -> "Claude" fires on every standalone "cloud";
+# delete the rule if you ever dictate about actual cloud services a lot.
 [replacements]
+"cloud code" = "Claude Code"
+"cloud.md" = "CLAUDE.md"
+cloud = "Claude"

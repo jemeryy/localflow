@@ -116,6 +116,9 @@ tts_length_scale = 0.8    # speech speed: lower = faster (0.8 ~ 25% faster),
 tts_volume = 1.0          # narration loudness multiplier: 1.0 = normal, lower
                           # = quieter, up to 2.0 louder. Live from Settings.
 
+numbers_as_digits = false # rewrite spoken numbers as digits after STT
+                          # ("forty seven" -> "47"). Restart to apply.
+
 # Personal dictionary: deterministic fixes applied AFTER transcription
 # (safe, unlike hot_words). Edit in Settings, or add rows here like:
 #   "code x" = "Codex"
@@ -266,6 +269,11 @@ class Config(BaseModel):
     # M10: personal dictionary, applied AFTER STT and cleanup by
     # core/dictionary.py — zero STT-accuracy risk, unlike hot_words.
     replacements: dict[str, str] = {}
+    # Rewrite spoken numbers as digits ("forty seven" -> "47", "twenty six
+    # point two seven" -> "26.27") after STT, on the same pass as the
+    # dictionary. Bare "one" is left alone ("no one" must survive).
+    # Default off = exact v1.2 surface. Takes effect on restart.
+    numbers_as_digits: bool = False
     # Read-aloud (TTS). Fully local Piper voice. read_aloud_hotkey is a PRESS
     # (not hold): press to speak the selection, press again to stop.
     tts_enabled: bool = True

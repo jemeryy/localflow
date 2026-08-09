@@ -42,6 +42,7 @@ from localflow.core import (
     transcribe_audio,
 )
 from localflow.core.dictionary import apply_replacements, mine_substitutions
+from localflow.core.numbers import spelled_to_digits
 from localflow.core.live import patch_plan
 from localflow.desktop import config
 from localflow.desktop.capture import StreamRecorder
@@ -424,6 +425,10 @@ class LocalFlowApp:
         # M10: personal dictionary (applied after cleanup, before inject)
         # and the optional history store (None = history off, write nothing).
         self.replacements: dict[str, str] = {}
+        # Rewrite spoken numbers as digits ("forty seven" -> "47") in the
+        # same post-STT pass as the dictionary (9 Aug: Parakeet spells
+        # numbers out; Jeremy wants digits).
+        self.numbers_as_digits = False
         self.history = None
         # Tier 1 (VAD-segmented streaming). The segmenter cuts a long hold at
         # silences and enqueues mid-dictation segments transcribed DURING the
@@ -885,11 +890,7 @@ class LocalFlowApp:
                 log.warning("cleanup failed — keeping raw text only",
                             exc_info=True)
                 clean_text = None
-        if self.replacements:
-            try:  # M10 dictionary; a bad rule must never block the paste
-                text = apply_replacements(text, self.replacements)
-            except Exception:
-                log.exception("dictionary failed — pasting unmodified text")
+        text = self.post_stt(text)
         # Remember it BEFORE injecting: "Copy last dictation" must recover the
         # text even when the paste went nowhere (target wasn't focused).
         self.last_text = text
@@ -923,6 +924,26 @@ class LocalFlowApp:
             # trustworthy loudness sample - adjust the Windows mic level on
             # it. The all-silence paths returned above on purpose.
             self._maybe_adjust_gain(peak)
+
+    def post_stt(self, text: str) -> str:
+        """Deterministic post-STT shaping: the M10 dictionary, then spoken
+        numbers -> digits. The livetyper applies this same method to every
+        preview decode and segment text, so live-typed screens, the final
+        text and history all agree on one surface. Each stage is guarded —
+        a bad rule must never block a paste."""
+        if not text:
+            return text
+        if self.replacements:
+            try:
+                text = apply_replacements(text, self.replacements)
+            except Exception:
+                log.exception("dictionary failed — using unmodified text")
+        if self.numbers_as_digits:
+            try:
+                text = spelled_to_digits(text)
+            except Exception:
+                log.exception("number rewrite failed — using unmodified text")
+        return text
 
     def _typed_text(self, dictation_id: int) -> str:
         """What live typing already put in the focused app for THIS dictation
@@ -1351,6 +1372,7 @@ def _run(args: argparse.Namespace) -> int:
     app.set_live_typing(cfg.live_typing)
     # M10: dictionary + history from config (both live-appliable).
     app.replacements = dict(cfg.replacements)
+    app.numbers_as_digits = bool(cfg.numbers_as_digits)
     if cfg.history_enabled:
         from localflow.desktop.history import HistoryStore
         app.history = HistoryStore()
@@ -1374,7 +1396,8 @@ def _run(args: argparse.Namespace) -> int:
         is_dictating=lambda: (recorder.recording and not app.mic_test_active
                               and app.live_typing),
         current_id=lambda: app._dictation_id,
-        on_patch=lambda n, t: live_patch(n, t, target=app._live_target))
+        on_patch=lambda n, t: live_patch(n, t, target=app._live_target),
+        transform=app.post_stt)
     # Held in a ref so the settings window can rebuild it live (M8).
     hotkey_ref = {"listener": PushToTalkListener(
         cfg.hotkey, app.on_hotkey_down, app.on_hotkey_up,

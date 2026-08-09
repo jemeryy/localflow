@@ -80,7 +80,8 @@ class LiveTyper:
 
     def __init__(self, recorder, engine_lock, is_dictating, current_id,
                  engine=None, poll_interval_s: float = POLL_INTERVAL_S,
-                 min_window_s: float = MIN_WINDOW_S, on_patch=None):
+                 min_window_s: float = MIN_WINDOW_S, on_patch=None,
+                 transform=None):
         self.recorder = recorder
         self.engine = engine
         self.engine_lock = engine_lock
@@ -89,6 +90,11 @@ class LiveTyper:
         self.poll_interval_s = poll_interval_s
         self.min_window_s = min_window_s
         self.on_patch = on_patch
+        # Pure text->text shaping (dictionary + spoken numbers) applied to
+        # EVERY text entering this class - preview decodes and authoritative
+        # segment texts alike. Identical inputs on both paths is what keeps
+        # append_tail's content alignment (and the screen) consistent.
+        self.transform = transform
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._loop, daemon=True,
                                         name="localflow-livetyper")
@@ -163,6 +169,7 @@ class LiveTyper:
         cut segment, and the final drain on release (the worker calls this
         for both, in queue order). Appends only the words the preview had
         not typed for that window; never rewrites anything."""
+        text = self._xform(text)
         with self._lock:
             if dictation_id != self._id or self._discard:
                 return
@@ -250,9 +257,20 @@ class LiveTyper:
         # BEFORE two decodes can agree on it and commit (live 30 Jul).
         # gapped=True is preview-only: a committed loop is permanent here,
         # while the final/history text keeps genuine near-repeats intact.
-        self._revise(collapse_repeats(strip_hallucinations(text),
-                                      gapped=True).split(),
+        self._revise(self._xform(collapse_repeats(strip_hallucinations(text),
+                                                  gapped=True)).split(),
                      dictation_id)
+
+    def _xform(self, text: str) -> str:
+        """Apply the shared post-STT transform; a bad rule must never stop
+        the stream, so failures fall back to the raw text."""
+        if not self.transform or not text:
+            return text
+        try:
+            return self.transform(text)
+        except Exception:
+            log.exception("post-STT transform failed - using raw text")
+            return text
 
     def _revise(self, words: list[str], dictation_id: int) -> None:
         with self._lock:

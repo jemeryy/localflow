@@ -1477,6 +1477,30 @@ def test_livetyper_stable_hypothesis_commits_every_word():
     assert lt.text() == "hello there"
 
 
+def test_livetyper_transform_reaches_the_screen():
+    """The shared post_stt transform (dictionary + spoken numbers) shapes
+    BOTH live paths - preview decodes and authoritative segment texts - so
+    what live typing puts on screen matches the final text (9 Aug)."""
+    from localflow.core.dictionary import apply_replacements
+    from localflow.core.numbers import spelled_to_digits
+
+    def transform(t):
+        return spelled_to_digits(apply_replacements(t, {"cloud": "Claude"}))
+
+    lt = _livetyper(["ask cloud for forty seven",
+                     "ask cloud for forty seven"])
+    lt.transform = transform
+    lt._tick()
+    lt._tick()
+    assert lt.text() == "ask Claude for 47"
+
+    lt2 = _livetyper(["unused"])
+    lt2.transform = transform
+    lt2._reset(1)
+    lt2.on_segment_text(1, "ask cloud for forty seven")
+    assert lt2.text() == "ask Claude for 47"
+
+
 def test_livetyper_never_revises_typed_words():
     """No correction (Jeremy 27 Jul): a decode that changes its mind about
     typed words leaves them alone - genuinely new words still flow."""
