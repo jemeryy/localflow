@@ -5,7 +5,8 @@ word safe to type yet" decision is testable without a GPU.
 
 from __future__ import annotations
 
-from localflow.core.live import append_tail, commit_prefix, patch_plan
+from localflow.core.live import append_tail, commit_prefix, patch_plan, \
+    spill_count
 
 
 def _w(text: str) -> list[str]:
@@ -56,6 +57,26 @@ def test_append_tail_falls_back_to_position_when_the_edge_is_rewritten():
     tail, boundary = append_tail(
         _w("i rode a bike"), _w("i wrote a book fast"), 4)
     assert tail == ["fast"] and boundary == "book"
+
+
+# ---- spill_count (words typed past a Tier 1 cut) ------------------------
+
+
+def test_spill_count_zero_when_the_text_covers_everything_typed():
+    assert spill_count(_w("hello there my"), _w("Hello there, my friend.")) == 0
+
+
+def test_spill_count_counts_trailing_words_missing_from_the_text():
+    # Live 11 Aug: the segment text stops at the cut point, so typed words
+    # whose audio lies past the cut are absent from it - that's the spill.
+    assert spill_count(
+        _w("I mean like what if I tell all the work trees"),
+        _w("I mean, like, what if I tell all")) == 3
+
+
+def test_spill_count_empty_inputs():
+    assert spill_count([], _w("hello")) == 0
+    assert spill_count(_w("hello there"), []) == 2
 
 
 # ---- commit_prefix (LocalAgreement-2) -----------------------------------

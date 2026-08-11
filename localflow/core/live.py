@@ -83,6 +83,26 @@ def append_tail(screen: list[str], newer: list[str],
     return list(newer[end:]), boundary
 
 
+def spill_count(screen: list[str], newer: list[str]) -> int:
+    """How many TRAILING words of `screen` have no match in `newer`.
+
+    The preview decodes the whole live buffer, so by the time a Tier 1 cut
+    lands it may have typed words whose audio lies PAST the cut point. The
+    cut window's authoritative text stops at the cut, so those words are
+    absent from it - they belong to the NEXT window, and unless that window
+    anchors on them its first decode types them all again (live 11 Aug:
+    "the work trees to ship..." landed three times). This counts that spill.
+    """
+    a = [_norm(w) for w in screen]
+    b = [_norm(w) for w in newer]
+    matched = 0
+    for a0, _b0, size in difflib.SequenceMatcher(
+            a=a, b=b, autojunk=False).get_matching_blocks():
+        if size:
+            matched = a0 + size
+    return len(a) - matched
+
+
 def patch_plan(typed: str, final: str, loose: bool = False) -> tuple[int, str]:
     """(backspaces, text to retype) that turns `typed` into `final`.
 

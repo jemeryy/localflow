@@ -43,7 +43,7 @@ import time
 
 from localflow.core import collapse_repeats, ensure_16k_mono, \
     strip_hallucinations
-from localflow.core.live import _norm, append_tail, commit_prefix
+from localflow.core.live import _norm, append_tail, commit_prefix, spill_count
 
 log = logging.getLogger("localflow.desktop.livetyper")
 
@@ -214,6 +214,20 @@ class LiveTyper:
             screen_words = self._screen.split()
             window = screen_words[-count:] if count else []
             tail, boundary = append_tail(window, all_words, count)
+            if not final and not tail:
+                # Typed words whose AUDIO lies past the cut point (the preview
+                # decodes the whole live buffer) are absent from this window's
+                # text - their audio belongs to the NEXT window, which must
+                # anchor on them or its first decode re-types them all (live
+                # 11 Aug triple-type). Credit the spill forward; the stale
+                # positional fallback must drop, never re-type.
+                spill = spill_count(window, all_words)
+                if spill:
+                    if self._pending_counts:
+                        self._pending_counts[0] += spill
+                    else:
+                        self._typed += spill
+                        self._slice_jumped = True
             self._append(tail, final=final, boundary=boundary)
 
     # -- the loop ---------------------------------------------------------
@@ -314,6 +328,11 @@ class LiveTyper:
         with self._lock:
             if dictation_id != self._id or self._closed:
                 return          # the dictation ended while we were decoding
+            if self._pending_counts:
+                return          # this decode was in flight when a cut drained
+                                # its audio: on_cut reset the typed count, so
+                                # typing the stale hypothesis would re-type the
+                                # whole old window (live 11 Aug triple-type)
             if not words:
                 return          # a flaky empty decode changes nothing
             committed = commit_prefix(self._prev, words, self._committed,

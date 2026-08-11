@@ -1816,6 +1816,46 @@ def test_livetyper_cut_pauses_until_the_segment_tail_lands():
     assert screen[0] == lt.text()
 
 
+def test_livetyper_decode_racing_a_cut_never_types():
+    """Live 11 Aug triple-type, mechanism 1: a preview decode already in
+    flight when the segmenter cut landed would treat the pre-cut hypothesis
+    as the NEW window's first decode (typed count just reset to 0) and
+    re-type the whole thing. A decode landing while a cut awaits its
+    authoritative text is stale - it must be dropped."""
+    screen = [""]
+    lt = _livetyper(["the work trees to ship", "the work trees to ship"],
+                    screen=screen)
+    lt._tick()
+    lt._tick()
+    assert screen[0] == "the work trees to ship"
+    lt.on_cut(1)
+    # the in-flight decode of the PRE-cut buffer lands after the cut
+    lt._revise("the work trees to ship they know what order".split(), 1)
+    assert screen[0] == "the work trees to ship"
+
+
+def test_livetyper_words_typed_past_the_cut_are_not_retyped():
+    """Live 11 Aug triple-type, mechanism 2: continuous speech pushed the cut
+    point 9s BEHIND the typed frontier, so the preview had already typed
+    words whose audio belongs to the NEXT window. The cut window's text stops
+    at the cut and cannot account for them - they must be credited forward as
+    the next window's anchor, or its first decode re-types all of them."""
+    screen = [""]
+    h1 = "I mean like what if I tell all the work trees to ship at the same time? Do"
+    h2 = "The work trees to ship at the same time? Do they know what order"
+    lt = _livetyper([h1, h1, h2, h2], screen=screen)
+    lt._tick()
+    lt._tick()
+    assert screen[0] == h1
+    lt.on_cut(1)                    # the cut landed back at "...tell all"
+    lt.on_segment_text(1, "I mean, like, what if I tell all")
+    assert screen[0] == h1          # nothing new; 10 typed words are spill
+    lt._tick()                      # next window re-hears the spilled words
+    lt._tick()
+    assert screen[0] == h1 + " they know what order"
+    assert screen[0] == lt.text()
+
+
 def test_livetyper_flushes_once_when_the_dictation_ends():
     lt = _livetyper(["hello there", "hello there my"])
     lt._tick()

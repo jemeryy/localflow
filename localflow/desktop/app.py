@@ -1811,6 +1811,34 @@ def _run(args: argparse.Namespace) -> int:
         log.info("idle room-noise recalibration every %.0f min",
                  cfg.auto_calibrate_minutes)
 
+    def keep_warm_loop() -> None:
+        """Windows pages the idle STT model out of RAM, so the first
+        dictation after a long break ran several times slower and nothing
+        streamed (live 11 Aug: VAD 4.3s + STT 2.1s after 17 min idle). A
+        one-second silent decode every few minutes keeps the weights
+        resident. Non-blocking lock: a real dictation always wins."""
+        interval_s = 300.0
+        silence = np.zeros(16_000, dtype=np.float32)
+        while not quit_event.wait(interval_s):
+            if time.monotonic() - app.last_mic_use < interval_s:
+                continue                  # recently dictating: already warm
+            if app.engine is None or not app.warm.is_set():
+                continue
+            if not app.engine_lock.acquire(blocking=False):
+                continue
+            try:
+                app.engine.transcribe(silence, timestamps=False,
+                                      rebuild_on_failure=False)
+                if app.vad is not None:
+                    app.vad.trim(silence)     # Silero pages out too
+            except Exception:
+                log.exception("keep-warm decode failed")
+            finally:
+                app.engine_lock.release()
+
+    threading.Thread(target=keep_warm_loop, daemon=True,
+                     name="localflow-keepwarm").start()
+
     def clear_noise_calibration() -> str:
         from localflow.desktop import noiseprofile
         removed = noiseprofile.clear_profile()
