@@ -83,6 +83,17 @@ def _split_punct(word: str) -> tuple[str, str]:
     return bare, word[len(bare):]
 
 
+def _decap(word: str) -> str:
+    """The model capitalises the first word of every audio window, so the
+    window after a Tier 1 cut starts with a stray capital mid-sentence
+    (live 13 Aug: "look like clean Diagrams"). Lowercase a plain Titlecase
+    word; "I"/"I'm", acronyms and CamelCase earn their capitals and stay."""
+    if word[:1].isupper() and word[1:].islower() \
+            and not word.startswith(("I'", "I’")):
+        return word[0].lower() + word[1:]
+    return word
+
+
 class LiveTyper:
     """Polls a StreamRecorder while it records and types committed words.
 
@@ -228,7 +239,8 @@ class LiveTyper:
                     else:
                         self._typed += spill
                         self._slice_jumped = True
-            self._append(tail, final=final, boundary=boundary)
+            self._append(tail, final=final, boundary=boundary,
+                         window_start=count == 0)
 
     # -- the loop ---------------------------------------------------------
 
@@ -355,10 +367,12 @@ class LiveTyper:
             fresh, boundary = append_tail(window, words[:committed], fallback)
             if committed:
                 self._slice_jumped = False
-            self._typed += self._append(fresh, boundary=boundary)
+            self._typed += self._append(fresh, boundary=boundary,
+                                        window_start=self._typed == 0)
 
     def _append(self, words: list[str], final: bool = False,
-                boundary: str | None = None) -> int:
+                boundary: str | None = None,
+                window_start: bool = False) -> int:
         """Type `words` after everything already typed (under _lock).
 
         Boundary punctuation (live 29/30 Jul): Whisper punctuates a pause
@@ -379,6 +393,15 @@ class LiveTyper:
         n_back = 0
         prefix = ""
         screen_words = self._screen.split()
+        # Window-start decapitalisation (live 13 Aug): the first word of a
+        # NEW window's text is capitalised by the model regardless of the
+        # sentence it lands in. Mid-sentence (the screen doesn't end .!?)
+        # that capital is an artifact - drop it. After a real sentence end
+        # the capital stands, proper grammar either way.
+        if window_start and words and screen_words:
+            cur = _split_punct(screen_words[-1])[1]
+            if not any(c in _SENTENCE_END for c in cur):
+                words[0] = _decap(words[0])
         # Overlap guard: alignment drift or a decode-loop stutter would
         # re-type words already on screen — seen live 30 Jul as "retire
         # retire" (one word, preview path) and "coming up with up with"

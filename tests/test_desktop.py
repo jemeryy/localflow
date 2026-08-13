@@ -1856,6 +1856,55 @@ def test_livetyper_words_typed_past_the_cut_are_not_retyped():
     assert screen[0] == lt.text()
 
 
+def test_livetyper_window_start_capital_is_dropped_mid_sentence():
+    """Live 13 Aug: the model capitalises the first word of every audio
+    window, so the window after a Tier 1 cut typed "...look like clean
+    Diagrams that can be". Mid-sentence, a plain Titlecase window-start
+    word loses the stray capital."""
+    screen = [""]
+    lt = _livetyper(["make them look like clean",
+                     "make them look like clean",
+                     "Diagrams that can be",
+                     "Diagrams that can be"], screen=screen)
+    lt._tick()
+    lt._tick()
+    assert screen[0] == "make them look like clean"
+    lt.on_cut(1)
+    lt.on_segment_text(1, "make them look like clean")
+    lt._tick()
+    lt._tick()
+    assert screen[0] == "make them look like clean diagrams that can be"
+    assert screen[0] == lt.text()
+
+
+def test_livetyper_window_start_capital_stays_after_a_sentence_end():
+    """After a real sentence end the next window's capital is grammar,
+    not artifact (live 13 Aug: "...are not rough. Like they are now.")."""
+    screen = [""]
+    lt = _livetyper(["they are not rough.",
+                     "they are not rough.",
+                     "Like they are now",
+                     "Like they are now"], screen=screen)
+    lt._tick()
+    lt._tick()
+    lt.on_cut(1)
+    lt.on_segment_text(1, "they are not rough.")
+    lt._tick()
+    lt._tick()
+    assert screen[0] == "they are not rough. Like they are now"
+    assert screen[0] == lt.text()
+
+
+def test_livetyper_decap_spares_words_that_earn_their_capitals():
+    from localflow.desktop.livetyper import _decap
+    assert _decap("The") == "the"
+    assert _decap("Diagrams,") == "diagrams,"
+    assert _decap("I") == "I"
+    assert _decap("I'm") == "I'm"
+    assert _decap("GPU") == "GPU"
+    assert _decap("McDonald") == "McDonald"
+
+
 def test_livetyper_flushes_once_when_the_dictation_ends():
     lt = _livetyper(["hello there", "hello there my"])
     lt._tick()
