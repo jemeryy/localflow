@@ -1,0 +1,19 @@
+{
+  "description": "Codex equivalents of shared lifecycle hooks in .claude/settings.json.",
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup|clear",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "if [ -f \"$(git rev-parse --show-toplevel)/plans/NEXT.md\" ]; then head -c 2000 \"$(git rev-parse --show-toplevel)/plans/NEXT.md\"; fi",
+            "timeout": 10,
+            "statusMessage": "Loading latest handoff pointer",
+            "commandWindows": "$projectRoot = (git rev-parse --show-toplevel).Trim(); $handoff = Join-Path $projectRoot 'plans/NEXT.md'; if (Test-Path -LiteralPath $handoff) { $content = Get-Content -LiteralPath $handoff -Raw -Encoding utf8; if ($content) { $content.Substring(0, [Math]::Min(2000, $content.Length)) } }"
+          }
+        ]
+      }
+    ]
+  }
+}

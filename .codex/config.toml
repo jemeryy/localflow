@@ -1,0 +1,7 @@
+# Shared lifecycle hooks; runtime trust is still required.
+[features]
+hooks = true
+
+[shell_environment_policy.set]
+PYTHONIOENCODING = "utf-8"
+PYTHONUTF8 = "1"
