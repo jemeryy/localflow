@@ -11,8 +11,13 @@ models/
 
 # Runtime + secrets
 .env
+.env.*
+!.env.example
 *.log
 .tmp/
+history.jsonl
+noiseprofile.npz
+.pytest_cache/
 
 # Audio scratch
 *.wav
